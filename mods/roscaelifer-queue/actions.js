@@ -1,4 +1,4 @@
-import { notify, run } from "herdr";
+import { agents, notify, panes, run, spaces, terminals } from "herdr";
 import { execRoscaelifer, resolveBinary } from "./store.js";
 
 function formatError(err) {
@@ -25,7 +25,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
 
   async function runCli(args, { timeout = 30000, label = "roscaelifer" } = {}) {
     const ctx = getCtx?.();
-    if (!ctx) throw new Error("No repository context selected");
+    if (!ctx) throw new Error("No project context selected");
     const runner = (await getRunner?.()) || (await resolveBinary(ctx));
     const res = await execRoscaelifer(ctx, runner, args, { timeout });
     if (res.code !== 0) {
@@ -37,12 +37,50 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
 
   async function runBdExec(bdArgs, { timeout = 30000 } = {}) {
     const ctx = getCtx?.();
-    if (!ctx) throw new Error("No repository context selected");
+    if (!ctx) throw new Error("No project context selected");
     const args = ["bd-exec"];
     if (ctx.bdDir) args.push("--bd-dir", ctx.bdDir);
     if (ctx.bdActor) args.push("--bd-actor", ctx.bdActor);
     args.push("--", ...bdArgs);
     return runCli(args, { timeout, label: `bd ${bdArgs[0] || ""}`.trim() });
+  }
+
+  function tickArgs(ctx, { env = null, maxRunning = null } = {}) {
+    const args = ["tick"];
+    if (ctx?.db) args.push("--db", ctx.db);
+    if (ctx?.config) args.push("--config", ctx.config);
+    if (ctx?.formulasDir) args.push("--formulas-dir", ctx.formulasDir);
+    args.push("--bd");
+    if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
+    if (env || ctx?.env) args.push("--env", env || ctx.env);
+    if (Number(maxRunning) > 0) args.push("--max-running", String(maxRunning));
+    return args;
+  }
+
+  function beadUpdateArgs(beadId, { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = false } = {}) {
+    const labels = Array.isArray(currentLabels) ? currentLabels : [];
+    const args = ["update", beadId, "--add-label", "roscaelifer"];
+    if (formula) {
+      for (const label of labels) {
+        if (typeof label === "string" && label.startsWith("formula:") && label !== `formula:${formula}`) {
+          args.push("--remove-label", label);
+        }
+      }
+      args.push("--add-label", `formula:${formula}`);
+    }
+    if (env) {
+      for (const label of labels) {
+        if (typeof label === "string" && label.startsWith("env:") && label !== `env:${env}`) {
+          args.push("--remove-label", label);
+        }
+      }
+      args.push("--add-label", `env:${env}`);
+    }
+    for (const bad of ["roscaelifer-failed", "roscaelifer-cancelled", "roscaelifer-invalid"]) {
+      if (labels.includes(bad)) args.push("--remove-label", bad);
+    }
+    if (wakeDeferred && bdStatus === "deferred") args.push("--status", "open", "--defer", "");
+    return args;
   }
 
   function enqueueSerialized(key, title, fn, { refresh = true, successBody = null, cx = null } = {}) {
@@ -91,19 +129,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       return enqueueSerialized(
         "tick",
         "Tick",
-        async () => {
-          const args = ["tick"];
-          if (ctx?.db) args.push("--db", ctx.db);
-          if (ctx?.config) args.push("--config", ctx.config);
-          if (ctx?.formulasDir) args.push("--formulas-dir", ctx.formulasDir);
-          if (ctx?.bdDir || opts.bd !== false) {
-            args.push("--bd");
-            if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
-          }
-          if (opts.env || ctx?.env) args.push("--env", opts.env || ctx.env);
-          if (opts.maxRunning) args.push("--max-running", String(opts.maxRunning));
-          return runCli(args, { timeout: 60000, label: "tick" });
-        },
+        async () => runCli(tickArgs(ctx, { env: opts.env || null, maxRunning: opts.maxRunning ?? null }), { timeout: 60000, label: "tick" }),
         { successBody: "Reconcile pass completed.", cx: opts?.cx || cx },
       );
     },
@@ -197,36 +223,42 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       );
     },
 
-    enqueueBead(beadId, { formula, env, currentLabels = [], cx: optCx } = {}, cx = null) {
+    enqueueBead(
+      beadId,
+      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = false, cx: optCx } = {},
+      cx = null,
+    ) {
       return enqueueSerialized(
         `enqueue:${beadId}`,
         `Enqueue ${beadId}`,
-        async () => {
-          const bdArgs = ["update", beadId, "--add-label", "roscaelifer"];
-          if (formula) {
-            for (const l of currentLabels) {
-              if (typeof l === "string" && l.startsWith("formula:") && l !== `formula:${formula}`) {
-                bdArgs.push("--remove-label", l);
-              }
-            }
-            bdArgs.push("--add-label", `formula:${formula}`);
-          }
-          if (env) {
-            for (const l of currentLabels) {
-              if (typeof l === "string" && l.startsWith("env:") && l !== `env:${env}`) {
-                bdArgs.push("--remove-label", l);
-              }
-            }
-            bdArgs.push("--add-label", `env:${env}`);
-          }
-          for (const bad of ["roscaelifer-failed", "roscaelifer-cancelled", "roscaelifer-invalid"]) {
-            if (!currentLabels.length || currentLabels.includes(bad)) {
-              bdArgs.push("--remove-label", bad);
-            }
-          }
-          return runBdExec(bdArgs);
-        },
+        async () => runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred })),
         { successBody: `Queued ${beadId} for roscaelifer`, cx: optCx || cx },
+      );
+    },
+
+    dispatchBead(
+      beadId,
+      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = true, maxRunning, cx: optCx } = {},
+      cx = null,
+    ) {
+      const ctx = getCtx?.();
+      return enqueueSerialized(
+        `dispatch:${beadId}`,
+        `Dispatch ${beadId}`,
+        async () => {
+          await runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred }));
+          return runCli(tickArgs(ctx, { env, maxRunning }), { timeout: 60000, label: "tick" });
+        },
+        { successBody: `Dispatched ${beadId}`, cx: optCx || cx },
+      );
+    },
+
+    dequeueBead(beadId, cx = null) {
+      return enqueueSerialized(
+        `dequeue:${beadId}`,
+        `Dequeue ${beadId}`,
+        async () => runBdExec(["update", beadId, "--remove-label", "roscaelifer"]),
+        { successBody: `Dequeued ${beadId}`, cx },
       );
     },
 
@@ -335,9 +367,63 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       run("terminal.peek", { terminal: hcAddress });
     },
 
-    focusAgent(hcAddress) {
-      if (!hcAddress) return;
-      run("agent.focus", { terminal: hcAddress });
+    switchToSession(itemOrTarget) {
+      const target = typeof itemOrTarget === "string" ? { hcAddress: itemOrTarget } : itemOrTarget || {};
+      const session = target.sessionInfo || {};
+      const fallbackAddr = session.terminal || target.hcAddress || null;
+      if (!fallbackAddr) {
+        notify({ title: "Session unavailable", body: "This task has no Herdr terminal address.", level: "warning" });
+        return;
+      }
+      const machine = session.machine || target.machine || null;
+      const candidates = new Set([
+        fallbackAddr,
+        session.terminal,
+        target.hcAddress,
+        machine && !String(fallbackAddr).includes("/") ? `${machine}/${fallbackAddr}` : null,
+        String(fallbackAddr).includes("/") ? String(fallbackAddr).split("/").slice(1).join("/") : null,
+      ].filter(Boolean).map(String));
+      const matches = (address) => address && [...candidates].includes(String(address));
+      const liveAgents = agents() || [];
+      const livePanes = panes() || [];
+      const liveTerminals = terminals() || [];
+      const liveSpaces = spaces() || [];
+      const agent = liveAgents.find((entry) => matches(entry?.address));
+      if (agent) {
+        if (agent.space) run("space.select", { id: agent.space });
+        if (agent.tab) run("tab.select", { id: agent.tab });
+        run("agent.focus", { terminal: agent.address });
+        return;
+      }
+      const pane = livePanes.find((entry) => matches(entry?.terminal || entry?.address || entry?.hc_address));
+      if (pane) {
+        const owner = liveSpaces.find((space) => {
+          const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
+          return tabs.some((tab) => String(tab?.id ?? tab?.tab ?? tab) === String(pane.tab));
+        });
+        if (owner?.id) run("space.select", { id: owner.id });
+        if (pane.tab) run("tab.select", { id: pane.tab });
+        run("pane.focus", { pane: pane.pane || pane.id });
+        return;
+      }
+      const terminal = liveTerminals.find((entry) => matches(entry?.address));
+      if (terminal) {
+        const envSpace = session.envSpace;
+        const owner = liveSpaces.find((space) => space?.id === envSpace || space?.name === envSpace);
+        if (owner?.id) run("space.select", { id: owner.id });
+        run("terminal.keep", { terminal: terminal.address, place: "tab" });
+        return;
+      }
+      run("agent.focus", { terminal: fallbackAddr });
+      notify({
+        title: "Session not in this Herdr window",
+        body: `The session at ${fallbackAddr} is not live in this Herdr window. Tried to focus it directly.`,
+        level: "warning",
+      });
+    },
+
+    focusAgent(target) {
+      return this.switchToSession(target);
     },
 
     keepTerminal(hcAddress) {

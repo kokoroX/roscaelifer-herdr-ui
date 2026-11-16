@@ -240,7 +240,31 @@ export class InspectorController {
     if (actions) {
       if (item.beadId && !item.isOptedIn && item.bdStatus !== "closed" && !item.taskId) {
         actionButtons.push(
-          actionBtn(t, "insp-act-enqueue", "Enqueue", () => onOpenDialog?.("enqueue", { item }), { primary: true, disabled: busy, icon: "play" }),
+          actionBtn(t, "insp-act-enqueue", "Enqueue", () => onOpenDialog?.("enqueue", { item }), { disabled: busy, icon: "play" }),
+          actionBtn(t, "insp-act-dispatch", "Dispatch Now", (_e, cx) => item.formula
+            ? actions.dispatchBead(item.beadId, {
+                formula: item.formula,
+                env: item.env,
+                currentLabels: item.labels || [],
+                bdStatus: item.bdStatus,
+                wakeDeferred: item.bdStatus === "deferred",
+                maxRunning: item.maxRunning ?? undefined,
+              }, cx)
+            : onOpenDialog?.("enqueue", { item }), { primary: true, disabled: busy || item.isBlocked, icon: "play" }),
+        );
+      }
+      if (item.beadId && item.isOptedIn && item.bdStatus !== "closed" && !item.taskId) {
+        actionButtons.push(
+          actionBtn(t, "insp-act-dispatch-opt", "Dispatch", (_e, cx) => actions.dispatchBead(item.beadId, {
+            formula: item.formula || undefined,
+            env: item.env,
+            currentLabels: item.labels || [],
+            bdStatus: item.bdStatus,
+            wakeDeferred: item.bdStatus === "deferred",
+            maxRunning: item.maxRunning ?? undefined,
+          }, cx), { primary: true, disabled: busy || item.isBlocked, icon: "play" }),
+          actionBtn(t, "insp-act-options", "Options", () => onOpenDialog?.("enqueue", { item }), { disabled: busy }),
+          actionBtn(t, "insp-act-dequeue", "Dequeue", (_e, cx) => actions.dequeueBead(item.beadId, cx), { disabled: busy, icon: "close" }),
         );
       }
       if (item.needsReview && item.beadId) {
@@ -294,6 +318,9 @@ export class InspectorController {
     if (branch) metaRows.push(["Branch", branch]);
     if (worktree) metaRows.push(["Worktree", worktree]);
     if (hcAddress) metaRows.push(["Terminal", hcAddress]);
+    if (item.sessionInfo?.spaceName || item.sessionInfo?.tabName) {
+      metaRows.push(["Space / Tab", [item.sessionInfo.spaceName, item.sessionInfo.tabName].filter(Boolean).join(" · ")]);
+    }
     if (link) metaRows.push(["Link", link]);
 
     return v_flex()
@@ -329,7 +356,8 @@ export class InspectorController {
                   .when(Boolean(prioLabel), (el) => el.child(badge(t, prioLabel, item.priority <= 1 ? t.ansi1 : t.muted)))
                   .when(Boolean(item.ephemeral || beadDetail?.ephemeral), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
                   .child(badge(t, statusText, statusCol))
-                  .when(Boolean(item.agentStatus), (el) => el.child(badge(t, `agent:${item.agentStatus}`, statusColor(item.agentStatus, t)))),
+                  .when(Boolean(item.agentStatus), (el) => el.child(badge(t, `agent:${item.agentStatus}`, statusColor(item.agentStatus, t))))
+                  .when(Boolean(item.sessionInfo?.spaceName || item.sessionInfo?.tabName), (el) => el.child(badge(t, [item.sessionInfo.spaceName, item.sessionInfo.tabName].filter(Boolean).join(" · "), t.accent))),
               )
               .child(
                 h_flex()
@@ -702,7 +730,7 @@ export class InspectorController {
           .when(Boolean(hcAddress && actions), (el) =>
             el
               .child(actionBtn(t, "insp-term-peek", "Peek", () => actions.peekTerminal(hcAddress), { icon: "terminal" }))
-              .child(actionBtn(t, "insp-term-focus", "Focus", () => actions.focusAgent(hcAddress)))
+              .child(actionBtn(t, "insp-term-open", "Open Session", () => actions.switchToSession(item)))
               .child(actionBtn(t, "insp-term-keep", "Keep", () => actions.keepTerminal(hcAddress))),
           )
           .when(Boolean(worktree && actions), (el) =>

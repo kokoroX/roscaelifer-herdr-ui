@@ -42,6 +42,10 @@ function statusColor(status, t) {
       return t.ansi1;
     case "idle":
     case "ready":
+      return t.idle;
+    case "queue":
+    case "queued":
+      return t.accent;
     case "open":
     case "pending":
       return t.idle;
@@ -127,7 +131,9 @@ function computeWaves(items) {
     ids.sort((a, b) => {
       const ia = byId.get(a);
       const ib = byId.get(b);
-      return (ia?.priority ?? 9) - (ib?.priority ?? 9) || a.localeCompare(b);
+      const priority = (ia?.priority ?? 9) - (ib?.priority ?? 9);
+      if (priority !== 0) return priority;
+      return a < b ? -1 : a > b ? 1 : 0;
     });
 
   let waveIndex = 0;
@@ -258,15 +264,25 @@ function renderFilterCheckbox(id, label, checked, onChange, t) {
 export class DepsController {
   constructor(_cx) {
     this.epicsScroll = ScrollHandle.new();
-    this.wavesScroll = ScrollHandle.new();
     this.eventsScroll = ScrollHandle.new();
+    this.wavesScrollX = 0;
+    this.wavesViewportW = 0;
+    this.wavesContentW = 0;
+    this._minWavesContentW = 0;
     this.selectedEpicId = null; // null = All Issues
     this.chainFocusId = null;
     this.showClosedInWaves = false;
     this.showDoneEpics = false;
     this.showEmptyEpics = false;
     this.eventFilter = "";
-    this.handleWaveScrollWheel = createColumnScrollLock();
+    this.waveBodyScrollLock = createColumnScrollLock({
+      onHorizontalDelta: (rawDx, deltaCx) => this.scrollWavesBy(rawDx, deltaCx),
+    });
+    this.waveOuterScrollLock = createColumnScrollLock({
+      onHorizontalDelta: (rawDx, deltaCx) => this.scrollWavesBy(rawDx, deltaCx),
+    });
+    this.handleWaveScrollWheel = this.waveBodyScrollLock;
+    this.handleWavesOuterScrollWheel = (e, cx) => this.waveOuterScrollLock(e, cx);
     this.eventFilterInput = InputState.new({ placeholder: "Filter events by task, kind, or message…" });
     this.eventFilterInput.on("change", (_e, cx) => {
       this.eventFilter = this.eventFilterInput.value();
@@ -281,6 +297,101 @@ export class DepsController {
       this.eventInputFocused = false;
       cx.notify();
     });
+    this._sidebarCache = {
+      queue: null,
+      showDoneEpics: null,
+      showEmptyEpics: null,
+      stats: null,
+    };
+    this._waveCache = {
+      queue: null,
+      selectedEpicId: null,
+      showClosedInWaves: null,
+      data: null,
+    };
+  }
+
+  maxWavesScrollX(contentW = Math.max(this.wavesContentW, this._minWavesContentW || 0)) {
+    return Math.max(0, contentW - this.wavesViewportW);
+  }
+
+  clampWavesScrollX(contentW = Math.max(this.wavesContentW, this._minWavesContentW || 0)) {
+    const next = Math.max(0, Math.min(this.wavesScrollX, this.maxWavesScrollX(contentW)));
+    const changed = next !== this.wavesScrollX;
+    this.wavesScrollX = next;
+    return changed;
+  }
+
+  scrollWavesBy(rawDx, cx) {
+    const next = Math.max(0, Math.min(this.wavesScrollX - rawDx, this.maxWavesScrollX()));
+    if (next === this.wavesScrollX) return;
+    this.wavesScrollX = next;
+    cx?.notify();
+  }
+
+  getSidebarStats(queue, epics, items) {
+    const cached = this._sidebarCache;
+    if (
+      cached.queue === queue &&
+      cached.showDoneEpics === this.showDoneEpics &&
+      cached.showEmptyEpics === this.showEmptyEpics
+    ) {
+      return cached.stats;
+    }
+    const nonEpicCount = items.filter((it) => it.issueType !== "epic").length;
+    const closedCount = items.filter(
+      (it) => it.issueType !== "epic" && (it.bdStatus === "closed" || it.column === "closed"),
+    ).length;
+    const visibleEpics = epics.filter((ep) =>
+      isEpicVisible(ep, { showDone: this.showDoneEpics, showEmpty: this.showEmptyEpics }),
+    );
+    const stats = { nonEpicCount, closedCount, visibleEpics };
+    this._sidebarCache = {
+      queue,
+      showDoneEpics: this.showDoneEpics,
+      showEmptyEpics: this.showEmptyEpics,
+      stats,
+    };
+    return stats;
+  }
+
+  getWaveData(queue, epics, items) {
+    const cached = this._waveCache;
+    if (
+      cached.queue === queue &&
+      cached.selectedEpicId === this.selectedEpicId &&
+      cached.showClosedInWaves === this.showClosedInWaves
+    ) {
+      return cached.data;
+    }
+    const selectedEpic = this.selectedEpicId
+      ? epics.find((e) => (e.id || e.beadId) === this.selectedEpicId)
+      : null;
+    const epicChildIds = selectedEpic
+      ? new Set((selectedEpic.children ?? []).map((c) => c.beadId || c.id).filter(Boolean))
+      : null;
+    const scopedItems = items.filter((it) => {
+      if (it.issueType === "epic") return false;
+      if (this.selectedEpicId) {
+        const key = it.beadId || it.id;
+        const inEpic =
+          it.parent === this.selectedEpicId ||
+          (epicChildIds && epicChildIds.has(key)) ||
+          (key && key.startsWith(`${this.selectedEpicId}.`));
+        if (!inEpic) return false;
+      }
+      if (!this.showClosedInWaves && (it.bdStatus === "closed" || it.column === "closed")) return false;
+      return true;
+    });
+    const waveGraph = computeWaves(scopedItems);
+    const data = { selectedEpic, scopedItems, ...waveGraph };
+    this._waveCache = {
+      queue,
+      selectedEpicId: this.selectedEpicId,
+      showClosedInWaves: this.showClosedInWaves,
+      data,
+    };
+    return data;
   }
 
   render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = false, onToggleShowEphemeral }, cx) {
@@ -295,6 +406,8 @@ export class DepsController {
       return this.renderMirrorAndEvents(t, { queue, mirrors, events, onSelectItem, monoFont }, cx);
     }
 
+    const sidebarStats = this.getSidebarStats(queue, epics, items);
+
     return v_flex()
       .id("deps-root")
       .size_full()
@@ -306,8 +419,8 @@ export class DepsController {
           .flex_1()
           .min_h(0)
           .gap(8)
-          .child(this.renderEpicSidebar(t, { epics, items, monoFont }))
-          .child(this.renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral })),
+          .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats }))
+          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -337,12 +450,9 @@ export class DepsController {
     }
   }
 
-  renderEpicSidebar(t, { epics, items, monoFont }) {
-    const nonEpicCount = items.filter((it) => it.issueType !== "epic").length;
-    const closedCount = items.filter((it) => it.issueType !== "epic" && (it.bdStatus === "closed" || it.column === "closed")).length;
-    const visibleEpics = epics.filter((ep) =>
-      isEpicVisible(ep, { showDone: this.showDoneEpics, showEmpty: this.showEmptyEpics }),
-    );
+  renderEpicSidebar(t, { epics, items, monoFont, stats = null }) {
+    const cachedStats = stats || this.getSidebarStats(null, epics, items);
+    const { nonEpicCount, closedCount, visibleEpics } = cachedStats;
     const filteredCountText =
       visibleEpics.length !== epics.length ? `${visibleEpics.length}/${epics.length}` : `${epics.length}`;
 
@@ -517,26 +627,11 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont, showEphemeral = false, onToggleShowEphemeral }) {
-    const selectedEpic = this.selectedEpicId ? epics.find((e) => (e.id || e.beadId) === this.selectedEpicId) : null;
-    const epicChildIds = selectedEpic
-      ? new Set((selectedEpic.children ?? []).map((c) => c.beadId || c.id).filter(Boolean))
-      : null;
-    const scopedItems = items.filter((it) => {
-      if (it.issueType === "epic") return false;
-      if (this.selectedEpicId) {
-        const key = it.beadId || it.id;
-        const inEpic =
-          it.parent === this.selectedEpicId ||
-          (epicChildIds && epicChildIds.has(key)) ||
-          (key && key.startsWith(`${this.selectedEpicId}.`));
-        if (!inEpic) return false;
-      }
-      if (!this.showClosedInWaves && (it.bdStatus === "closed" || it.column === "closed")) return false;
-      return true;
-    });
-
-    const { waves, blockersOf, unlocksOf } = computeWaves(scopedItems);
+  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral = false, onToggleShowEphemeral }) {
+    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items);
+    const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
+    this._minWavesContentW = minContentW;
+    this.clampWavesScrollX(minContentW);
     const activeChainId = this.chainFocusId || (scopedItems.some((it) => (it.beadId || it.id) === selectedId) ? selectedId : null);
     const { upstream, downstream } = collectChain(activeChainId, blockersOf, unlocksOf);
 
@@ -651,15 +746,33 @@ export class DepsController {
           .flex_1()
           .min_h(0)
           .child(
-            h_flex()
+            div()
               .id("deps-waves-scroll")
-              .track_scroll(this.wavesScroll)
               .size_full()
-              .overflow_x_scroll()
-              .p(10)
-              .gap(10)
-              .items_start()
-              .when(waves.length === 0, (el) =>
+              .overflow_hidden()
+              .on_size_change((size, sizeCx) => {
+                const zoom = settings()?.zoom || 1;
+                this.wavesViewportW = size.width / zoom;
+                if (this.clampWavesScrollX()) sizeCx?.notify();
+              })
+              .on_scroll_wheel((e, scrollCx) => this.handleWavesOuterScrollWheel(e, scrollCx))
+              .child(
+                h_flex()
+                  .id("deps-waves-track")
+                  .h_full()
+                  .min_h(0)
+                  .w_full()
+                  .min_w(minContentW)
+                  .ml(-this.wavesScrollX)
+                  .on_size_change((size, sizeCx) => {
+                    const zoom = settings()?.zoom || 1;
+                    this.wavesContentW = size.width / zoom;
+                    if (this.clampWavesScrollX()) sizeCx?.notify();
+                  })
+                  .p(10)
+                  .gap(10)
+                  .items_start()
+                  .when(waves.length === 0, (el) =>
                 el.child(div().p(16).text_size(12.5).text_color(t.dim).child("No open dependency nodes in this scope. Toggle \"Show Closed\" to view completed items.")),
               )
               .children(
@@ -675,7 +788,6 @@ export class DepsController {
                     .border_color(t.border)
                     .bg(t.canvas)
                     .overflow_hidden()
-                    .on_scroll_wheel((e, cx) => this.handleWaveScrollWheel(e, cx))
                     .child(
                       h_flex()
                         .flex_none()
@@ -690,14 +802,21 @@ export class DepsController {
                         .child(div().text_size(11).text_color(t.dim).child(`${wave.items.length}`)),
                     )
                     .child(
-                      v_flex()
-                        .id(`deps-wave-col-${wave.index}`)
+                      div()
+                        .relative()
                         .flex_1()
                         .min_h(0)
-                        .overflow_y_scrollbar()
-                        .p(8)
-                        .gap(8)
-                        .children(
+                        .on_scroll_wheel((_e, cx) => {
+                          if (!this.waveBodyScrollLock.isHorizontal()) cx?.stop_propagation();
+                        })
+                        .child(
+                          v_flex()
+                            .id(`deps-wave-col-${wave.index}`)
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .p(8)
+                            .gap(8)
+                            .children(
                           wave.items.map((it) => {
                             const id = it.beadId || it.id;
                             const isFocused = activeChainId === id;
@@ -822,11 +941,20 @@ export class DepsController {
                                 ),
                               );
                           }),
+                            ),
+                        )
+                        .child(
+                          div()
+                            .id(`deps-wave-guard-${wave.index}`)
+                            .absolute()
+                            .inset_0()
+                            .on_scroll_wheel(this.handleWaveScrollWheel),
                         ),
+                      ),
                     ),
                 ),
               ),
-          ),
+            ),
       );
   }
 

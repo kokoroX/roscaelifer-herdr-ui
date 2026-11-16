@@ -14,21 +14,31 @@ import {
   ScrollHandle,
   Scrollbar,
 } from "gpui-base";
-import { theme } from "herdr";
+import { settings, theme } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
 
-const COLUMNS = [
+const ROSCAELIFER_COLUMNS = [
   { key: "ready", label: "Ready", emptyText: "No ready beads" },
+  { key: "queue", label: "Queue", emptyText: "No queued items" },
   { key: "running", label: "Running", emptyText: "No running tasks" },
   { key: "action", label: "Needs Action", emptyText: "Nothing waiting" },
   { key: "review", label: "Review", emptyText: "No items in review" },
   { key: "closed", label: "Closed", emptyText: "No recent closed items" },
 ];
 
+const BEADS_COLUMNS = [
+  { key: "backlog", label: "Backlog", emptyText: "No deferred beads" },
+  { key: "ready", label: "Ready", emptyText: "No ready beads" },
+  { key: "in_progress", label: "In Progress", emptyText: "No beads in progress" },
+  { key: "blocked", label: "Blocked", emptyText: "No blocked beads" },
+  { key: "closed", label: "Closed", emptyText: "No closed beads" },
+];
+
 const CLOSED_LIMIT_OPTIONS = [
   { value: 50, label: "50" },
   { value: 500, label: "500" },
   { value: 5000, label: "5k" },
+  { value: "all", label: "All" },
 ];
 
 function segmentTabs(id, t) {
@@ -77,10 +87,16 @@ function priorityStyle(priority, t) {
 
 function columnAccent(key, t) {
   switch (key) {
+    case "queue":
+      return t.accent;
     case "running":
+    case "in_progress":
       return t.working || t.accent;
     case "action":
+    case "blocked":
       return t.blocked || t.ansi1;
+    case "backlog":
+      return t.dim;
     case "review":
       return t.done || t.ansi2;
     case "closed":
@@ -120,7 +136,7 @@ function chip(text, color, bg, borderColor = null) {
     .child(text);
 }
 
-function miniBtn(id, label, { bg, fg, border, busy = false, onClick }) {
+function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, onClick }) {
   return Button.new(id)
     .h(22)
     .px(8)
@@ -133,10 +149,12 @@ function miniBtn(id, label, { bg, fg, border, busy = false, onClick }) {
     .text_size(11)
     .font_medium()
     .when(Boolean(border), (el) => el.border_1().border_color(border))
-    .cursor_pointer()
-    .hover((s) => s.opacity(0.86))
+    .disabled(disabled)
+    .when(disabled, (el) => el.opacity(0.45))
+    .when(!disabled, (el) => el.cursor_pointer().hover((s) => s.opacity(0.86)))
     .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
     .on_click((e, cx) => {
+      if (disabled) return;
       cx.stop_propagation();
       onClick?.(e, cx);
     })
@@ -147,7 +165,8 @@ function miniBtn(id, label, { bg, fg, border, busy = false, onClick }) {
 }
 
 export class BoardController {
-  constructor(cx) {
+  constructor(cx, { mode = "roscaelifer" } = {}) {
+    this.mode = mode;
     this.envFilter = "all";
     this.onlyQueued = false;
     this.query = "";
@@ -166,17 +185,62 @@ export class BoardController {
       cx.notify();
     });
     this._lastVisible = [];
+    this._filterCache = {
+      queue: null,
+      envFilter: null,
+      onlyQueued: null,
+      query: null,
+      columns: null,
+      visibleAll: null,
+      closedItemsByKey: null,
+    };
     // The active columns and the horizontal row keep their scroll position by
     // name; `closed` is a virtual `list()` and owns its own.
     this.colScrolls = {
+      backlog: ScrollHandle.new(),
       ready: ScrollHandle.new(),
+      queue: ScrollHandle.new(),
+      in_progress: ScrollHandle.new(),
+      blocked: ScrollHandle.new(),
       running: ScrollHandle.new(),
       action: ScrollHandle.new(),
       review: ScrollHandle.new(),
     };
-    this.colsScroll = ScrollHandle.new();
-    this._handleColumnScrollWheel = createColumnScrollLock();
+    this.scrollX = 0;
+    this.viewportW = 0;
+    this.contentW = 0;
+    this._minContentW = 0;
+    this.bodyScrollLock = createColumnScrollLock({
+      onHorizontalDelta: (rawDx, deltaCx) => this.scrollBy(rawDx, deltaCx),
+    });
+    this.outerScrollLock = createColumnScrollLock({
+      onHorizontalDelta: (rawDx, deltaCx) => this.scrollBy(rawDx, deltaCx),
+    });
+    this._handleColumnScrollWheel = this.bodyScrollLock;
+    this._handleOuterScrollWheel = this.outerScrollLock;
     void cx;
+  }
+
+  maxScrollX(contentW = Math.max(this.contentW, this._minContentW || 0)) {
+    return Math.max(0, contentW - this.viewportW);
+  }
+
+  clampScrollX(contentW = Math.max(this.contentW, this._minContentW || 0)) {
+    const next = Math.max(0, Math.min(this.scrollX, this.maxScrollX(contentW)));
+    const changed = next !== this.scrollX;
+    this.scrollX = next;
+    return changed;
+  }
+
+  scrollBy(rawDx, cx) {
+    const next = Math.max(0, Math.min(this.scrollX - rawDx, this.maxScrollX()));
+    if (next === this.scrollX) return;
+    this.scrollX = next;
+    cx?.notify();
+  }
+
+  handleOuterScrollWheel(e, cx) {
+    this._handleOuterScrollWheel(e, cx);
   }
 
   focusSearch() {
@@ -198,26 +262,12 @@ export class BoardController {
     if (this.envFilter !== "all" && item.env !== this.envFilter) {
       return false;
     }
-    if (this.onlyQueued && item.column === "ready" && !item.isOptedIn && !item.taskId) {
+    if (this.mode === "roscaelifer" && this.onlyQueued && item.column === "ready") {
       return false;
     }
     const q = this.query.trim().toLowerCase();
     if (!q) return true;
-    const hay = [
-      item.id,
-      item.beadId,
-      item.taskId,
-      item.title,
-      item.formula,
-      item.env,
-      item.project,
-      item.branch,
-      ...(item.labels || []),
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return hay.includes(q);
+    return (item._searchText || "").includes(q);
   }
 
   renderAgentStatus(item, t, { interactive = true } = {}) {
@@ -330,141 +380,194 @@ export class BoardController {
 
   renderCardActions(item, { actions, onOpenDialog }, t) {
     const btns = [];
-    if (item.column === "ready") {
-      if (item.beadId && !item.isOptedIn && !item.isBlocked) {
-        btns.push(
-          miniBtn(`act-q-${item.id}`, "Enqueue", {
-            bg: t.solid,
-            fg: t.solid_foreground,
-            busy: actions.isBusy(`enqueue:${item.beadId}`),
-            onClick: () => onOpenDialog("enqueue", { item }),
-          }),
-        );
-      } else if (item.beadId && item.isOptedIn) {
-        btns.push(
-          miniBtn(`act-edit-${item.id}`, "Options", {
-            bg: t.raised,
-            fg: t.foreground,
-            border: t.border,
-            onClick: () => onOpenDialog("enqueue", { item }),
-          }),
-        );
-      }
-    } else if (item.column === "running") {
-      if (item.hcAddress) {
-        btns.push(
-          miniBtn(`act-peek-${item.id}`, "Peek", {
-            bg: t.raised,
-            fg: t.foreground,
-            border: t.border,
-            onClick: () => actions.peekTerminal(item.hcAddress),
-          }),
-          miniBtn(`act-focus-${item.id}`, "Focus", {
-            bg: t.raised,
-            fg: t.foreground,
-            border: t.border,
-            onClick: () => actions.focusAgent(item.hcAddress),
-          }),
-        );
-      }
-      if (item.taskId) {
-        btns.push(
-          miniBtn(`act-cancel-${item.id}`, "Cancel", {
-            bg: t.raised,
-            fg: t.ansi1 || t.blocked,
-            border: t.border,
-            busy: actions.isBusy(`cancel:${item.taskId}`),
-            onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
-          }),
-        );
-      }
-    } else if (item.column === "action") {
+    const beadArgs = (extra = {}) => ({
+      env: item.env,
+      formula: item.formula || undefined,
+      currentLabels: item.labels,
+      bdStatus: item.bdStatus,
+      wakeDeferred: item.bdStatus === "deferred",
+      maxRunning: item.maxRunning ?? undefined,
+      ...extra,
+    });
+    const active = item.taskStatus === "active";
+    const addSessionButtons = (prefix = "") => {
+      if (!item.hcAddress) return;
+      btns.push(
+        miniBtn(`act-open-${prefix}${item.id}`, "Open Session", {
+          bg: t.raised,
+          fg: t.foreground,
+          border: t.border,
+          onClick: () => actions.switchToSession(item),
+        }),
+        miniBtn(`act-peek-${prefix}${item.id}`, "Peek", {
+          bg: t.raised,
+          fg: t.foreground,
+          border: t.border,
+          onClick: () => actions.peekTerminal(item.hcAddress),
+        }),
+      );
+    };
+    const addGateButtons = ({ withSession = true } = {}) => {
       if (item.actionReason === "waiting_approval" && item.taskId && item.waitingStep) {
-        btns.push(
-          miniBtn(`act-app-${item.id}`, "Approve", {
-            bg: t.solid,
-            fg: t.solid_foreground,
-            busy: actions.isBusy(`approve:${item.taskId}:${item.waitingStep.stepId}`),
-            onClick: (_e, cx) => actions.approveGate(item.taskId, item.waitingStep.stepId, cx),
-          }),
-        );
+        btns.push(miniBtn(`act-app-${item.id}`, "Approve", {
+          bg: t.solid, fg: t.solid_foreground,
+          busy: actions.isBusy(`approve:${item.taskId}:${item.waitingStep.stepId}`),
+          onClick: (_e, cx) => actions.approveGate(item.taskId, item.waitingStep.stepId, cx),
+        }));
       }
-      if (
-        (item.actionReason === "failed" || item.actionReason === "cancelled") &&
-        item.taskId &&
-        item.waitingStep
-      ) {
-        btns.push(
-          miniBtn(`act-retry-${item.id}`, "Retry", {
-            bg: t.solid,
-            fg: t.solid_foreground,
-            busy: actions.isBusy(`retry:${item.taskId}:${item.waitingStep.stepId}`),
-            onClick: (_e, cx) => actions.retryTask(item.taskId, item.waitingStep.stepId, cx),
-          }),
-        );
+      if ((item.actionReason === "failed" || item.actionReason === "cancelled") && item.taskId && item.waitingStep) {
+        btns.push(miniBtn(`act-retry-${item.id}`, "Retry", {
+          bg: t.solid, fg: t.solid_foreground,
+          busy: actions.isBusy(`retry:${item.taskId}:${item.waitingStep.stepId}`),
+          onClick: (_e, cx) => actions.retryTask(item.taskId, item.waitingStep.stepId, cx),
+        }));
       }
       if (item.hasFailedLabel && item.beadId) {
-        btns.push(
-          miniBtn(`act-requeue-${item.id}`, "Re-queue", {
-            bg: t.raised,
-            fg: t.foreground,
-            border: t.border,
-            busy: actions.isBusy(`enqueue:${item.beadId}`),
-            onClick: (_e, cx) => actions.requeueBead(item.beadId, item.labels, cx),
-          }),
-        );
+        btns.push(miniBtn(`act-requeue-${item.id}`, "Re-queue", {
+          bg: t.raised, fg: t.foreground, border: t.border,
+          busy: actions.isBusy(`enqueue:${item.beadId}`),
+          onClick: (_e, cx) => actions.requeueBead(item.beadId, item.labels, cx),
+        }));
       }
-      if (item.hcAddress) {
-        btns.push(
-          miniBtn(`act-peek2-${item.id}`, "Peek", {
-            bg: t.raised,
-            fg: t.foreground,
-            border: t.border,
-            onClick: () => actions.peekTerminal(item.hcAddress),
-          }),
-        );
-      }
-    } else if (item.column === "review") {
-      if (item.beadId) {
-        btns.push(
-          miniBtn(`act-pass-${item.id}`, "Pass", {
-            bg: t.solid,
-            fg: t.solid_foreground,
-            busy: actions.isBusy(`approve-review:${item.beadId}`),
-            onClick: (_e, cx) => actions.approveReview(item.beadId, cx),
-          }),
-          miniBtn(`act-reject-${item.id}`, "Reject", {
-            bg: t.raised,
-            fg: t.ansi1 || t.blocked,
-            border: t.border,
-            onClick: () => onOpenDialog("reject", { item }),
-          }),
-        );
-      }
-    } else if (item.column === "closed") {
-      if (item.pendingCleanup && item.taskId) {
-        btns.push(
-          miniBtn(`act-clean-${item.id}`, "Clean", {
-            bg: t.raised,
-            fg: t.blocked || t.ansi3,
-            border: t.border,
-            onClick: () => onOpenDialog("clean-preview", { item, target: { taskId: item.taskId } }),
-          }),
-        );
-      }
-      if (item.beadId) {
-        btns.push(
-          miniBtn(`act-reopen-${item.id}`, "Reopen", {
-            bg: t.raised,
-            fg: t.muted,
-            border: t.border,
-            busy: actions.isBusy(`reopen:${item.beadId}`),
-            onClick: (_e, cx) => actions.reopenBead(item.beadId, cx),
-          }),
-        );
-      }
-    }
+      if (withSession && item.hcAddress) addSessionButtons("action-");
+    };
 
+    if (this.mode === "beads" && item.beadId && item.bdStatus !== "closed") {
+      if (active) {
+        addSessionButtons("bead-");
+        if (item.taskId) {
+          btns.push(miniBtn(`act-cancel-bead-${item.id}`, "Cancel", {
+            bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+            busy: actions.isBusy(`cancel:${item.taskId}`),
+            onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+          }));
+        }
+      } else if (!item.isOptedIn) {
+        if (!item.isBlocked) {
+          btns.push(miniBtn(`act-dispatch-${item.id}`, "Dispatch", {
+            bg: t.solid, fg: t.solid_foreground,
+            busy: actions.isBusy(`dispatch:${item.beadId}`),
+            onClick: (_e, cx) => item.formula
+              ? actions.dispatchBead(item.beadId, beadArgs(), cx)
+              : onOpenDialog("enqueue", { item }),
+          }));
+        }
+        btns.push(miniBtn(`act-queue-${item.id}`, "Queue", {
+          bg: t.raised, fg: t.foreground, border: t.border,
+          busy: actions.isBusy(`enqueue:${item.beadId}`),
+          onClick: (_e, cx) => item.formula
+            ? actions.enqueueBead(item.beadId, beadArgs(), cx)
+            : onOpenDialog("enqueue", { item }),
+        }));
+      } else {
+        if (!item.isBlocked) {
+          btns.push(miniBtn(`act-dispatch-opt-${item.id}`, "Dispatch", {
+            bg: t.solid, fg: t.solid_foreground,
+            busy: actions.isBusy(`dispatch:${item.beadId}`),
+            onClick: (_e, cx) => actions.dispatchBead(item.beadId, beadArgs(), cx),
+          }));
+        }
+        btns.push(
+          miniBtn(`act-options-${item.id}`, "Options", {
+            bg: t.raised, fg: t.foreground, border: t.border,
+            onClick: () => onOpenDialog("enqueue", { item }),
+          }),
+          miniBtn(`act-dequeue-${item.id}`, "Dequeue", {
+            bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+            busy: actions.isBusy(`dequeue:${item.beadId}`),
+            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx),
+          }),
+        );
+      }
+      if (item.column === "action") addGateButtons({ withSession: false });
+    } else if (item.column === "queue") {
+      if (item.taskId && item.taskStatus === "active") {
+        // An active task whose steps are all pending: queued for a concurrency slot.
+        if (item.beadId) btns.push(miniBtn(`act-options-queue-${item.id}`, "Options", {
+          bg: t.raised, fg: t.foreground, border: t.border,
+          onClick: () => onOpenDialog("enqueue", { item }),
+        }));
+        btns.push(miniBtn(`act-cancel-queue-${item.id}`, "Cancel", {
+          bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+          busy: actions.isBusy(`cancel:${item.taskId}`),
+          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+        }));
+      } else if (item.beadId) {
+        // An opted-in bead that has no live task yet: ready to be dispatched.
+        if (!item.isBlocked) {
+          btns.push(miniBtn(`act-dispatch-queue-${item.id}`, "Dispatch", {
+            bg: t.solid, fg: t.solid_foreground,
+            busy: actions.isBusy(`dispatch:${item.beadId}`),
+            onClick: (_e, cx) => item.formula
+              ? actions.dispatchBead(item.beadId, beadArgs(), cx)
+              : onOpenDialog("enqueue", { item }),
+          }));
+        }
+        btns.push(miniBtn(`act-options-queue-${item.id}`, "Options", {
+          bg: t.raised, fg: t.foreground, border: t.border,
+          onClick: () => onOpenDialog("enqueue", { item }),
+        }));
+        if (item.isOptedIn) {
+          btns.push(miniBtn(`act-dequeue-queue-${item.id}`, "Dequeue", {
+            bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+            busy: actions.isBusy(`dequeue:${item.beadId}`),
+            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx),
+          }));
+        }
+      }
+    } else if (item.column === "ready") {
+      if (item.beadId && !item.isOptedIn) {
+        btns.push(miniBtn(`act-q-${item.id}`, "Enqueue", {
+          bg: t.solid, fg: t.solid_foreground,
+          busy: actions.isBusy(`enqueue:${item.beadId}`),
+          onClick: () => onOpenDialog("enqueue", { item }),
+        }));
+      } else if (item.beadId && item.isOptedIn) {
+        btns.push(miniBtn(`act-edit-${item.id}`, "Options", {
+          bg: t.raised, fg: t.foreground, border: t.border,
+          onClick: () => onOpenDialog("enqueue", { item }),
+        }));
+      }
+      // An active task without a running step is waiting for a concurrency slot: allow cancelling it.
+      if (item.taskId && item.taskStatus === "active") {
+        btns.push(miniBtn(`act-cancel-ready-${item.id}`, "Cancel", {
+          bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+          busy: actions.isBusy(`cancel:${item.taskId}`),
+          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+        }));
+      }
+    } else if (item.column === "running") {
+      addSessionButtons();
+      if (item.taskId) btns.push(miniBtn(`act-cancel-${item.id}`, "Cancel", {
+        bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+        busy: actions.isBusy(`cancel:${item.taskId}`),
+        onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+      }));
+    } else if (item.column === "action") {
+      addGateButtons();
+    } else if (item.column === "review") {
+      if (item.beadId) btns.push(
+        miniBtn(`act-pass-${item.id}`, "Pass", {
+          bg: t.solid, fg: t.solid_foreground,
+          busy: actions.isBusy(`approve-review:${item.beadId}`),
+          onClick: (_e, cx) => actions.approveReview(item.beadId, cx),
+        }),
+        miniBtn(`act-reject-${item.id}`, "Reject", {
+          bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
+          onClick: () => onOpenDialog("reject", { item }),
+        }),
+      );
+    } else if (item.column === "closed") {
+      if (item.pendingCleanup && item.taskId) btns.push(miniBtn(`act-clean-${item.id}`, "Clean", {
+        bg: t.raised, fg: t.blocked || t.ansi3, border: t.border,
+        onClick: () => onOpenDialog("clean-preview", { item, target: { taskId: item.taskId } }),
+      }));
+      if (item.beadId) btns.push(miniBtn(`act-reopen-${item.id}`, "Reopen", {
+        bg: t.raised, fg: t.muted, border: t.border,
+        busy: actions.isBusy(`reopen:${item.beadId}`),
+        onClick: (_e, cx) => actions.reopenBead(item.beadId, cx),
+      }));
+    }
     if (!btns.length) return null;
     return h_flex().pt(2).gap(6).flex_wrap().children(btns);
   }
@@ -473,6 +576,11 @@ export class BoardController {
     const selected = item.id === selectedId;
     const pStyle = priorityStyle(item.priority, t);
     const reason = actionReasonBadge(item.actionReason, t);
+    const sessionLabel = item.sessionInfo?.spaceName || item.sessionInfo?.tabName
+      ? [item.sessionInfo.spaceName, item.sessionInfo.tabName].filter(Boolean).join(" · ")
+      : item.hcAddress;
+    const activeLink = Boolean(item.isRunningTask || item.column === "running");
+    const actionLink = item.column === "action" ? `action: ${item.actionReason || "needs action"}` : null;
     const actionRow = interactive
       ? this.renderCardActions(item, { actions, onOpenDialog }, t)
       : null;
@@ -524,7 +632,8 @@ export class BoardController {
           )
           .when(Boolean(item.agentStatus), (el) =>
             el.child(this.renderAgentStatus(item, t, { interactive })),
-          ),
+          )
+          .when(Boolean(sessionLabel), (el) => el.child(chip(sessionLabel, t.accent, t.accent + "18"))),
       )
       .child(
         div()
@@ -543,13 +652,35 @@ export class BoardController {
           .when(Boolean(item.env), (el) =>
             el.child(chip(`env:${item.env}`, t.muted, t.raised)),
           )
-          .when(item.isOptedIn && item.column === "ready", (el) =>
-            el.child(chip("queued", t.accent, t.accent + "1f")),
+          .when(this.mode === "beads" && item.bdStatus === "deferred", (el) =>
+            el.child(chip("deferred", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
           )
-          .when(item.isBlocked && item.column === "ready", (el) =>
+          .when(this.mode === "beads" && (item.isBlocked || item.bdStatus === "blocked"), (el) =>
             el.child(chip(`blocked (${item.blockedBy.length})`, t.ansi1 || t.blocked, (t.ansi1 || t.blocked) + "1f")),
           )
-          .when(Boolean(reason), (el) =>
+          .when(this.mode === "beads" && item.isOptedIn, (el) => el.child(chip("queued", t.accent, t.accent + "1f")))
+          .when(this.mode === "beads" && activeLink, (el) => el.child(chip("running", t.working || t.accent, (t.working || t.accent) + "20")))
+          .when(this.mode === "beads" && Boolean(actionLink), (el) => el.child(chip(actionLink, t.blocked || t.ansi1, (t.blocked || t.ansi1) + "20")))
+          .when(this.mode === "beads" && (item.needsReview || item.column === "review"), (el) => el.child(chip("review", t.done || t.ansi2, (t.done || t.ansi2) + "20")))
+          .when(this.mode !== "beads" && item.isOptedIn && item.column === "ready" && !(item.taskId && item.taskStatus === "active"), (el) =>
+            el.child(chip("queued", t.accent, t.accent + "1f")),
+          )
+          .when(this.mode !== "beads" && item.column === "queue" && item.taskId && item.taskStatus === "active" && !item.hasRunningStep, (el) =>
+            el.child(chip("queued · pending", t.accent, t.accent + "1f")),
+          )
+          .when(this.mode !== "beads" && item.column === "queue" && item.isOptedIn && !(item.taskId && item.taskStatus === "active"), (el) =>
+            el.child(chip("queued", t.accent, t.accent + "1f")),
+          )
+          .when(this.mode !== "beads" && (item.column === "ready" || item.column === "queue") && item.bdStatus === "in_progress" && item.taskStatus !== "active", (el) =>
+            el.child(chip("bd:in_progress", t.muted, t.raised)),
+          )
+          .when(this.mode !== "beads" && (item.column === "ready" || item.column === "queue") && item.isBlocked, (el) =>
+            el.child(chip(`blocked (${item.blockedBy.length})`, t.ansi1 || t.blocked, (t.ansi1 || t.blocked) + "1f")),
+          )
+          .when(this.mode !== "beads" && (item.column === "ready" || item.column === "queue") && item.bdStatus === "deferred", (el) =>
+            el.child(chip("deferred", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
+          )
+          .when(Boolean(reason) && !(this.mode === "beads" && Boolean(actionLink)), (el) =>
             el.child(chip(reason.text, reason.color, reason.color + "22")),
           )
           .when(item.pendingCleanup, (el) =>
@@ -568,7 +699,7 @@ export class BoardController {
       .when(Boolean(actionRow), (el) => el.child(actionRow));
   }
 
-  renderFilterBar(queue, t, { closedLimit = 500, onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral } = {}) {
+  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral } = {}) {
     const envs = queue?.envs || [];
 
     const envTab = (id, label, active, extra, onClick) =>
@@ -616,40 +747,47 @@ export class BoardController {
               ),
           )
           .child(div().w(1).h(16).bg(t.border).mx(2))
-          .child(
-            Switch.new("filter-queued")
-              .checked(this.onlyQueued)
-              .on_change((checked, cx) => {
-                this.onlyQueued = Boolean(checked);
-                cx.notify();
-              })
-              .flex()
-              .items_center()
-              .gap(7)
-              .cursor_pointer()
-              .child(
-                h_flex()
-                  .w(28)
-                  .h(16)
-                  .p(2)
-                  .rounded(8)
-                  .items_center()
-                  .bg(this.onlyQueued ? t.accent : t.border)
-                  .when(this.onlyQueued, (el) => el.justify_end())
-                  .when(!this.onlyQueued, (el) => el.justify_start())
-                  .child(
-                    div()
-                      .size(12)
-                      .rounded(6)
-                      .bg(this.onlyQueued ? t.accent_foreground : t.muted),
-                  ),
-              )
-              .child(
-                div()
-                  .text_size(11.5)
-                  .text_color(this.onlyQueued ? t.foreground : t.muted)
-                  .child("Queued only"),
-              ),
+          .when(this.mode === "roscaelifer", (el) =>
+            el.child(
+              h_flex()
+                .gap(7)
+                .items_center()
+                .child(
+                  Switch.new("filter-queued")
+                    .checked(this.onlyQueued)
+                    .on_change((checked, cx) => {
+                      this.onlyQueued = Boolean(checked);
+                      cx.notify();
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(7)
+                    .cursor_pointer()
+                    .child(
+                      h_flex()
+                        .w(28)
+                        .h(16)
+                        .p(2)
+                        .rounded(8)
+                        .items_center()
+                        .bg(this.onlyQueued ? t.accent : t.border)
+                        .when(this.onlyQueued, (el) => el.justify_end())
+                        .when(!this.onlyQueued, (el) => el.justify_start())
+                        .child(
+                          div()
+                            .size(12)
+                            .rounded(6)
+                            .bg(this.onlyQueued ? t.accent_foreground : t.muted),
+                        ),
+                    )
+                    .child(
+                      div()
+                        .text_size(11.5)
+                        .text_color(this.onlyQueued ? t.foreground : t.muted)
+                        .child("Queued only"),
+                    ),
+                ),
+            ),
           )
           .child(
             Switch.new("filter-ephemeral")
@@ -746,6 +884,9 @@ export class BoardController {
       .relative()
       .flex_1()
       .min_h(0)
+      .on_scroll_wheel((_e, cx) => {
+        if (!this.bodyScrollLock.isHorizontal()) cx?.stop_propagation();
+      })
       .child(
         v_flex()
           .id(`col-scroll-${col.key}`)
@@ -770,6 +911,13 @@ export class BoardController {
             ),
           ),
       )
+      .child(
+        div()
+          .id(`col-wheel-guard-${col.key}`)
+          .absolute()
+          .inset_0()
+          .on_scroll_wheel(this._handleColumnScrollWheel),
+      )
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
@@ -777,7 +925,7 @@ export class BoardController {
   // on screen is laid out. A row may register no handlers of its own, which is
   // why the card inside it is drawn display-only and the press is answered by
   // `on_item_click` on the list (the Inspector carries the real actions).
-  renderClosedColumnBody(col, listItems, { selectedId, onSelectItem }, t) {
+  renderClosedColumnBody(col, listItems, { selectedId, onSelectItem, itemsByKey }, t) {
     if (listItems.length === 0) {
       return div()
         .flex_1()
@@ -793,12 +941,13 @@ export class BoardController {
         );
     }
 
-    const itemsByKey = new Map(listItems.map((item) => [String(item.id), item]));
-
     return v_flex()
       .relative()
       .flex_1()
       .min_h(0)
+      .on_scroll_wheel((_e, cx) => {
+        if (!this.bodyScrollLock.isHorizontal()) cx?.stop_propagation();
+      })
       .child(
         list(
           `col-scroll-${col.key}`,
@@ -820,18 +969,64 @@ export class BoardController {
             if (target) onSelectItem?.(target, clickCx);
           }),
       )
+      .child(
+        div()
+          .id(`col-wheel-guard-${col.key}`)
+          .absolute()
+          .inset_0()
+          .on_scroll_wheel(this._handleColumnScrollWheel),
+      )
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = 500, onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral }, cx) {
+  getFilteredColumns(queue) {
+    const query = this.query.trim();
+    const cached = this._filterCache;
+    if (
+      cached.queue === queue &&
+      cached.envFilter === this.envFilter &&
+      cached.onlyQueued === this.onlyQueued &&
+      cached.query === query &&
+      cached.mode === this.mode
+    ) {
+      return cached;
+    }
+
+    const cols = this.mode === "beads"
+      ? queue?.beadColumns || { backlog: [], ready: [], in_progress: [], blocked: [], closed: [] }
+      : queue?.columns || { ready: [], queue: [], running: [], action: [], review: [], closed: [] };
+    const columns = {};
+    const visibleAll = [];
+    const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
+    for (const col of boardColumns) {
+      const listItems = (cols[col.key] || []).filter((item) => this.matchesFilter(item));
+      columns[col.key] = listItems;
+      visibleAll.push(...listItems);
+    }
+    const closedItemsByKey = new Map(
+      (columns.closed || []).map((item) => [String(item.id), item]),
+    );
+    this._filterCache = {
+      queue,
+      envFilter: this.envFilter,
+      onlyQueued: this.onlyQueued,
+      query,
+      mode: this.mode,
+      columns,
+      visibleAll,
+      closedItemsByKey,
+    };
+    return this._filterCache;
+  }
+
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral }, cx) {
     void cx;
     const t = theme();
-    const cols = queue?.columns || { ready: [], running: [], action: [], review: [], closed: [] };
-    const visibleAll = [];
+    const { columns: cols, visibleAll, closedItemsByKey } = this.getFilteredColumns(queue);
+    const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
 
-    const colViews = COLUMNS.map((col) => {
-      const listItems = (cols[col.key] || []).filter((item) => this.matchesFilter(item));
-      visibleAll.push(...listItems);
+    const colViews = boardColumns.map((col) => {
+      const listItems = cols[col.key] || [];
       const accent = columnAccent(col.key, t);
 
       return v_flex()
@@ -844,7 +1039,6 @@ export class BoardController {
         .bg(t.canvas || t.chrome)
         .border_1()
         .border_color(t.border)
-        .on_scroll_wheel((e, cx) => this.handleColumnScrollWheel(e, cx))
         .child(
           h_flex()
             .h(36)
@@ -874,7 +1068,7 @@ export class BoardController {
         )
         .child(
           col.key === "closed"
-            ? this.renderClosedColumnBody(col, listItems, { selectedId, onSelectItem }, t)
+            ? this.renderClosedColumnBody(col, listItems, { selectedId, onSelectItem, itemsByKey: closedItemsByKey }, t)
             : this.renderActiveColumnBody(
                 col,
                 listItems,
@@ -885,6 +1079,9 @@ export class BoardController {
     });
 
     this._lastVisible = visibleAll;
+    const minContentW = boardColumns.length * 300 + (boardColumns.length - 1) * 10 + 20;
+    this._minContentW = minContentW;
+    this.clampScrollX(minContentW);
 
     return v_flex()
       .size_full()
@@ -906,15 +1103,35 @@ export class BoardController {
         ),
       )
       .child(
-        h_flex()
+        div()
           .id("kanban-cols")
-          .track_scroll(this.colsScroll)
           .flex_1()
           .min_h(0)
-          .p(10)
-          .gap(10)
-          .overflow_x_scroll()
-          .children(colViews),
+          .w_full()
+          .overflow_hidden()
+          .on_size_change((size, sizeCx) => {
+            const zoom = settings()?.zoom || 1;
+            this.viewportW = size.width / zoom;
+            if (this.clampScrollX()) sizeCx?.notify();
+          })
+          .on_scroll_wheel((e, scrollCx) => this.handleOuterScrollWheel(e, scrollCx))
+          .child(
+            h_flex()
+              .id("kanban-cols-track")
+              .h_full()
+              .min_h(0)
+              .w_full()
+              .min_w(minContentW)
+              .ml(-this.scrollX)
+              .p(10)
+              .gap(10)
+              .on_size_change((size, sizeCx) => {
+                const zoom = settings()?.zoom || 1;
+                this.contentW = size.width / zoom;
+                if (this.clampScrollX()) sizeCx?.notify();
+              })
+              .children(colViews),
+          ),
       );
   }
 }

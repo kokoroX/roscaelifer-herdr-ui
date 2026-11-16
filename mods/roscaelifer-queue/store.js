@@ -1,8 +1,10 @@
 import * as fs from "fs/promises";
-import { exec, home } from "herdr";
+import { exec, focused, home, panes, readTextFile, spaces, checking } from "herdr";
 
 const HISTORY_KEY = "roscaelifer.repoHistory.v1";
 const ACTIVE_REPO_KEY = "roscaelifer.activeRepo.v1";
+const ACTIVE_PROJECT_KEY = "roscaelifer.activeProject.v1";
+const PROJECTS_CONFIG_VERSION = 1;
 const SNAPSHOT_CACHE_PREFIX = "roscaelifer.snapshotCache.v1:";
 const SNAPSHOT_CACHE_INDEX_KEY = "roscaelifer.snapshotCacheIndex.v1";
 const MAX_HISTORY = 10;
@@ -109,10 +111,11 @@ export function saveRepoContext(ctx) {
 }
 
 export function repoLabel(ctx) {
-  if (!ctx) return "No repository";
+  if (!ctx) return "No project";
+  if (ctx.name) return ctx.name;
   if (ctx.label) return ctx.label;
-  const base = ctx.repo || ctx.bdDir || ctx.db || "";
-  if (!base) return ctx.machine ? `Custom DB @${ctx.machine}` : "Custom DB";
+  const base = ctx.repo || ctx.bdDir || ctx.db || ctx.config || ctx.formulasDir || "";
+  if (!base) return ctx.machine ? `Custom Project @${ctx.machine}` : "Custom Project";
   const parts = base.replace(/\/+$/, "").split("/").filter(Boolean);
   return parts[parts.length - 1] || base;
 }
@@ -121,19 +124,22 @@ export function contextKey(ctx) {
   if (!ctx) return "";
   return [
     normalizeMachine(ctx.machine),
+    ctx.projectId || "",
+    ctx.name || "",
     ctx.repo || "",
     ctx.db || "",
     ctx.bdDir || "",
     ctx.config || "",
     ctx.formulasDir || "",
     ctx.bin || "",
+    ctx.env || "",
   ].join("|");
 }
 
 export function repoIdentityKey(ctx) {
   if (!ctx) return "";
   const machine = normalizeMachine(ctx.machine);
-  const identity = ctx.repo || `${ctx.bdDir || ""}|${ctx.db || ""}`;
+  const identity = ctx.repo || `${ctx.bdDir || ""}|${ctx.db || ""}|${ctx.config || ""}|${ctx.formulasDir || ""}`;
   return `${machine}|${identity}`;
 }
 
@@ -201,16 +207,25 @@ export function saveCachedSnapshot(ctx, snapshot) {
   const key = repoIdentityKey(ctx);
   if (!key || !isValidCachedSnapshot(snapshot)) return;
   try {
+    const issues = snapshot?.bd?.issues;
+    const closedCount = Array.isArray(issues)
+      ? issues.reduce((count, issue) => count + (issue?.status === "closed" ? 1 : 0), 0)
+      : 0;
+    const shouldSlim = Array.isArray(issues) && (issues.length > 120 || closedCount > 20);
+    const cachedAt = Date.now();
     let payload = {
       v: 1,
-      cachedAt: Date.now(),
-      snapshot: slimSnapshotForCache(snapshot),
+      cachedAt,
+      snapshot: shouldSlim
+        ? slimSnapshotForCache(snapshot, { maxEvents: 30, maxClosed: 20 })
+        : slimSnapshotForCache(snapshot),
     };
     let serialized = JSON.stringify(payload);
     if (serialized.length > MAX_CACHED_SNAPSHOT_CHARS) {
+      if (shouldSlim) return;
       payload = {
         v: 1,
-        cachedAt: payload.cachedAt,
+        cachedAt,
         snapshot: slimSnapshotForCache(snapshot, { maxEvents: 30, maxClosed: 20 }),
       };
       serialized = JSON.stringify(payload);
@@ -274,6 +289,215 @@ function normalizePath(p, machine = "") {
   if (!p) return "";
   if (!machine && p.startsWith("~/")) return `${home()}${p.slice(1)}`;
   return p.replace(/\/+$/, "") || "/";
+}
+
+export function projectsConfigPath() {
+  return `${normalizePath(home())}/.config/roscaelifer/projects.json`;
+}
+
+function projectBasename(project) {
+  const base = project?.repo || project?.bdDir || project?.db || project?.config || project?.formulasDir || "";
+  const parts = String(base).replace(/\/+$/, "").split("/").filter(Boolean);
+  return parts[parts.length - 1] || "Project";
+}
+
+function projectIdBase(name) {
+  const id = String(name || "project")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return id || "project";
+}
+
+function normalizeProject(raw, index = 0) {
+  if (!raw || typeof raw !== "object") return null;
+  const fields = {
+    id: typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : `project-${index + 1}`,
+    name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : projectBasename(raw),
+    repo: typeof raw.repo === "string" ? raw.repo.trim() : "",
+    machine: normalizeMachine(raw.machine),
+    db: typeof raw.db === "string" ? raw.db.trim() : "",
+    bdDir: typeof raw.bdDir === "string" ? raw.bdDir.trim() : "",
+    config: typeof raw.config === "string" ? raw.config.trim() : "",
+    formulasDir: typeof raw.formulasDir === "string" ? raw.formulasDir.trim() : "",
+    bin: typeof raw.bin === "string" ? raw.bin.trim() : "",
+    env: typeof raw.env === "string" ? raw.env.trim() : "",
+    updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : 0,
+  };
+  if (!fields.repo && !fields.db && !fields.bdDir && !fields.config && !fields.formulasDir) return null;
+  return fields;
+}
+
+function projectFromLegacyContext(ctx, index = 0) {
+  const normalized = normalizeProject({
+    ...ctx,
+    name: ctx?.name || ctx?.label || projectBasename(ctx),
+    id: ctx?.id || projectIdBase(ctx?.name || ctx?.label || projectBasename(ctx)),
+  }, index);
+  return normalized;
+}
+
+function migrateLegacyProjects() {
+  const history = loadRepoHistory();
+  const active = loadActiveRepo();
+  const entries = [];
+  if (active) entries.push(active);
+  entries.push(...history);
+  const projects = [];
+  const usedIds = new Set();
+  for (const entry of entries) {
+    const project = projectFromLegacyContext(entry, projects.length);
+    if (!project) continue;
+    const baseId = projectIdBase(project.name);
+    let id = baseId;
+    let suffix = 2;
+    while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+    project.id = id;
+    usedIds.add(id);
+    if (projects.some((item) => repoIdentityKey(item) === repoIdentityKey(project))) continue;
+    projects.push(project);
+  }
+  const activeProject = active
+    ? projects.find((project) => repoIdentityKey(project) === repoIdentityKey(active))?.id || ""
+    : "";
+  return { version: PROJECTS_CONFIG_VERSION, activeProject, projects };
+}
+
+function emptyProjectsConfig() {
+  return { version: PROJECTS_CONFIG_VERSION, activeProject: "", projects: [] };
+}
+
+export async function loadGlobalProjectsConfig() {
+  let raw;
+  try {
+    raw = await readTextFile(projectsConfigPath());
+  } catch {
+    raw = null;
+  }
+  if (raw === null || raw === undefined) {
+    const migrated = migrateLegacyProjects();
+    const active = migrated.projects.find((project) => project.id === migrated.activeProject);
+    if (active) saveActiveProjectMirror(active);
+    else clearActiveProjectMirror();
+    return migrated;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || parsed.version !== PROJECTS_CONFIG_VERSION || !Array.isArray(parsed.projects)) {
+      clearActiveProjectMirror();
+      return emptyProjectsConfig();
+    }
+    const projects = parsed.projects.map(normalizeProject).filter(Boolean);
+    const activeProject = typeof parsed.activeProject === "string" && projects.some((project) => project.id === parsed.activeProject)
+      ? parsed.activeProject
+      : "";
+    const config = { version: PROJECTS_CONFIG_VERSION, activeProject, projects };
+    const active = projects.find((project) => project.id === activeProject);
+    if (active) saveActiveProjectMirror(active);
+    else clearActiveProjectMirror();
+    return config;
+  } catch {
+    clearActiveProjectMirror();
+    return emptyProjectsConfig();
+  }
+}
+
+export async function saveGlobalProjectsConfig(config) {
+  if (checking()) return config;
+  const normalized = {
+    version: PROJECTS_CONFIG_VERSION,
+    activeProject: typeof config?.activeProject === "string" ? config.activeProject : "",
+    projects: Array.isArray(config?.projects) ? config.projects.map(normalizeProject).filter(Boolean) : [],
+  };
+  const jsonText = JSON.stringify(normalized, null, 2);
+  const script = 'mkdir -p "$(dirname "$1")" && tmp=$(mktemp "${1}.tmp.XXXXXX") && printf \'%s\\n\' "$2" > "$tmp" && mv -f "$tmp" "$1"';
+  const result = await exec("sh", ["-c", script, "roscaelifer-save-projects", projectsConfigPath(), jsonText]);
+  if (result.code !== 0) throw new Error((result.stderr || result.stdout || "Unable to save projects.json").trim());
+  return normalized;
+}
+
+export function saveActiveProjectMirror(project) {
+  if (!project) {
+    safeStorageSet(ACTIVE_PROJECT_KEY, null);
+    return;
+  }
+  safeStorageSet(ACTIVE_PROJECT_KEY, { ...project, projectId: project.id });
+}
+
+export function loadActiveProjectMirror() {
+  const mirror = safeStorageGet(ACTIVE_PROJECT_KEY, null);
+  return mirror && typeof mirror === "object" ? mirror : null;
+}
+
+export function clearActiveProjectMirror() {
+  safeStorageSet(ACTIVE_PROJECT_KEY, null);
+}
+
+export async function upsertGlobalProject(projectInput, editingProjectId = null) {
+  const config = await loadGlobalProjectsConfig();
+  const project = normalizeProject({ ...projectInput, id: editingProjectId || projectInput?.id || "project" });
+  if (!project) throw new Error("Project Name is required, and at least one project path is required.");
+  const existingIndex = editingProjectId ? config.projects.findIndex((item) => item.id === editingProjectId) : -1;
+  if (existingIndex >= 0) {
+    project.id = editingProjectId;
+    config.projects[existingIndex] = project;
+  } else {
+    const usedIds = new Set(config.projects.map((item) => item.id));
+    const baseId = projectIdBase(project.name);
+    let id = baseId;
+    let suffix = 2;
+    while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+    project.id = id;
+    config.projects.unshift(project);
+  }
+  config.activeProject = project.id;
+  const saved = await saveGlobalProjectsConfig(config);
+  saveActiveProjectMirror(project);
+  return { config: saved, project };
+}
+
+export async function deleteGlobalProject(projectId) {
+  const config = await loadGlobalProjectsConfig();
+  const removed = config.projects.find((project) => project.id === projectId) || null;
+  const wasActive = config.activeProject === projectId;
+  config.projects = config.projects.filter((project) => project.id !== projectId);
+  if (wasActive) config.activeProject = "";
+  const saved = await saveGlobalProjectsConfig(config);
+  if (saved.activeProject) {
+    saveActiveProjectMirror(saved.projects.find((project) => project.id === saved.activeProject));
+  } else {
+    clearActiveProjectMirror();
+  }
+  return { config: saved, removed, wasActive };
+}
+
+export async function detectCurrentWorkspaceProject({ focusedInfo = focused(), spaceList = spaces(), paneList = panes() } = {}) {
+  const activeSpace = (spaceList || []).find((space) => space.active);
+  const candidates = [];
+  if (focusedInfo?.cwd) candidates.push({ cwd: focusedInfo.cwd, machine: normalizeMachine(activeSpace?.machine) });
+  if (activeSpace?.folder) candidates.push({ cwd: activeSpace.folder, machine: normalizeMachine(activeSpace.machine) });
+  const tabToMachine = new Map();
+  for (const space of spaceList || []) {
+    const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
+    for (const tab of tabs) {
+      const id = typeof tab === "object" ? tab?.id || tab?.tab : tab;
+      if (id !== undefined && id !== null) tabToMachine.set(String(id), normalizeMachine(space.machine));
+    }
+  }
+  for (const pane of paneList || []) {
+    if (pane?.cwd) candidates.push({ cwd: pane.cwd, machine: normalizeMachine(pane.machine) || tabToMachine.get(String(pane.tab)) || "" });
+  }
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const clean = normalizePath(candidate.cwd, candidate.machine);
+    const key = `${candidate.machine}|${clean}`;
+    if (!clean || seen.has(key)) continue;
+    seen.add(key);
+    const found = await detectRepoFromPath(clean, candidate.machine);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function pathExists(p) {
@@ -468,73 +692,41 @@ export function buildContextFromProps(rawProps, overrideCtx = null) {
     machine,
     bin: src.bin ?? rawProps?.bin ?? "",
     env: src.env ?? rawProps?.env ?? "",
+    name: src.name || "",
+    projectId: src.projectId || src.id || "",
     label: src.label || "",
-    source: overrideCtx ? "override" : "props",
+    source: src.source || (overrideCtx ? "override" : "props"),
   };
   ctx.label = repoLabel(ctx);
   return ctx;
 }
 
 export async function resolveContext(rawProps, { focusedInfo, spaceList, paneList, sharedOverride } = {}) {
-  const fromOverride = buildContextFromProps(rawProps, sharedOverride);
-  if (fromOverride) return fromOverride;
+  const isAutoDetectSignal = Boolean(sharedOverride && sharedOverride.__autoDetect);
+
+  // projects.json is the authoritative source: an explicit activeProject wins over any
+  // stale shared.json override left behind by a previous session.
+  const projectsConfig = await loadGlobalProjectsConfig();
+  const activeProject = projectsConfig.projects.find((project) => project.id === projectsConfig.activeProject);
+  if (activeProject) {
+    saveActiveProjectMirror(activeProject);
+    return buildContextFromProps(rawProps, { ...activeProject, source: "project", projectId: activeProject.id });
+  }
+
+  if (!isAutoDetectSignal) {
+    const fromOverride = buildContextFromProps(rawProps, sharedOverride);
+    if (fromOverride) return fromOverride;
+  }
 
   const fromProps = buildContextFromProps(rawProps, null);
   if (fromProps) return fromProps;
 
-  const spaces = spaceList || [];
-  const activeSpace = spaces.find((s) => s.active);
-  const tabToMachine = new Map();
-  for (const space of spaces) {
-    const machine = normalizeMachine(space?.machine);
-    const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
-    for (const tab of tabs) {
-      const tabId = typeof tab === "object" ? tab?.id || tab?.tab : tab;
-      if (tabId !== undefined && tabId !== null) tabToMachine.set(String(tabId), machine);
-    }
-  }
-
-  const candidates = [];
-  if (focusedInfo?.cwd) {
-    candidates.push({ cwd: focusedInfo.cwd, machine: normalizeMachine(activeSpace?.machine) });
-  }
-  if (activeSpace?.folder) {
-    candidates.push({ cwd: activeSpace.folder, machine: normalizeMachine(activeSpace.machine) });
-  }
-  for (const p of paneList || []) {
-    if (p?.cwd) candidates.push({ cwd: p.cwd, machine: tabToMachine.get(String(p.tab)) ?? "" });
-  }
-
-  const seen = new Set();
-  for (const candidate of candidates) {
-    const machine = normalizeMachine(candidate.machine);
-    const clean = normalizePath(candidate.cwd, machine);
-    const key = `${machine}|${clean}`;
-    if (!clean || seen.has(key)) continue;
-    seen.add(key);
-    const detected = await detectRepoFromPath(clean, machine);
-    if (detected) {
-      if (rawProps?.bin) detected.bin = rawProps.bin;
-      if (rawProps?.env) detected.env = rawProps.env;
-      return detected;
-    }
-  }
-
-  const activeSaved = loadActiveRepo();
-  if (activeSaved) {
-    return {
-      ...activeSaved,
-      bin: activeSaved.bin || rawProps?.bin || "",
-      source: "history",
-    };
-  }
-  const history = loadRepoHistory();
-  if (history.length > 0) {
-    return {
-      ...history[0],
-      bin: history[0].bin || rawProps?.bin || "",
-      source: "history",
-    };
+  const detected = await detectCurrentWorkspaceProject({ focusedInfo, spaceList, paneList });
+  if (detected) {
+    if (rawProps?.bin) detected.bin = rawProps.bin;
+    if (rawProps?.env) detected.env = rawProps.env;
+    detected.name = repoLabel(detected);
+    return detected;
   }
   return null;
 }
@@ -578,9 +770,10 @@ exit 1
 function detectSnapshotFlags(stdout, stderr) {
   const text = `${stdout || ""}\n${stderr || ""}`;
   return {
-    supportsCompact: /(?:^|[\s\[,|])--compact(?:[\s\]=,|]|$)/m.test(text),
-    supportsBrief: /(?:^|[\s\[,|])--brief(?:[\s\]=,|]|$)/m.test(text),
-    supportsIncludeEphemeral: /(?:^|[\s\[,|])--include-ephemeral(?:[\s\]=,|]|$)/m.test(text),
+    supportsCompact: /(?:^|[\s\[,|])--?compact(?:[\s\]=,|]|$)/m.test(text),
+    supportsBrief: /(?:^|[\s\[,|])--?brief(?:[\s\]=,|]|$)/m.test(text),
+    supportsIncludeEphemeral: /(?:^|[\s\[,|])--?include-ephemeral(?:[\s\]=,|]|$)/m.test(text),
+    supportsAllClosed: /(?:^|[\s\[,|])--?all-closed(?:[\s\]=,|]|$)/m.test(text),
   };
 }
 
@@ -811,7 +1004,15 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
     if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
   }
   if (opts.eventsLimit) args.push("--events-limit", String(opts.eventsLimit));
-  if (opts.closedLimit) args.push("--closed-limit", String(opts.closedLimit));
+  if (opts.closedLimit === "all") {
+    if (resolved?.supportsAllClosed) {
+      args.push("--all-closed");
+    } else {
+      args.push("--closed-limit", "50000");
+    }
+  } else if (Number.isInteger(opts.closedLimit) && opts.closedLimit > 0) {
+    args.push("--closed-limit", String(opts.closedLimit));
+  }
 
   let res;
   try {
@@ -828,12 +1029,13 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   if (res.code !== 0) {
     const errText = (res.stderr || res.stdout || `snapshot exited ${res.code}`).trim();
     const flagRejected =
-      (resolved?.supportsCompact || resolved?.supportsBrief || resolved?.supportsIncludeEphemeral) &&
+      (resolved?.supportsCompact || resolved?.supportsBrief || resolved?.supportsIncludeEphemeral || resolved?.supportsAllClosed) &&
       /flag provided but not defined/i.test(errText);
     if (flagRejected) {
       if (resolved?.supportsCompact) resolved.supportsCompact = false;
       if (resolved?.supportsBrief) resolved.supportsBrief = false;
       if (resolved?.supportsIncludeEphemeral) resolved.supportsIncludeEphemeral = false;
+      if (resolved?.supportsAllClosed) resolved.supportsAllClosed = false;
     }
     if (!opts._retried && (isCommandNotFoundFailure(res) || flagRejected)) {
       invalidateBinaryCache(ctx);
@@ -954,19 +1156,6 @@ function stripTaskMetaPrefix(val) {
   return s.startsWith("task:") ? s.slice(5) : s;
 }
 
-function labelValue(labels, prefix) {
-  for (const l of labels || []) {
-    if (typeof l === "string" && l.startsWith(prefix)) {
-      return l.slice(prefix.length);
-    }
-  }
-  return null;
-}
-
-function hasLabel(labels, name) {
-  return Array.isArray(labels) && labels.includes(name);
-}
-
 function parseDepTarget(dep) {
   if (!dep) return "";
   if (dep.depends_on_id) return String(dep.depends_on_id);
@@ -988,27 +1177,47 @@ function parseHcAddressFromThread(threadId) {
 
 function normalizeAddress(addr, envObj) {
   if (!addr) return [];
-  const out = [addr];
+  const value = String(addr);
+  const out = [value];
   const machine = envObj?.machine;
-  if (machine && !addr.includes("/")) {
-    out.push(`${machine}/${addr}`);
-  }
-  if (addr.includes("/")) {
-    out.push(addr.split("/").slice(1).join("/"));
-  }
-  return out;
+  if (machine && !value.includes("/")) out.push(`${machine}/${value}`);
+  if (value.includes("/")) out.push(value.split("/").slice(1).join("/"));
+  return [...new Set(out.filter(Boolean))];
 }
 
-function buildHerdrLookup(agents = [], terminals = []) {
+function addAddressIndex(index, address, value, machine = "") {
+  for (const candidate of normalizeAddress(address, { machine })) {
+    if (!index.has(candidate)) index.set(candidate, value);
+  }
+}
+
+function spaceTabInfo(spaces, tabId) {
+  if (tabId === undefined || tabId === null) return null;
+  const wanted = String(tabId);
+  for (const space of spaces || []) {
+    const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
+    for (const rawTab of tabs) {
+      const tab = rawTab && typeof rawTab === "object" ? rawTab : { id: rawTab };
+      if (String(tab.id ?? tab.tab ?? "") !== wanted) continue;
+      return { space, tab };
+    }
+  }
+  return null;
+}
+
+function buildHerdrLookup(agents = [], terminals = [], spaces = [], panes = []) {
   const agentByAddr = new Map();
-  for (const a of agents || []) {
-    if (!a?.address) continue;
-    agentByAddr.set(a.address, a);
+  for (const agent of agents || []) {
+    if (agent?.address) addAddressIndex(agentByAddr, agent.address, agent, agent.machine);
   }
   const termByAddr = new Map();
-  for (const t of terminals || []) {
-    if (!t?.address) continue;
-    termByAddr.set(t.address, t);
+  for (const terminal of terminals || []) {
+    if (terminal?.address) addAddressIndex(termByAddr, terminal.address, terminal, terminal.machine);
+  }
+  const paneByAddr = new Map();
+  for (const pane of panes || []) {
+    const address = pane?.terminal || pane?.address || pane?.hc_address;
+    if (address) addAddressIndex(paneByAddr, address, pane, pane.machine);
   }
   return {
     findAgent(hcAddress, envObj) {
@@ -1022,6 +1231,15 @@ function buildHerdrLookup(agents = [], terminals = []) {
         if (termByAddr.has(candidate)) return termByAddr.get(candidate);
       }
       return null;
+    },
+    findPane(hcAddress, envObj) {
+      for (const candidate of normalizeAddress(hcAddress, envObj)) {
+        if (paneByAddr.has(candidate)) return paneByAddr.get(candidate);
+      }
+      return null;
+    },
+    findSpaceTab(tabId) {
+      return spaceTabInfo(spaces, tabId);
     },
   };
 }
@@ -1047,6 +1265,7 @@ function normalizeSteps(rawSteps, envObj, lookup) {
       null;
     const liveAgent = hcAddress ? lookup.findAgent(hcAddress, envObj) : null;
     const liveTerminal = hcAddress ? lookup.findTerminal(hcAddress, envObj) : null;
+    const livePane = hcAddress ? lookup.findPane(hcAddress, envObj) : null;
     return {
       stepId: s.step_id || s.id || "",
       ordinal: s.ordinal ?? 0,
@@ -1079,6 +1298,7 @@ function normalizeSteps(rawSteps, envObj, lookup) {
       hcAddress,
       liveAgent,
       liveTerminal,
+      livePane,
       agentStatus: resolveLiveStatus(liveAgent, liveTerminal),
     };
   });
@@ -1110,7 +1330,7 @@ function pickBestTaskForBead(tasks, metaTaskId) {
   })[0];
 }
 
-export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces = [] } = {}) {
+export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces = [], panes = [] } = {}) {
   const snap = snapshot || {};
   const cfg = snap.config || {};
   const defaultEnv = cfg.default_env || "local";
@@ -1146,7 +1366,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
   }
 
   const formulas = Array.isArray(cfg.formulas) ? cfg.formulas : [];
-  const lookup = buildHerdrLookup(agents, terminals);
+  const lookup = buildHerdrLookup(agents, terminals, spaces, panes);
 
   const rawTasks = Array.isArray(snap.tasks) ? snap.tasks : [];
   const tasksById = new Map();
@@ -1215,19 +1435,42 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     const beadId = issue ? issue.id : task?.bead_id || null;
     const taskId = task ? String(task.id) : null;
     const id = beadId || `task:${taskId}`;
-    const labels = Array.isArray(issue?.labels) ? [...issue.labels] : [];
+    const labels = Array.isArray(issue?.labels) ? issue.labels : [];
+    let envLabel = null;
+    let formulaLabel = null;
+    let isOptedIn = false;
+    let needsReview = false;
+    let hasFailedLabel = false;
+    let isCancelledLabel = false;
+    let isInvalidLabel = false;
+    for (const label of labels) {
+      if (typeof label !== "string") continue;
+      if (label.startsWith("env:") && envLabel === null) envLabel = label.slice(4);
+      if (label.startsWith("formula:") && formulaLabel === null) formulaLabel = label.slice(8);
+      if (label === "roscaelifer") isOptedIn = true;
+      if (label === "roscaelifer-review") needsReview = true;
+      if (label === "roscaelifer-failed") hasFailedLabel = true;
+      if (label === "roscaelifer-cancelled") {
+        hasFailedLabel = true;
+        isCancelledLabel = true;
+      }
+      if (label === "roscaelifer-invalid") {
+        hasFailedLabel = true;
+        isInvalidLabel = true;
+      }
+    }
     const intakePlan = beadId ? intakeByBead.get(beadId) || null : null;
 
     const envName =
       task?.resolved_env ||
       intakePlan?.env ||
-      labelValue(labels, "env:") ||
+      envLabel ||
       defaultEnv;
     const envObj = envsByName.get(envName) || null;
     const formula =
       task?.formula_name ||
       intakePlan?.formula ||
-      labelValue(labels, "formula:") ||
+      formulaLabel ||
       null;
     const project =
       task?.project ||
@@ -1248,11 +1491,9 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     );
     const pendingCleanup = pendingCleanupCount > 0;
 
-    let hcAddress = currentStep?.hcAddress || null;
-    if (!hcAddress) {
-      const withAddr = [...steps].reverse().find((s) => s.hcAddress);
-      hcAddress = withAddr?.hcAddress || null;
-    }
+    const liveStep = steps.find((step) => step.liveAgent || step.liveTerminal || step.livePane) || null;
+    const sessionStep = liveStep || currentStep || [...steps].reverse().find((step) => step.hcAddress) || null;
+    let hcAddress = sessionStep?.hcAddress || null;
     if (!hcAddress && taskPendingCleanups.length > 0) {
       hcAddress = taskPendingCleanups[0].hc_address || taskPendingCleanups[0].pane_id || null;
     }
@@ -1261,13 +1502,33 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     }
 
     const liveAgent =
-      currentStep?.liveAgent ||
+      sessionStep?.liveAgent ||
       (hcAddress ? lookup.findAgent(hcAddress, envObj) : null);
     const liveTerminal =
-      currentStep?.liveTerminal ||
+      sessionStep?.liveTerminal ||
       (hcAddress ? lookup.findTerminal(hcAddress, envObj) : null);
+    const livePane =
+      sessionStep?.livePane ||
+      (hcAddress ? lookup.findPane(hcAddress, envObj) : null);
+    const canonicalAddress = liveAgent?.address || liveTerminal?.address || livePane?.terminal || hcAddress || null;
+    const tabInfo = lookup.findSpaceTab(liveAgent?.tab || livePane?.tab);
+    const sessionInfo = canonicalAddress
+      ? {
+          terminal: canonicalAddress,
+          spaceId: liveAgent?.space || tabInfo?.space?.id || null,
+          spaceName: tabInfo?.space?.name || tabInfo?.space?.label || null,
+          tabId: liveAgent?.tab || livePane?.tab || tabInfo?.tab?.id || null,
+          tabName: tabInfo?.tab?.name || tabInfo?.tab?.title || tabInfo?.tab?.label || null,
+          paneId: livePane?.pane || livePane?.id || null,
+          hasAgent: Boolean(liveAgent),
+          hasPane: Boolean(livePane || liveAgent?.pane),
+          isLive: Boolean(liveAgent || liveTerminal || livePane),
+          machine: envObj?.machine || null,
+          envSpace: envObj?.space || null,
+        }
+      : null;
     const agentStatus =
-      currentStep?.agentStatus || resolveLiveStatus(liveAgent, liveTerminal);
+      sessionStep?.agentStatus || resolveLiveStatus(liveAgent, liveTerminal);
 
     const attempt = currentStep?.currentAttempt || null;
     const worktree =
@@ -1284,12 +1545,6 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
 
     const bdStatus = issue?.status || null;
     const taskStatus = task?.status || null;
-    const isOptedIn = hasLabel(labels, "roscaelifer");
-    const needsReview = hasLabel(labels, "roscaelifer-review");
-    const hasFailedLabel =
-      hasLabel(labels, "roscaelifer-failed") ||
-      hasLabel(labels, "roscaelifer-cancelled") ||
-      hasLabel(labels, "roscaelifer-invalid");
     const isReady = beadId ? readySet.has(beadId) : false;
 
     const blockedBy = [];
@@ -1298,14 +1553,32 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       const target = parseDepTarget(dep);
       if (target) blockedBy.push(target);
     }
-    const isBlocked = blockedBy.some((depId) => {
-      const target = issueMap.get(depId);
-      return target ? target.status !== "closed" : true;
-    });
+    const isBlocked =
+      bdStatus === "closed"
+        ? false
+        : blockedBy.some((depId) => {
+            const target = issueMap.get(depId);
+            return target ? target.status !== "closed" : true;
+          });
+    const beadColumn =
+      !beadId
+        ? null
+        : bdStatus === "closed"
+          ? "closed"
+          : bdStatus === "deferred" || bdStatus === "backlog"
+            ? "backlog"
+            : bdStatus === "in_progress"
+              ? "in_progress"
+              : bdStatus === "blocked" || isBlocked
+                ? "blocked"
+                : "ready";
 
     const waitingApprovalStep = steps.find((s) => s.status === "waiting_approval");
     const needsHumanStep = steps.find((s) => s.status === "needs_human");
     const failedStep = steps.find((s) => s.status === "failed");
+    // Only a roscaelifer task whose step is actually executing counts as running.
+    const hasRunningStep = steps.some((s) => s.status === "running");
+    const isRunningTask = taskStatus === "active" && hasRunningStep;
 
     let column = "ready";
     let actionReason = null;
@@ -1314,7 +1587,11 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       if (needsReview) {
         column = "review";
       } else if (taskStatus === "active") {
-        column = waitingApprovalStep || needsHumanStep ? "action" : "running";
+        column = waitingApprovalStep || needsHumanStep
+          ? "action"
+          : hasRunningStep
+            ? "running"
+            : "closed";
       } else {
         column = "closed";
       }
@@ -1329,20 +1606,23 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       actionReason = "needs_human";
     } else if (hasFailedLabel) {
       column = "action";
-      actionReason = hasLabel(labels, "roscaelifer-invalid")
-        ? "invalid"
-        : hasLabel(labels, "roscaelifer-cancelled")
-          ? "cancelled"
-          : "failed";
+      actionReason = isInvalidLabel ? "invalid" : isCancelledLabel ? "cancelled" : "failed";
     } else if (
       (taskStatus === "failed" || taskStatus === "cancelled") &&
       !(isOptedIn && isReady && intakePlan?.action === "create")
     ) {
       column = "action";
       actionReason = taskStatus;
-    } else if (taskStatus === "active" || bdStatus === "in_progress") {
+    } else if (isRunningTask) {
+      // Only an active task with a step actually executing is running.
       column = "running";
+    } else if (taskStatus === "active" || isOptedIn) {
+      // Already queued for work: an active task whose steps are all pending is
+      // waiting for a concurrency slot, and an opted-in (`roscaelifer` label)
+      // bead is waiting for intake/dependencies/a tick.
+      column = "queue";
     } else {
+      // A plain bead nobody has queued yet.
       column = "ready";
     }
 
@@ -1364,10 +1644,12 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       bdStatus,
       taskStatus,
       column,
+      beadColumn,
       actionReason,
       labels,
       formula,
       env: envName,
+      maxRunning: envObj?.maxRunning ?? null,
       machine: envObj?.machine || null,
       project,
       assignee: issue?.assignee || "",
@@ -1377,7 +1659,8 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       steps,
       currentStep,
       waitingStep: waitingApprovalStep || needsHumanStep || failedStep || null,
-      hcAddress,
+      hcAddress: canonicalAddress,
+      sessionInfo,
       worktree,
       branch,
       link,
@@ -1393,12 +1676,30 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       isOptedIn,
       needsReview,
       hasFailedLabel,
+      hasRunningStep,
+      isRunningTask,
       isBlocked,
       createdAt: issue?.created_at || task?.created_at || null,
       updatedAt: task?.updated_at || issue?.created_at || null,
       issue,
       task,
     };
+    item._searchText = [
+      item.id,
+      item.beadId,
+      item.taskId,
+      item.title,
+      item.env,
+      item.branch,
+      ...item.labels,
+      item.formula,
+      item.project,
+      item.assignee,
+      item.parent,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
     return item;
   }
 
@@ -1428,23 +1729,49 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       const ar = a.agentStatus ? AGENT_RANK[a.agentStatus] ?? 0 : 0;
       const br = b.agentStatus ? AGENT_RANK[b.agentStatus] ?? 0 : 0;
       if (ar !== br) return br - ar;
-      return a.id.localeCompare(b.id);
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
 
   const columns = {
     ready: sortItems(items.filter((i) => i.column === "ready")),
+    queue: sortItems(items.filter((i) => i.column === "queue")),
     running: sortItems(items.filter((i) => i.column === "running")),
     action: sortItems(items.filter((i) => i.column === "action")),
     review: sortItems(items.filter((i) => i.column === "review")),
     closed: sortItems(items.filter((i) => i.column === "closed")),
   };
+  const beadItems = items.filter((item) => Boolean(item.beadId));
+  const beadColumns = {
+    backlog: sortItems(beadItems.filter((item) => item.beadColumn === "backlog")),
+    ready: sortItems(beadItems.filter((item) => item.beadColumn === "ready")),
+    in_progress: sortItems(beadItems.filter((item) => item.beadColumn === "in_progress")),
+    blocked: sortItems(beadItems.filter((item) => item.beadColumn === "blocked")),
+    closed: sortItems(beadItems.filter((item) => item.beadColumn === "closed")),
+  };
 
   // Build epic summaries (plus expose epics in itemsById for dependency lookup if referenced).
+  // Index each item under matching epic IDs once, instead of scanning all items for every epic.
+  const epicIdSet = new Set(epicsRaw.map((epic) => epic.id));
+  const childrenByEpic = new Map();
+  for (const item of items) {
+    const matched = new Set();
+    if (item.parent && epicIdSet.has(item.parent)) matched.add(item.parent);
+    if (item.beadId) {
+      const parts = String(item.beadId).split(".");
+      let prefix = parts[0];
+      for (let i = 1; i < parts.length; i += 1) {
+        if (epicIdSet.has(prefix)) matched.add(prefix);
+        prefix += `.${parts[i]}`;
+      }
+    }
+    for (const epicId of matched) {
+      if (!childrenByEpic.has(epicId)) childrenByEpic.set(epicId, []);
+      childrenByEpic.get(epicId).push(item);
+    }
+  }
   const epics = epicsRaw.map((epic) => {
-    const children = items.filter(
-      (i) => i.parent === epic.id || (i.beadId && i.beadId.startsWith(`${epic.id}.`)),
-    );
-    const counts = { ready: 0, running: 0, action: 0, review: 0, closed: 0, total: children.length };
+    const children = childrenByEpic.get(epic.id) || [];
+    const counts = { ready: 0, queue: 0, running: 0, action: 0, review: 0, closed: 0, total: children.length };
     for (const c of children) counts[c.column] = (counts[c.column] || 0) + 1;
     const doneCount = counts.closed + counts.review;
     const progress = counts.total > 0 ? doneCount / counts.total : epic.status === "closed" ? 1 : 0;
@@ -1488,6 +1815,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     items,
     itemsById,
     columns,
+    beadColumns,
     epics,
     envs,
     envsByName,
@@ -1503,5 +1831,6 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     paths: snap.paths || {},
     generatedAt: snap.generated_at || null,
     spacesCount: (spaces || []).length,
+    panesCount: (panes || []).length,
   };
 }

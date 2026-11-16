@@ -1,62 +1,108 @@
-/**
- * Column scroll lock.
- *
- * A column scrolls vertically inside a horizontally scrolling row. A fast
- * vertical swipe on a touchpad regularly carries a little horizontal drift,
- * which the outer horizontal container would otherwise read as a sideways pan.
- *
- * Each gesture therefore locks to a single axis: once the accumulated motion is
- * clearly vertical, the event is swallowed so it never reaches the outer
- * horizontal scroller. The lock is kept past the end of the touch phase because
- * momentum keeps sending events whose residual sideways component must not pan
- * the board.
- */
+const LINE_PX = 40;
+
+/** Pixel deltas, taking the dominant axis when a backend reports both. */
+function dominantPixelDelta(delta) {
+  const x = delta?.x ?? 0;
+  const y = delta?.y ?? 0;
+  return Math.abs(x) > Math.abs(y) ? x : y;
+}
 
 /**
- * Create an independent scroll-wheel handler with its own gesture state.
+ * Lock a nested scrolling gesture to one axis.
  *
- * The returned function can be attached to `on_scroll_wheel` of a vertically
- * scrollable column nested in a horizontally scrollable container.
- *
- * @returns {(e: any, cx: any) => void} Wheel handler bound to this gesture state.
+ * The handler is intentionally usable both on a transparent wheel guard over
+ * a vertical scroller and on a custom horizontal viewport. Horizontal motion
+ * is sent to `onHorizontalDelta`; vertical motion is left to the element below
+ * the guard so its normal vertical scrolling still works.
  */
-export function createColumnScrollLock() {
-  const g = { axis: null, accX: 0, accY: 0, lastAt: 0 };
+export function createColumnScrollLock({ onHorizontalDelta } = {}) {
+  const g = { axis: null, accX: 0, accY: 0, lastAt: 0, pendingX: 0 };
 
-  return function handleColumnScrollWheel(e, cx) {
+  const reset = () => {
+    g.axis = null;
+    g.accX = 0;
+    g.accY = 0;
+    g.pendingX = 0;
+  };
+
+  const handleColumnScrollWheel = (e, cx) => {
     if (!e) return;
-    // Shift is an explicit request for horizontal scrolling.
-    if (e?.modifiers?.shift) return;
-    const lines = e?.delta_lines;
-    if (lines) {
-      // A discrete wheel notch: its dominant axis is the whole intent.
-      if (Math.abs(lines?.x ?? 0) > Math.abs(lines?.y ?? 0)) return;
+
+    // Shift-wheel is an explicit horizontal request. Some backends report it
+    // in delta_lines (line counts), others in pixel delta.
+    if (e?.modifiers?.shift) {
+      const rawDelta = e?.delta_lines
+        ? (e.delta_lines.y ?? 0) * LINE_PX
+        : dominantPixelDelta(e?.delta);
+      g.axis = "x";
+      g.pendingX = 0;
+      if (rawDelta !== 0) onHorizontalDelta?.(rawDelta, cx);
       cx?.stop_propagation();
       return;
     }
-    const now = Date.now();
-    if (e?.touch_phase === "started" || now - g.lastAt > 250) {
-      g.axis = null;
-      g.accX = 0;
-      g.accY = 0;
+
+    // Discrete wheel events already carry their intended axis. Keep the axis
+    // in the state so an outer handler can stop vertical bubbling after the
+    // guard lets it pass through.
+    if (e?.delta_lines) {
+      // Line counts arrive without pixel meaning; scale them to a wheel step so
+      // line-reporting devices scroll the lanes like pixel-reporting ones.
+      const lx = (e.delta_lines.x ?? 0) * LINE_PX;
+      const ly = (e.delta_lines.y ?? 0) * LINE_PX;
+      if (Math.abs(lx) > Math.abs(ly)) {
+        g.axis = "x";
+        g.pendingX = 0;
+        if (lx !== 0) onHorizontalDelta?.(lx, cx);
+        cx?.stop_propagation();
+      } else {
+        g.axis = "y";
+      }
+      return;
     }
+
+    const now = Date.now();
+    if (e?.touch_phase === "started" || now - g.lastAt > 250) reset();
     g.lastAt = now;
-    const dx = Math.abs(e?.delta?.x ?? 0);
-    const dy = Math.abs(e?.delta?.y ?? 0);
+
+    const rawDx = e?.delta?.x ?? 0;
+    const rawDy = e?.delta?.y ?? 0;
+    const dx = Math.abs(rawDx);
+    const dy = Math.abs(rawDy);
     g.accX += dx;
     g.accY += dy;
-    // Decide the axis from accumulated motion so one jittery frame cannot
-    // flip it. The lock is kept past `ended`: momentum keeps sending events
-    // with a residual sideways component that must not pan the board.
+    if (g.axis === null && dx > dy) g.pendingX += rawDx;
+
     if (g.axis === null) {
       const total = g.accX + g.accY;
-      if ((g.accX >= 4 && g.accX > g.accY * 1.5) || (total >= 6 && g.accX > g.accY * 1.5)) {
+      if ((g.accX >= 3 && g.accX > g.accY * 1.35) || (total >= 5 && g.accX > g.accY * 1.35)) {
         g.axis = "x";
-      } else if (g.accY >= 4 || total >= 6) {
+      } else if (g.accY >= 3 || total >= 5) {
         g.axis = "y";
       }
     }
-    if (g.axis === "x") return;
-    if (g.axis === "y" || dy >= dx) cx?.stop_propagation();
+
+    if (g.axis === "x") {
+      if (g.pendingX !== 0) {
+        onHorizontalDelta?.(g.pendingX, cx);
+        g.pendingX = 0;
+      } else if (rawDx !== 0) {
+        onHorizontalDelta?.(rawDx, cx);
+      }
+      cx?.stop_propagation();
+      return;
+    }
+
+    if (g.axis === "y") return;
+
+    // Before the axis is locked, suppress a horizontally dominant first frame
+    // so its tiny vertical component cannot reach the nested vertical scroller.
+    if (dx > dy) cx?.stop_propagation();
+    // A vertically dominant undecided frame is deliberately left untouched.
   };
+
+  handleColumnScrollWheel.isHorizontal = () => g.axis === "x";
+  handleColumnScrollWheel.getGestureState = () => ({ ...g });
+  return handleColumnScrollWheel;
 }
+
+export const createHorizontalWheelHandler = createColumnScrollLock;

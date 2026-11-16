@@ -13,9 +13,18 @@ import {
   Textarea,
   TextareaState,
 } from "gpui-base";
-import { closeOverlay, pickFolder, props, setShared, theme } from "herdr";
+import { closeOverlay, focused, panes, pickFolder, props, setShared, spaces, theme } from "herdr";
 import { createActions } from "./actions.js";
-import { clearActiveRepo } from "./store.js";
+import {
+  clearActiveProjectMirror,
+  deleteGlobalProject,
+  detectCurrentWorkspaceProject,
+  loadGlobalProjectsConfig,
+  repoIdentityKey,
+  saveActiveProjectMirror,
+  saveGlobalProjectsConfig,
+  upsertGlobalProject,
+} from "./store.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
 const normalizeMachine = (machine) => (typeof machine === "string" ? machine.trim() : "");
@@ -105,6 +114,7 @@ export class DialogController {
     if (this.dialogType === "enqueue") {
       this.formula = typeof formulaDefault === "string" ? formulaDefault : "";
       this.env = typeof envDefault === "string" ? envDefault : "";
+      this.wakeDeferred = this.item?.bdStatus === "deferred";
       this.handle.focus();
     } else if (this.dialogType === "create") {
       this.titleInput = InputState.new({ placeholder: "Short actionable bead title" });
@@ -173,16 +183,23 @@ export class DialogController {
       if (!this.preview) {
         this.loadCleanPreview(cx);
       }
-    } else if (this.dialogType === "repo-config") {
-      this.repoInput = InputState.new({ value: this.ctx.repo ?? "", placeholder: "/path/to/repo" });
-      this.machineInput = InputState.new({ value: this.ctx.machine ?? "", placeholder: "remote machine (optional)" });
-      this.dbInput = InputState.new({ value: this.ctx.db ?? "", placeholder: ".roscaelifer/roscaelifer.db" });
-      this.bdDirInput = InputState.new({ value: this.ctx.bdDir ?? "", placeholder: "/path/to/repo/.beads" });
-      this.configInput = InputState.new({ value: this.ctx.config ?? "", placeholder: "roscaelifer.toml" });
-      this.formulasDirInput = InputState.new({ value: this.ctx.formulasDir ?? "", placeholder: "formulas" });
-      this.binInput = InputState.new({ value: this.ctx.bin ?? "", placeholder: "roscaelifer-herdr (optional override)" });
-      this.focusedField = "repo";
+    } else if (this.dialogType === "repo-config" || this.dialogType === "project-config") {
+      this.projectsConfig = p.projectsConfig || { version: 1, activeProject: "", projects: [] };
+      this.editingProjectId = null;
+      this.projectFormTouched = false;
+      this.autoProjectName = "";
+      this.projectNameInput = InputState.new({ value: "", placeholder: "A name for this project" });
+      this.repoInput = InputState.new({ value: "", placeholder: "/path/to/project (optional)" });
+      this.machineInput = InputState.new({ value: "", placeholder: "remote machine (optional)" });
+      this.dbInput = InputState.new({ value: "", placeholder: ".roscaelifer/roscaelifer.db" });
+      this.bdDirInput = InputState.new({ value: "", placeholder: "/path/to/project/.beads" });
+      this.configInput = InputState.new({ value: "", placeholder: "roscaelifer.toml" });
+      this.formulasDirInput = InputState.new({ value: "", placeholder: "formulas" });
+      this.binInput = InputState.new({ value: "", placeholder: "roscaelifer-herdr (optional override)" });
+      this.envInput = InputState.new({ value: "", placeholder: "optional default environment" });
+      this.focusedField = "name";
       for (const [name, st] of [
+        ["name", this.projectNameInput],
         ["repo", this.repoInput],
         ["machine", this.machineInput],
         ["db", this.dbInput],
@@ -190,6 +207,7 @@ export class DialogController {
         ["config", this.configInput],
         ["formulasDir", this.formulasDirInput],
         ["bin", this.binInput],
+        ["env", this.envInput],
       ]) {
         st.on("focus", (_e, cx) => {
           this.focusedField = name;
@@ -199,9 +217,25 @@ export class DialogController {
           if (this.focusedField === name) this.focusedField = null;
           cx.notify();
         });
+        st.on("change", (_e, cx) => {
+          this.projectFormTouched = true;
+          this.error = null;
+          cx.notify();
+        });
       }
-      this.repoInput.focus();
-      cx.timer.after(120, () => this.repoInput.focus());
+      this.setProjectForm(this.resolveProjectForForm(), false);
+      this.projectNameInput.focus();
+      cx.timer.after(120, () => this.projectNameInput.focus());
+      cx.spawn(async (loadCx) => {
+        try {
+          this.projectsConfig = await loadGlobalProjectsConfig();
+          if (!this.projectFormTouched) this.setProjectForm(this.resolveProjectForForm(), false);
+        } catch (err) {
+          this.error = String(err?.message ?? err);
+        } finally {
+          loadCx.notify();
+        }
+      });
     }
   }
 
@@ -233,7 +267,7 @@ export class DialogController {
     });
   }
 
-  submit(cx) {
+  submit(cx, dispatchNow = false) {
     if (this.busy) return;
     if (this.dialogType === "enqueue") {
       const beadId = this.item?.beadId || this.item?.id;
@@ -242,12 +276,25 @@ export class DialogController {
         cx.notify();
         return;
       }
+      const selectedEnv = this.envs.find((entry) => (typeof entry === "string" ? entry : entry?.name) === this.env);
+      const maxRunning = typeof selectedEnv === "object" ? selectedEnv?.maxRunning : undefined;
       this.runMutation(cx, () =>
-        this.actions.enqueueBead(beadId, {
-          formula: this.formula || undefined,
-          env: this.env || undefined,
-          currentLabels: this.item?.labels || [],
-        }),
+        dispatchNow
+          ? this.actions.dispatchBead(beadId, {
+              formula: this.formula || undefined,
+              env: this.env || undefined,
+              currentLabels: this.item?.labels || [],
+              bdStatus: this.item?.bdStatus || null,
+              wakeDeferred: this.wakeDeferred,
+              maxRunning,
+            })
+          : this.actions.enqueueBead(beadId, {
+              formula: this.formula || undefined,
+              env: this.env || undefined,
+              currentLabels: this.item?.labels || [],
+              bdStatus: this.item?.bdStatus || null,
+              wakeDeferred: this.wakeDeferred,
+            }),
       );
       return;
     }
@@ -304,8 +351,10 @@ export class DialogController {
       return;
     }
 
-    if (this.dialogType === "repo-config") {
-      const nextCtx = {
+    if (this.dialogType === "repo-config" || this.dialogType === "project-config") {
+      const name = this.projectNameInput.value().trim();
+      const nextProject = {
+        name,
         repo: this.repoInput.value().trim(),
         machine: this.machineInput.value().trim(),
         db: this.dbInput.value().trim(),
@@ -313,11 +362,38 @@ export class DialogController {
         config: this.configInput.value().trim(),
         formulasDir: this.formulasDirInput.value().trim(),
         bin: this.binInput.value().trim(),
+        env: this.envInput.value().trim(),
         updatedAt: Date.now(),
       };
-      setShared("roscaelifer.ctxOverride", nextCtx);
-      setShared("roscaelifer.refresh", Date.now());
-      this.close();
+      if (!name) {
+        this.error = "Project Name is required.";
+        this.projectNameInput.focus();
+        cx.notify();
+        return;
+      }
+      if (!nextProject.repo && !nextProject.db && !nextProject.bdDir && !nextProject.config && !nextProject.formulasDir) {
+        this.error = "Provide at least one of Project Root, DB Path, Beads Directory, Herdr Env Config, or Formulas Directory.";
+        cx.notify();
+        return;
+      }
+      this.busy = true;
+      this.error = null;
+      cx.notify();
+      cx.spawn(async (saveCx) => {
+        try {
+          const result = await upsertGlobalProject(nextProject, this.editingProjectId);
+          const savedCtx = { ...result.project, projectId: result.project.id, source: "project" };
+          saveActiveProjectMirror(result.project);
+          setShared("roscaelifer.ctxOverride", { ...savedCtx, updatedAt: Date.now() });
+          setShared("roscaelifer.refresh", Date.now());
+          this.close();
+        } catch (err) {
+          this.error = String(err?.message ?? err);
+        } finally {
+          this.busy = false;
+          saveCx.notify();
+        }
+      });
     }
   }
 
@@ -501,6 +577,19 @@ export class DialogController {
   renderEnqueue(t) {
     return v_flex()
       .gap(12)
+      .when(Boolean(this.item?.isBlocked), (el) =>
+        el.child(
+          div()
+            .p(8)
+            .rounded(7)
+            .bg(alpha(t.blocked || t.ansi3, "18"))
+            .border_1()
+            .border_color(alpha(t.blocked || t.ansi3, "55"))
+            .text_size(11.5)
+            .text_color(t.blocked || t.ansi3)
+            .child("This bead has open blockers. Queue will wait until they are unblocked; Dispatch Now is disabled."),
+        ),
+      )
       .when(Boolean(this.item), (el) =>
         el.child(
           v_flex()
@@ -515,7 +604,28 @@ export class DialogController {
         ),
       )
       .child(this.renderSelect(t, "formula", "Formula", this.formulaOptions(), this.formula, (v) => (this.formula = v)))
-      .child(this.renderSelect(t, "env", "Environment", this.envOptions(), this.env, (v) => (this.env = v)));
+      .child(this.renderSelect(t, "env", "Environment", this.envOptions(), this.env, (v) => (this.env = v)))
+      .when(this.item?.bdStatus === "deferred", (el) =>
+        el.child(
+          v_flex()
+            .gap(3)
+            .child(
+              Checkbox.new("dlg-wake-deferred")
+                .checked(this.wakeDeferred)
+                .on_change((checked, cx) => {
+                  this.wakeDeferred = Boolean(checked);
+                  cx.notify();
+                })
+                .flex()
+                .items_center()
+                .gap(8)
+                .cursor_pointer()
+                .child(div().size(16).rounded(4).border_1().border_color(this.wakeDeferred ? t.accent : t.input).bg(this.wakeDeferred ? t.accent : t.background).text_size(11).text_color(t.accent_foreground).child(this.wakeDeferred ? "✓" : ""))
+                .child(div().text_size(12).text_color(t.foreground).child("Wake deferred bead (set open & clear defer)")),
+            )
+            .child(div().pl(24).text_size(11).text_color(t.dim).child("The bead becomes eligible for bd ready and the next roscaelifer intake.")),
+        ),
+      );
   }
 
   renderCreate(t) {
@@ -760,24 +870,180 @@ export class DialogController {
       );
   }
 
-  renderRepoConfig(t) {
-    const updateRepoPaths = (folder) => {
-      const prevRepo = this.repoInput.value().trim();
-      const derived = [
-        [this.dbInput, `${prevRepo}/.roscaelifer/roscaelifer.db`, `${folder}/.roscaelifer/roscaelifer.db`],
-        [this.bdDirInput, `${prevRepo}/.beads`, `${folder}/.beads`],
-        [this.configInput, `${prevRepo}/roscaelifer.toml`, `${folder}/roscaelifer.toml`],
-        [this.formulasDirInput, `${prevRepo}/formulas`, `${folder}/formulas`],
-      ];
-      this.repoInput.set_value(folder);
-      for (const [input, oldDefault, nextDefault] of derived) {
-        const current = input.value().trim();
-        if (!current || current === oldDefault) {
-          input.set_value(nextDefault);
-        }
-      }
-    };
+  hasContextPaths(ctx = this.ctx) {
+    return Boolean(ctx && (ctx.repo || ctx.db || ctx.bdDir || ctx.config || ctx.formulasDir));
+  }
 
+  resolveProjectForForm() {
+    const projects = Array.isArray(this.projectsConfig?.projects) ? this.projectsConfig.projects : [];
+    const active = projects.find((project) => project.id === this.projectsConfig.activeProject);
+    if (active) return active;
+    const ctxProjectId = this.ctx?.projectId;
+    if (ctxProjectId) {
+      const byId = projects.find((project) => project.id === ctxProjectId || project.projectId === ctxProjectId);
+      if (byId) return byId;
+    }
+    if (this.hasContextPaths()) {
+      const ctxKey = repoIdentityKey(this.ctx);
+      const byIdentity = projects.find((project) => repoIdentityKey(project) === ctxKey);
+      if (byIdentity) return byIdentity;
+      return this.ctx;
+    }
+    return null;
+  }
+
+  setProjectForm(project, markTouched = true) {
+    const value = project || {};
+    this.editingProjectId = value.id || value.projectId || null;
+    const repo = value.repo || "";
+    const base = String(repo || value.bdDir || value.db || value.config || value.formulasDir || "").replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
+    this.autoProjectName = base;
+    this.projectNameInput.set_value(value.name || base);
+    this.repoInput.set_value(repo);
+    this.machineInput.set_value(value.machine || "");
+    this.dbInput.set_value(value.db || "");
+    this.bdDirInput.set_value(value.bdDir || "");
+    this.configInput.set_value(value.config || "");
+    this.formulasDirInput.set_value(value.formulasDir || "");
+    this.binInput.set_value(value.bin || "");
+    this.envInput.set_value(value.env || "");
+    this.projectFormTouched = markTouched;
+  }
+
+  clearProjectForm(cx) {
+    this.setProjectForm(null, false);
+    this.editingProjectId = null;
+    this.projectNameInput.focus();
+    cx?.notify?.();
+  }
+
+  updateProjectRoot(folder) {
+    const previous = this.repoInput.value().trim();
+    const derived = [
+      [this.dbInput, `${previous}/.roscaelifer/roscaelifer.db`, `${folder}/.roscaelifer/roscaelifer.db`],
+      [this.bdDirInput, `${previous}/.beads`, `${folder}/.beads`],
+      [this.configInput, `${previous}/roscaelifer.toml`, `${folder}/roscaelifer.toml`],
+      [this.formulasDirInput, `${previous}/formulas`, `${folder}/formulas`],
+    ];
+    const currentName = this.projectNameInput.value().trim();
+    const nextName = String(folder).replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
+    this.repoInput.set_value(folder);
+    if (!currentName || currentName === this.autoProjectName) this.projectNameInput.set_value(nextName);
+    this.autoProjectName = nextName;
+    for (const [input, oldDefault, nextDefault] of derived) {
+      if (!input.value().trim() || input.value().trim() === oldDefault) input.set_value(nextDefault);
+    }
+    this.projectFormTouched = true;
+  }
+
+  applyDetectedProject(detected) {
+    const value = detected && typeof detected === "object" ? detected : {};
+    // Keep the id of the project the user is currently editing.
+    const nextRepo = typeof value.repo === "string" ? value.repo.trim() : "";
+    const previousRepo = this.repoInput.value().trim();
+    const wasEmpty = {
+      machine: !this.machineInput.value().trim(),
+      db: !this.dbInput.value().trim(),
+      bdDir: !this.bdDirInput.value().trim(),
+      config: !this.configInput.value().trim(),
+      formulasDir: !this.formulasDirInput.value().trim(),
+      bin: !this.binInput.value().trim(),
+      env: !this.envInput.value().trim(),
+    };
+    if (nextRepo && nextRepo !== previousRepo) this.updateProjectRoot(nextRepo);
+
+    const detectedName = String(value.name || "").trim()
+      || nextRepo.replace(/\/+$/, "").split("/").filter(Boolean).pop()
+      || "";
+    const currentName = this.projectNameInput.value().trim();
+    if (!currentName || currentName === this.autoProjectName) {
+      if (detectedName) this.projectNameInput.set_value(detectedName);
+      this.autoProjectName = detectedName;
+    }
+
+    const fillEmpty = (input, detectedValue) => {
+      const text = typeof detectedValue === "string" ? detectedValue.trim() : "";
+      if (text && !input.value().trim()) input.set_value(text);
+    };
+    if (wasEmpty.machine) fillEmpty(this.machineInput, value.machine);
+    if (wasEmpty.db) fillEmpty(this.dbInput, value.db);
+    if (wasEmpty.bdDir) fillEmpty(this.bdDirInput, value.bdDir);
+    if (wasEmpty.config) fillEmpty(this.configInput, value.config);
+    if (wasEmpty.formulasDir) fillEmpty(this.formulasDirInput, value.formulasDir);
+    if (wasEmpty.bin) fillEmpty(this.binInput, value.bin);
+    if (wasEmpty.env) fillEmpty(this.envInput, value.env);
+    this.projectFormTouched = true;
+  }
+
+  detectProject(cx) {
+    this.busy = true;
+    this.error = null;
+    cx.notify();
+    cx.spawn(async (detectCx) => {
+      try {
+        const detected = await detectCurrentWorkspaceProject({ focusedInfo: focused(), spaceList: spaces(), paneList: panes() });
+        if (!detected) {
+          this.error = "No roscaelifer project detected in the focused workspace.";
+          return;
+        }
+        this.applyDetectedProject(detected);
+      } catch (err) {
+        this.error = String(err?.message ?? err);
+      } finally {
+        this.busy = false;
+        detectCx.notify();
+      }
+    });
+  }
+
+  deleteProject(cx) {
+    if (!this.editingProjectId || this.busy) return;
+    this.busy = true;
+    this.error = null;
+    cx.notify();
+    cx.spawn(async (deleteCx) => {
+      try {
+        const result = await deleteGlobalProject(this.editingProjectId);
+        this.projectsConfig = result.config;
+        if (result.wasActive) {
+          clearActiveProjectMirror();
+          setShared("roscaelifer.ctxOverride", { __autoDetect: true, ts: Date.now() });
+          setShared("roscaelifer.refresh", Date.now());
+        }
+        const next = this.projectsConfig.projects[0] || null;
+        this.setProjectForm(next, false);
+      } catch (err) {
+        this.error = String(err?.message ?? err);
+      } finally {
+        this.busy = false;
+        deleteCx.notify();
+      }
+    });
+  }
+
+  useAutoDetect(cx) {
+    if (this.busy) return;
+    this.busy = true;
+    cx.notify();
+    cx.spawn(async (autoCx) => {
+      try {
+        const config = await loadGlobalProjectsConfig();
+        config.activeProject = "";
+        await saveGlobalProjectsConfig(config);
+        clearActiveProjectMirror();
+        setShared("roscaelifer.ctxOverride", { __autoDetect: true, ts: Date.now() });
+        setShared("roscaelifer.refresh", Date.now());
+        this.close();
+      } catch (err) {
+        this.error = String(err?.message ?? err);
+      } finally {
+        this.busy = false;
+        autoCx.notify();
+      }
+    });
+  }
+
+  renderProjectConfig(t) {
     const fieldRow = (name, label, inputState, pickable = false) =>
       v_flex()
         .gap(4)
@@ -785,107 +1051,52 @@ export class DialogController {
         .child(
           h_flex()
             .gap(6)
-            .child(
-              Input.new(inputState)
-                .flex_1()
-                .h(32)
-                .px(10)
-                .rounded(7)
-                .border_1()
-                .border_color(this.focusedField === name ? t.accent : t.input)
-                .bg(t.background)
-                .text_size(12)
-                .text_color(t.foreground),
-            )
-            .when(pickable, (el) =>
-              el.child(
-                this.renderBtn(t, `dlg-pick-${name}`, "Browse…", (_e, cx) => {
-                  cx.spawn(async (cx) => {
-                    const folder = await pickFolder({ prompt: `Select ${label}` });
-                    if (folder) {
-                      if (name === "repo") {
-                        updateRepoPaths(folder);
-                      } else {
-                        inputState.set_value(folder);
-                      }
-                      cx.notify();
-                    }
-                  });
-                }),
-              ),
-            ),
+            .child(Input.new(inputState).flex_1().h(32).px(10).rounded(7).border_1().border_color(this.focusedField === name ? t.accent : t.input).bg(t.background).text_size(12).text_color(t.foreground))
+            .when(pickable, (el) => el.child(this.renderBtn(t, `dlg-pick-${name}`, "Browse…", (_e, cx) => {
+              cx.spawn(async (pickCx) => {
+                const folder = await pickFolder({ prompt: `Select ${label}` });
+                if (folder) {
+                  if (name === "repo") this.updateProjectRoot(folder);
+                  else inputState.set_value(folder);
+                  pickCx.notify();
+                }
+              });
+            }))),
         );
 
-    const history = Array.isArray(this.p.history) ? this.p.history : [];
-    const historyLabels = history.map((h, idx) => h.label || h.repo || h.db || `Repo ${idx + 1}`);
-    const labelCounts = new Map();
-    for (const label of historyLabels) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
-    const displayHistoryLabel = (h, idx) => {
-      const label = historyLabels[idx];
-      if ((labelCounts.get(label) || 0) < 2) return label;
-      const base = h.repo || h.bdDir || h.db || "";
-      const parent = base.replace(/\/+$/, "").split("/").filter(Boolean).slice(-2, -1)[0] || "repo";
-      return h.machine ? `${label} @${h.machine}` : `${label} · ${parent}`;
+    const projects = Array.isArray(this.projectsConfig?.projects) ? this.projectsConfig.projects : [];
+    const counts = new Map();
+    for (const project of projects) counts.set(project.name, (counts.get(project.name) || 0) + 1);
+    const projectLabel = (project) => {
+      if ((counts.get(project.name) || 0) < 2) return project.name;
+      const base = project.repo || project.bdDir || project.db || project.config || "";
+      const parent = base.replace(/\/+$/, "").split("/").filter(Boolean).slice(-2, -1)[0] || "project";
+      return project.machine ? `${project.name} @${project.machine}` : `${project.name} · ${parent}`;
     };
-    const currentRepo = this.repoInput.value().trim();
-    const currentMachine = normalizeMachine(this.machineInput.value());
-    const currentDB = this.dbInput.value().trim();
-    const currentBDDir = this.bdDirInput.value().trim();
     return v_flex()
       .gap(10)
-      .child(div().text_size(12).text_color(t.dim).child("Override auto-detected repository paths for this mod view."))
-      .when(history.length > 0, (el) =>
-        el.child(
-          v_flex()
-            .gap(4)
-            .child(div().text_size(11).font_medium().text_color(t.dim).child("Recent Repositories"))
-            .child(
-              h_flex()
-                .gap(6)
-                .flex_wrap()
-                .children(
-                  history.slice(0, 6).map((h, idx) => {
-                    const active =
-                      normalizeMachine(h.machine) === currentMachine &&
-                      ((h.repo && String(h.repo).trim() === currentRepo) ||
-                        (h.db && String(h.db).trim() === currentDB) ||
-                        (h.bdDir && String(h.bdDir).trim() === currentBDDir));
-                    return div()
-                      .id(`dlg-hist-${idx}`)
-                      .px(8)
-                      .py(4)
-                      .rounded(5)
-                      .border_1()
-                      .border_color(active ? t.accent : t.border)
-                      .bg(active ? t.selected : t.raised)
-                      .text_size(11.5)
-                      .text_color(t.foreground)
-                      .font_medium()
-                      .cursor_pointer()
-                      .hover((s) => s.bg(t.hover))
-                      .on_click((_e, cx) => {
-                        this.repoInput.set_value(h.repo || "");
-                        this.machineInput.set_value(h.machine || "");
-                        this.dbInput.set_value(h.db || "");
-                        this.bdDirInput.set_value(h.bdDir || "");
-                        this.configInput.set_value(h.config || "");
-                        this.formulasDirInput.set_value(h.formulasDir || "");
-                        this.binInput.set_value(h.bin || "");
-                        cx.notify();
-                      })
-                      .child(displayHistoryLabel(h, idx));
-                  }),
-                ),
-            ),
-        ),
+      .child(div().text_size(12).text_color(t.dim).child("Manage saved projects (~/.config/roscaelifer/projects.json) or switch the active project."))
+      .child(
+        h_flex().items_center().justify_between()
+          .child(div().text_size(12).font_medium().text_color(t.foreground).child("Saved Projects"))
+          .child(h_flex().gap(6)
+            .child(this.renderBtn(t, "dlg-new-project", "+ New Project", (_e, cx) => this.clearProjectForm(cx)))
+            .child(this.renderBtn(t, "dlg-auto-detect", "Auto-Detect", (_e, cx) => this.detectProject(cx)))),
       )
-      .child(fieldRow("repo", "Repository Root", this.repoInput, true))
-      .child(fieldRow("machine", "Machine (blank = local)", this.machineInput, false))
-      .child(fieldRow("db", "Roscaelifer DB Path (--db)", this.dbInput, false))
+      .when(projects.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().children(projects.map((project) => {
+        const active = project.id === this.projectsConfig.activeProject;
+        const selected = project.id === this.editingProjectId;
+        return div().id(`dlg-project-${project.id}`).px(8).py(5).rounded(6).border_1().border_color(active || selected ? t.accent : t.border).bg(active ? t.selected : t.raised).text_size(11.5).text_color(t.foreground).font_medium().cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.setProjectForm(project, false); cx.notify(); }).child(`${active ? "• " : ""}${projectLabel(project)}`);
+      }))))
+      .child(fieldRow("name", "Project Name", this.projectNameInput))
+      .child(fieldRow("repo", "Project Root (optional)", this.repoInput, true))
+      .child(fieldRow("machine", "Machine (blank = local)", this.machineInput))
+      .child(fieldRow("db", "Roscaelifer DB Path (--db)", this.dbInput))
       .child(fieldRow("bdDir", "Beads Directory (.beads)", this.bdDirInput, true))
-      .child(fieldRow("config", "Herdr Env Config (roscaelifer.toml)", this.configInput, false))
+      .child(fieldRow("config", "Herdr Env Config (roscaelifer.toml)", this.configInput))
       .child(fieldRow("formulasDir", "Formulas Directory", this.formulasDirInput, true))
-      .child(fieldRow("bin", "roscaelifer Binary", this.binInput, false));
+      .child(fieldRow("bin", "roscaelifer Binary", this.binInput))
+      .child(fieldRow("env", "Default Env (optional)", this.envInput));
   }
 
   render(_cx) {
@@ -893,18 +1104,20 @@ export class DialogController {
     const ct = this.cleanTarget();
     const cleanLabel = ct.taskId ? (ct.stepId ? `${ct.taskId}/${ct.stepId}` : String(ct.taskId)) : null;
     const titles = {
-      enqueue: "Enqueue Bead",
+      enqueue: "Queue / Dispatch Bead",
       create: "New Bead",
       reject: "Reject Review",
       "clean-preview": cleanLabel ? `Clean Preview · ${cleanLabel}` : "Clean Pending Resources",
-      "repo-config": "Repository Configuration",
+      "project-config": "Project Configuration",
+      "repo-config": "Project Configuration",
     };
     const confirmLabels = {
-      enqueue: this.busy ? "Enqueueing…" : "Enqueue",
+      enqueue: this.busy ? "Working…" : "Dispatch Now",
       create: this.busy ? "Creating…" : "Create Bead",
       reject: this.busy ? "Rejecting…" : "Reject & Reopen",
       "clean-preview": this.busy ? "Cleaning…" : "Confirm Clean",
-      "repo-config": "Save Override",
+      "project-config": this.busy ? "Saving…" : (this.editingProjectId ? "Save & Activate" : "Create & Activate"),
+      "repo-config": this.busy ? "Saving…" : (this.editingProjectId ? "Save & Activate" : "Create & Activate"),
     };
 
     const canSubmit =
@@ -972,7 +1185,7 @@ export class DialogController {
               .when(this.dialogType === "create", (el) => el.child(this.renderCreate(t)))
               .when(this.dialogType === "reject", (el) => el.child(this.renderReject(t)))
               .when(this.dialogType === "clean-preview", (el) => el.child(this.renderCleanPreview(t)))
-              .when(this.dialogType === "repo-config", (el) => el.child(this.renderRepoConfig(t))),
+              .when(this.dialogType === "repo-config" || this.dialogType === "project-config", (el) => el.child(this.renderProjectConfig(t))),
           )
           .child(Scrollbar.vertical("dlg-body-scroll").absolute().inset_0()),
       )
@@ -988,24 +1201,25 @@ export class DialogController {
           .justify_between()
           .gap(8)
           .child(
-            this.dialogType === "repo-config"
-              ? this.renderBtn(t, "dlg-reset-ctx", "Reset Auto-Detect", () => {
-                  clearActiveRepo();
-                  setShared("roscaelifer.ctxOverride", null);
-                  setShared("roscaelifer.refresh", Date.now());
-                  this.close();
-                })
+            this.dialogType === "repo-config" || this.dialogType === "project-config"
+              ? h_flex()
+                  .gap(6)
+                  .child(this.renderBtn(t, "dlg-auto-project", "Use Auto-Detect", (_e, cx) => this.useAutoDetect(cx), { disabled: this.busy }))
+                  .when(Boolean(this.editingProjectId), (el) => el.child(this.renderBtn(t, "dlg-delete-project", "Delete", (_e, cx) => this.deleteProject(cx), { danger: true, disabled: this.busy })))
               : div(),
           )
           .child(
             h_flex()
               .gap(8)
               .child(this.renderBtn(t, "dlg-cancel", "Cancel", () => this.close()))
+              .when(this.dialogType === "enqueue", (el) =>
+                el.child(this.renderBtn(t, "dlg-queue", this.busy ? "Working…" : "Queue", (_e, cx) => this.submit(cx, false), { disabled: !canSubmit })),
+              )
               .child(
-                this.renderBtn(t, "dlg-confirm", confirmLabels[this.dialogType] ?? "Confirm", (_e, cx) => this.submit(cx), {
+                this.renderBtn(t, "dlg-confirm", confirmLabels[this.dialogType] ?? "Confirm", (_e, cx) => this.submit(cx, this.dialogType === "enqueue"), {
                   primary: this.dialogType !== "reject" && this.dialogType !== "clean-preview",
                   danger: this.dialogType === "reject" || this.dialogType === "clean-preview",
-                  disabled: !canSubmit,
+                  disabled: !canSubmit || (this.dialogType === "enqueue" && Boolean(this.item?.isBlocked)),
                 }),
               ),
           ),
