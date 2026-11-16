@@ -884,15 +884,45 @@ function parseBdJsonOutput(stdout) {
   }
 }
 
+function isBdShowUnsupported(errOrRes) {
+  const text = [errOrRes?.message, errOrRes?.stderr, errOrRes?.stdout, errOrRes]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return /unknown command[：: ]+["']?bd-show\b/.test(text) ||
+    /unknown command.*\bbd-show\b/.test(text);
+}
+
 export async function fetchBeadDetail(ctx, runner, beadId) {
   if (!beadId) return null;
-  const args = ["bd-exec"];
-  if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
-  if (ctx?.bdActor) args.push("--bd-actor", ctx.bdActor);
-  args.push("--", "show", "--json", String(beadId));
-  const res = await execRoscaelifer(ctx, runner, args, { timeout: 15000 });
-  if (res.code !== 0) {
-    throw new Error((res.stderr || res.stdout || `bd show ${beadId} exited ${res.code}`).trim());
+  const resolved = runner || (await resolveBinary(ctx));
+  const bdFlags = [];
+  if (ctx?.bdDir) bdFlags.push("--bd-dir", ctx.bdDir);
+  if (ctx?.bdActor) bdFlags.push("--bd-actor", ctx.bdActor);
+
+  let res;
+  if (resolved?.supportsBdShow !== false) {
+    const args = ["bd-show", "--json", ...bdFlags, String(beadId)];
+    try {
+      res = await execRoscaelifer(ctx, resolved, args, { timeout: 15000 });
+    } catch (err) {
+      if (!isBdShowUnsupported(err)) throw err;
+      resolved.supportsBdShow = false;
+    }
+    if (res && res.code !== 0) {
+      if (!isBdShowUnsupported(res)) {
+        throw new Error((res.stderr || res.stdout || `bd-show ${beadId} exited ${res.code}`).trim());
+      }
+      resolved.supportsBdShow = false;
+    }
+  }
+
+  if (!res || res.code !== 0) {
+    const args = ["bd-exec", ...bdFlags, "--", "show", "--json", String(beadId)];
+    res = await execRoscaelifer(ctx, resolved, args, { timeout: 15000 });
+    if (res.code !== 0) {
+      throw new Error((res.stderr || res.stdout || `bd show ${beadId} exited ${res.code}`).trim());
+    }
   }
   try {
     return parseBdJsonOutput(res.stdout);
