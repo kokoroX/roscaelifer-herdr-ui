@@ -580,6 +580,7 @@ function detectSnapshotFlags(stdout, stderr) {
   return {
     supportsCompact: /(?:^|[\s\[,|])--compact(?:[\s\]=,|]|$)/m.test(text),
     supportsBrief: /(?:^|[\s\[,|])--brief(?:[\s\]=,|]|$)/m.test(text),
+    supportsIncludeEphemeral: /(?:^|[\s\[,|])--include-ephemeral(?:[\s\]=,|]|$)/m.test(text),
   };
 }
 
@@ -801,6 +802,7 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   const args = ["snapshot", "--json"];
   if (resolved?.supportsCompact) args.push("--compact");
   if (resolved?.supportsBrief) args.push("--brief");
+  if (opts.includeEphemeral && resolved?.supportsIncludeEphemeral) args.push("--include-ephemeral");
   if (ctx?.db) args.push("--db", ctx.db);
   if (ctx?.config) args.push("--config", ctx.config);
   if (ctx?.formulasDir) args.push("--formulas-dir", ctx.formulasDir);
@@ -826,8 +828,13 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   if (res.code !== 0) {
     const errText = (res.stderr || res.stdout || `snapshot exited ${res.code}`).trim();
     const flagRejected =
-      (resolved?.supportsCompact || resolved?.supportsBrief) &&
+      (resolved?.supportsCompact || resolved?.supportsBrief || resolved?.supportsIncludeEphemeral) &&
       /flag provided but not defined/i.test(errText);
+    if (flagRejected) {
+      if (resolved?.supportsCompact) resolved.supportsCompact = false;
+      if (resolved?.supportsBrief) resolved.supportsBrief = false;
+      if (resolved?.supportsIncludeEphemeral) resolved.supportsIncludeEphemeral = false;
+    }
     if (!opts._retried && (isCommandNotFoundFailure(res) || flagRejected)) {
       invalidateBinaryCache(ctx);
       const freshRunner = await resolveBinary(ctx, { force: true });
@@ -893,7 +900,7 @@ function isBdShowUnsupported(errOrRes) {
     /unknown command.*\bbd-show\b/.test(text);
 }
 
-export async function fetchBeadDetail(ctx, runner, beadId) {
+export async function fetchBeadDetail(ctx, runner, beadId, opts = {}) {
   if (!beadId) return null;
   const resolved = runner || (await resolveBinary(ctx));
   const bdFlags = [];
@@ -902,18 +909,28 @@ export async function fetchBeadDetail(ctx, runner, beadId) {
 
   let res;
   if (resolved?.supportsBdShow !== false) {
-    const args = ["bd-show", "--json", ...bdFlags, String(beadId)];
+    const args = ["bd-show", "--json", ...bdFlags];
+    if (opts.includeEphemeral && resolved?.supportsBdShowIncludeEphemeral !== false) {
+      args.push("--include-ephemeral");
+    }
+    args.push(String(beadId));
     try {
       res = await execRoscaelifer(ctx, resolved, args, { timeout: 15000 });
     } catch (err) {
-      if (!isBdShowUnsupported(err)) throw err;
-      resolved.supportsBdShow = false;
+      const flagRejected =
+        opts.includeEphemeral && /flag provided but not defined/i.test(String(err?.message || err));
+      if (!isBdShowUnsupported(err) && !flagRejected) throw err;
+      if (flagRejected) resolved.supportsBdShowIncludeEphemeral = false;
+      if (isBdShowUnsupported(err)) resolved.supportsBdShow = false;
     }
     if (res && res.code !== 0) {
-      if (!isBdShowUnsupported(res)) {
+      const flagRejected =
+        opts.includeEphemeral && /flag provided but not defined/i.test(res.stderr || res.stdout || "");
+      if (!isBdShowUnsupported(res) && !flagRejected) {
         throw new Error((res.stderr || res.stdout || `bd-show ${beadId} exited ${res.code}`).trim());
       }
-      resolved.supportsBdShow = false;
+      if (flagRejected) resolved.supportsBdShowIncludeEphemeral = false;
+      if (isBdShowUnsupported(res)) resolved.supportsBdShow = false;
     }
   }
 
@@ -1335,6 +1352,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       beadId,
       taskId,
       title: issue?.title || task?.title || id,
+      ephemeral: Boolean(issue?.ephemeral),
       body: issue?.description || task?.body || "",
       description: issue?.description || "",
       acceptanceCriteria: issue?.acceptance_criteria || "",

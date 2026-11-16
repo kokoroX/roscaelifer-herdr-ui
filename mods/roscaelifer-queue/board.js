@@ -497,6 +497,9 @@ export class BoardController {
         h_flex()
           .items_center()
           .gap(6)
+          .when(Boolean(item.ephemeral), (el) =>
+            el.child(chip("ephemeral", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
+          )
           .when(Boolean(pStyle), (el) =>
             el.child(
               div()
@@ -565,7 +568,7 @@ export class BoardController {
       .when(Boolean(actionRow), (el) => el.child(actionRow));
   }
 
-  renderFilterBar(queue, t, { closedLimit = 500, onChangeClosedLimit } = {}) {
+  renderFilterBar(queue, t, { closedLimit = 500, onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral } = {}) {
     const envs = queue?.envs || [];
 
     const envTab = (id, label, active, extra, onClick) =>
@@ -646,6 +649,35 @@ export class BoardController {
                   .text_size(11.5)
                   .text_color(this.onlyQueued ? t.foreground : t.muted)
                   .child("Queued only"),
+              ),
+          )
+          .child(
+            Switch.new("filter-ephemeral")
+              .checked(showEphemeral)
+              .on_change((checked, clickCx) => {
+                onToggleShowEphemeral?.(!showEphemeral, clickCx);
+              })
+              .flex()
+              .items_center()
+              .gap(7)
+              .cursor_pointer()
+              .child(
+                h_flex()
+                  .w(28)
+                  .h(16)
+                  .p(2)
+                  .rounded(8)
+                  .items_center()
+                  .bg(showEphemeral ? t.accent : t.border)
+                  .when(showEphemeral, (el) => el.justify_end())
+                  .when(!showEphemeral, (el) => el.justify_start())
+                  .child(div().size(12).rounded(6).bg(showEphemeral ? t.accent_foreground : t.muted)),
+              )
+              .child(
+                div()
+                  .text_size(11.5)
+                  .text_color(showEphemeral ? t.foreground : t.muted)
+                  .child("Ephemeral"),
               ),
           )
           .child(div().w(1).h(16).bg(t.border).mx(2))
@@ -791,7 +823,7 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = 500, onChangeClosedLimit }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = 500, onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral }, cx) {
     void cx;
     const t = theme();
     const cols = queue?.columns || { ready: [], running: [], action: [], review: [], closed: [] };
@@ -857,7 +889,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit }))
+      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showEphemeral, onToggleShowEphemeral }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

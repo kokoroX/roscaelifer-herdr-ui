@@ -51,6 +51,7 @@ const LOCAL_WATCH_POLL_MS = 30000;
 const DETAIL_CACHE_TTL_MS = 20000;
 const DETAIL_CACHE_MAX = 50;
 const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v1";
+const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v1";
 const CLOSED_LIMIT_OPTIONS = [50, 500, 5000];
 const DEFAULT_CLOSED_LIMIT = 500;
 
@@ -170,6 +171,7 @@ export default class RoscaeliferQueue extends View {
       Number.isInteger(storedClosedLimit) && CLOSED_LIMIT_OPTIONS.includes(storedClosedLimit)
         ? storedClosedLimit
         : DEFAULT_CLOSED_LIMIT;
+    this.showEphemeral = Boolean(safeStorageGet(SHOW_EPHEMERAL_KEY, false));
     this.ctx = null;
     this.runner = null;
     this.snapshot = null;
@@ -328,6 +330,16 @@ export default class RoscaeliferQueue extends View {
     this.refresh(cx, { forceContext: false });
   }
 
+  setShowEphemeral(next, cx) {
+    const value = Boolean(next);
+    if (value === this.showEphemeral) return;
+    this.showEphemeral = value;
+    safeStorageSet(SHOW_EPHEMERAL_KEY, value);
+    this.detailCache.clear();
+    cx?.notify?.();
+    this.refresh(cx, { forceContext: false, preempt: true });
+  }
+
   async ensureRunner() {
     if (this.runner) return this.runner;
     this.runner = await resolveBinary(this.ctx);
@@ -458,6 +470,7 @@ export default class RoscaeliferQueue extends View {
         if (seq !== this.refreshSeq) return;
         const snap = await fetchSnapshot(this.ctx, runner, {
           closedLimit: this.closedLimit,
+          includeEphemeral: this.showEphemeral,
           onRunnerResolved: (freshRunner) => {
             if (seq === this.refreshSeq) this.runner = freshRunner;
           },
@@ -497,7 +510,7 @@ export default class RoscaeliferQueue extends View {
   }
 
   detailCacheKey(item) {
-    return `${contextKey(this.ctx)}|${item?.taskId || ""}|${item?.beadId || ""}`;
+    return `${contextKey(this.ctx)}|ephemeral:${this.showEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
   }
 
   setDetailCacheEntry(key, taskDetail, beadDetail) {
@@ -560,7 +573,9 @@ export default class RoscaeliferQueue extends View {
 
       const [taskRes, beadRes] = await Promise.allSettled([
         taskId ? fetchTaskDetail(this.ctx, runner, taskId) : Promise.resolve(null),
-        beadId ? fetchBeadDetail(this.ctx, runner, beadId) : Promise.resolve(null),
+        beadId
+          ? fetchBeadDetail(this.ctx, runner, beadId, { includeEphemeral: this.showEphemeral })
+          : Promise.resolve(null),
       ]);
       if (this.detailReqSeq !== reqSeq || this.selectedId !== itemId) return;
 
@@ -1003,6 +1018,9 @@ export default class RoscaeliferQueue extends View {
                       closedLimit: this.closedLimit,
                       onChangeClosedLimit: (nextLimit, clickCx) =>
                         this.setClosedLimit(nextLimit, clickCx),
+                      showEphemeral: this.showEphemeral,
+                      onToggleShowEphemeral: (next, clickCx) =>
+                        this.setShowEphemeral(next, clickCx),
                     },
                     cx,
                   ),
@@ -1016,6 +1034,9 @@ export default class RoscaeliferQueue extends View {
                       snapshot: this.snapshot,
                       mode: this.tab,
                       selectedId: this.selectedId,
+                      showEphemeral: this.showEphemeral,
+                      onToggleShowEphemeral: (next, clickCx) =>
+                        this.setShowEphemeral(next, clickCx),
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
                     },
                     cx,
@@ -1044,6 +1065,7 @@ export default class RoscaeliferQueue extends View {
                       ctx: this.ctx,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
                       onClose: (clickCx) => this.selectItem(null, clickCx),
+                      showEphemeral: this.showEphemeral,
                       onRefreshDetail: (clickCx) => {
                         if (selectedItem?.taskId || selectedItem?.beadId) {
                           this.selectItem(selectedItem, clickCx, { forceDetail: true });

@@ -283,7 +283,7 @@ export class DepsController {
     });
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = false, onToggleShowEphemeral }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const items = queue?.items ?? [];
@@ -307,7 +307,7 @@ export class DepsController {
           .min_h(0)
           .gap(8)
           .child(this.renderEpicSidebar(t, { epics, items, monoFont }))
-          .child(this.renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont })),
+          .child(this.renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -517,7 +517,7 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont }) {
+  renderWaveGraph(t, { epics, items, onSelectItem, selectedId, monoFont, showEphemeral = false, onToggleShowEphemeral }) {
     const selectedEpic = this.selectedEpicId ? epics.find((e) => (e.id || e.beadId) === this.selectedEpicId) : null;
     const epicChildIds = selectedEpic
       ? new Set((selectedEpic.children ?? []).map((c) => c.beadId || c.id).filter(Boolean))
@@ -602,24 +602,47 @@ export class DepsController {
               ),
           )
           .child(
-            div()
-              .id("deps-toggle-closed")
-              .px(8)
-              .py(3)
-              .rounded(5)
-              .border_1()
-              .border_color(this.showClosedInWaves ? t.accent : t.border)
-              .bg(this.showClosedInWaves ? alpha(t.accent, "22") : t.raised)
-              .text_size(11)
-              .text_color(this.showClosedInWaves ? t.accent : t.muted)
-              .cursor_pointer()
-              .hover((s) => s.bg(t.hover))
-              .on_click((_e, cx) => {
-                this.showClosedInWaves = !this.showClosedInWaves;
-                cx.notify();
-              })
-              .child(this.showClosedInWaves ? "Showing Closed" : "Show Closed"),
-          ),
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .id("deps-toggle-ephemeral")
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .border_1()
+                  .border_color(showEphemeral ? t.accent : t.border)
+                  .bg(showEphemeral ? alpha(t.accent, "22") : t.raised)
+                  .text_size(11)
+                  .text_color(showEphemeral ? t.accent : t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, clickCx) => {
+                    onToggleShowEphemeral?.(!showEphemeral, clickCx);
+                  })
+                  .child(showEphemeral ? "Showing Ephemeral" : "Show Ephemeral"),
+              )
+              .child(
+                div()
+                  .id("deps-toggle-closed")
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .border_1()
+                  .border_color(this.showClosedInWaves ? t.accent : t.border)
+                  .bg(this.showClosedInWaves ? alpha(t.accent, "22") : t.raised)
+                  .text_size(11)
+                  .text_color(this.showClosedInWaves ? t.accent : t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => {
+                    this.showClosedInWaves = !this.showClosedInWaves;
+                    cx.notify();
+                  })
+                  .child(this.showClosedInWaves ? "Showing Closed" : "Show Closed"),
+              ),
+          )
       )
       // Wave Lanes (horizontal scroll)
       .child(
@@ -719,6 +742,7 @@ export class DepsController {
                                       .items_center()
                                       .gap(5)
                                       .child(div().text_size(11).font_family(monoFont).text_color(t.accent).child(id))
+                                      .when(Boolean(it.ephemeral), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
                                       .when(it.priority !== undefined && it.priority !== null, (el) =>
                                         el.child(pill(t, `P${it.priority}`, it.priority <= 1 ? t.ansi1 : t.muted)),
                                       ),

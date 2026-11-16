@@ -327,6 +327,7 @@ export class InspectorController {
                   .when(Boolean(item.beadId), (el) => el.child(div().px(6).py(2).rounded(4).bg(t.raised).font_family(monoFont).text_size(11).text_color(t.accent).child(item.beadId)))
                   .when(Boolean(item.taskId), (el) => el.child(div().px(6).py(2).rounded(4).bg(t.raised).font_family(monoFont).text_size(11).text_color(t.muted).child(`#${item.taskId}`)))
                   .when(Boolean(prioLabel), (el) => el.child(badge(t, prioLabel, item.priority <= 1 ? t.ansi1 : t.muted)))
+                  .when(Boolean(item.ephemeral || beadDetail?.ephemeral), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
                   .child(badge(t, statusText, statusCol))
                   .when(Boolean(item.agentStatus), (el) => el.child(badge(t, `agent:${item.agentStatus}`, statusColor(item.agentStatus, t)))),
               )
