@@ -3,7 +3,19 @@ import { exec, home } from "herdr";
 
 const HISTORY_KEY = "roscaelifer.repoHistory.v1";
 const ACTIVE_REPO_KEY = "roscaelifer.activeRepo.v1";
+const SNAPSHOT_CACHE_PREFIX = "roscaelifer.snapshotCache.v1:";
+const SNAPSHOT_CACHE_INDEX_KEY = "roscaelifer.snapshotCacheIndex.v1";
 const MAX_HISTORY = 10;
+const MAX_CACHED_REPOS = 6;
+const MAX_CACHED_SNAPSHOT_CHARS = 512 * 1024;
+const BEADS_ARTIFACTS = [
+  "metadata.json",
+  "dolt",
+  "beads.db",
+  "issues.jsonl",
+  "redirect",
+  "config.yaml",
+];
 
 const AGENT_RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
 
@@ -28,14 +40,52 @@ export function safeStorageSet(key, value) {
   }
 }
 
+function normalizeMachine(machine) {
+  return typeof machine === "string" ? machine.trim() : "";
+}
+
+function isBogusStoredContext(ctx) {
+  if (!ctx || typeof ctx !== "object") return true;
+  const rawRepo = typeof ctx.repo === "string" ? ctx.repo : "";
+  if (!rawRepo) return !ctx.db && !ctx.bdDir;
+  const repo = rawRepo.replace(/\/+$/, "") || "/";
+  if (repo === "/") return true;
+  if (!normalizeMachine(ctx.machine) && repo === normalizePath(home())) return true;
+  return false;
+}
+
+function cleanRepoHistory(list) {
+  const seen = new Set();
+  return list
+    .filter((item) => !isBogusStoredContext(item))
+    .map((item) => ({ ...item, machine: normalizeMachine(item.machine) }))
+    .filter((item) => {
+      const key = repoIdentityKey(item);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 export function loadRepoHistory() {
-  const list = safeStorageGet(HISTORY_KEY, []);
-  return Array.isArray(list) ? list : [];
+  const raw = safeStorageGet(HISTORY_KEY, []);
+  const list = Array.isArray(raw) ? raw : [];
+  const cleaned = cleanRepoHistory(list);
+  if (JSON.stringify(cleaned) !== JSON.stringify(list)) safeStorageSet(HISTORY_KEY, cleaned);
+  return cleaned;
 }
 
 export function loadActiveRepo() {
   const item = safeStorageGet(ACTIVE_REPO_KEY, null);
-  return item && typeof item === "object" ? item : null;
+  if (!item || typeof item !== "object" || isBogusStoredContext(item)) {
+    if (item) safeStorageSet(ACTIVE_REPO_KEY, null);
+    return null;
+  }
+  return { ...item, machine: normalizeMachine(item.machine) };
+}
+
+export function clearActiveRepo() {
+  safeStorageSet(ACTIVE_REPO_KEY, null);
 }
 
 export function saveRepoContext(ctx) {
@@ -48,12 +98,13 @@ export function saveRepoContext(ctx) {
     formulasDir: ctx.formulasDir || "",
     bin: ctx.bin || "",
     env: ctx.env || "",
+    machine: normalizeMachine(ctx.machine),
     label: ctx.label || repoLabel(ctx),
     updatedAt: Date.now(),
   };
   safeStorageSet(ACTIVE_REPO_KEY, entry);
-  const key = contextKey(entry);
-  const next = [entry, ...loadRepoHistory().filter((x) => contextKey(x) !== key)].slice(0, MAX_HISTORY);
+  const key = repoIdentityKey(entry);
+  const next = [entry, ...loadRepoHistory().filter((x) => repoIdentityKey(x) !== key)].slice(0, MAX_HISTORY);
   safeStorageSet(HISTORY_KEY, next);
 }
 
@@ -61,7 +112,7 @@ export function repoLabel(ctx) {
   if (!ctx) return "No repository";
   if (ctx.label) return ctx.label;
   const base = ctx.repo || ctx.bdDir || ctx.db || "";
-  if (!base) return "Custom DB";
+  if (!base) return ctx.machine ? `Custom DB @${ctx.machine}` : "Custom DB";
   const parts = base.replace(/\/+$/, "").split("/").filter(Boolean);
   return parts[parts.length - 1] || base;
 }
@@ -69,6 +120,7 @@ export function repoLabel(ctx) {
 export function contextKey(ctx) {
   if (!ctx) return "";
   return [
+    normalizeMachine(ctx.machine),
     ctx.repo || "",
     ctx.db || "",
     ctx.bdDir || "",
@@ -78,6 +130,139 @@ export function contextKey(ctx) {
   ].join("|");
 }
 
+export function repoIdentityKey(ctx) {
+  if (!ctx) return "";
+  const machine = normalizeMachine(ctx.machine);
+  const identity = ctx.repo || `${ctx.bdDir || ""}|${ctx.db || ""}`;
+  return `${machine}|${identity}`;
+}
+
+function slimIssueForCache(issue) {
+  if (!issue || typeof issue !== "object") return issue;
+  const {
+    description: _description,
+    acceptance_criteria: _ac,
+    notes: _notes,
+    close_reason: _closeReason,
+    ...rest
+  } = issue;
+  return rest;
+}
+
+function slimSnapshotForCache(snapshot, { maxEvents = null, maxClosed = null } = {}) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const out = { ...snapshot };
+  if (Array.isArray(snapshot.events) && maxEvents !== null && snapshot.events.length > maxEvents) {
+    out.events = snapshot.events.slice(-maxEvents);
+  }
+  if (snapshot.bd && typeof snapshot.bd === "object") {
+    const bd = { ...snapshot.bd };
+    if (Array.isArray(snapshot.bd.issues)) {
+      let closedCount = 0;
+      const issues = [];
+      for (const issue of snapshot.bd.issues) {
+        if (maxClosed !== null && issue?.status === "closed") {
+          if (closedCount >= maxClosed) continue;
+          closedCount += 1;
+        }
+        issues.push(slimIssueForCache(issue));
+      }
+      bd.issues = issues;
+    }
+    out.bd = bd;
+  }
+  return out;
+}
+
+function isValidCachedSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  return (
+    typeof snapshot.schema_version === "number" ||
+    Array.isArray(snapshot.tasks) ||
+    (snapshot.config && typeof snapshot.config === "object")
+  );
+}
+
+export function loadCachedSnapshot(ctx) {
+  const key = repoIdentityKey(ctx);
+  if (!key) return null;
+  const entry = safeStorageGet(`${SNAPSHOT_CACHE_PREFIX}${key}`, null);
+  if (!entry || typeof entry !== "object") return null;
+  // Support both wrapped { v, cachedAt, snapshot } and legacy direct snapshot shapes.
+  const snapshot = entry.snapshot && typeof entry.snapshot === "object" ? entry.snapshot : entry;
+  if (!isValidCachedSnapshot(snapshot)) return null;
+  return {
+    snapshot,
+    cachedAt: typeof entry.cachedAt === "number" ? entry.cachedAt : 0,
+  };
+}
+
+export function saveCachedSnapshot(ctx, snapshot) {
+  const key = repoIdentityKey(ctx);
+  if (!key || !isValidCachedSnapshot(snapshot)) return;
+  try {
+    let payload = {
+      v: 1,
+      cachedAt: Date.now(),
+      snapshot: slimSnapshotForCache(snapshot),
+    };
+    let serialized = JSON.stringify(payload);
+    if (serialized.length > MAX_CACHED_SNAPSHOT_CHARS) {
+      payload = {
+        v: 1,
+        cachedAt: payload.cachedAt,
+        snapshot: slimSnapshotForCache(snapshot, { maxEvents: 30, maxClosed: 20 }),
+      };
+      serialized = JSON.stringify(payload);
+      if (serialized.length > MAX_CACHED_SNAPSHOT_CHARS) {
+        return;
+      }
+    }
+
+    const rawIdx = safeStorageGet(SNAPSHOT_CACHE_INDEX_KEY, []);
+    const index = Array.isArray(rawIdx) ? rawIdx.filter((k) => typeof k === "string" && k !== key) : [];
+    index.unshift(key);
+    while (index.length > MAX_CACHED_REPOS) {
+      const evicted = index.pop();
+      if (evicted) {
+        try {
+          localStorage.removeItem(`${SNAPSHOT_CACHE_PREFIX}${evicted}`);
+        } catch {
+          // Ignore storage eviction failures.
+        }
+      }
+    }
+
+    const cacheKey = `${SNAPSHOT_CACHE_PREFIX}${key}`;
+    try {
+      localStorage.setItem(cacheKey, serialized);
+    } catch {
+      // Evict oldest cached snapshots and retry once on quota pressure.
+      while (index.length > 1) {
+        const oldest = index.pop();
+        if (oldest) {
+          try {
+            localStorage.removeItem(`${SNAPSHOT_CACHE_PREFIX}${oldest}`);
+          } catch {
+            // Ignore storage eviction failures.
+          }
+        }
+        try {
+          localStorage.setItem(cacheKey, serialized);
+          safeStorageSet(SNAPSHOT_CACHE_INDEX_KEY, index);
+          return;
+        } catch {
+          // Keep evicting.
+        }
+      }
+      return;
+    }
+    safeStorageSet(SNAPSHOT_CACHE_INDEX_KEY, index);
+  } catch {
+    // Ignore storage failures during headless check or restricted contexts.
+  }
+}
+
 function parentDir(dir) {
   const clean = dir.replace(/\/+$/, "");
   const idx = clean.lastIndexOf("/");
@@ -85,9 +270,9 @@ function parentDir(dir) {
   return clean.slice(0, idx);
 }
 
-function normalizePath(p) {
+function normalizePath(p, machine = "") {
   if (!p) return "";
-  if (p.startsWith("~/")) return `${home()}${p.slice(1)}`;
+  if (!machine && p.startsWith("~/")) return `${home()}${p.slice(1)}`;
   return p.replace(/\/+$/, "") || "/";
 }
 
@@ -99,38 +284,144 @@ async function pathExists(p) {
   }
 }
 
-async function probeRepoRoot(dir) {
-  const clean = normalizePath(dir);
-  if (!clean) return null;
-  const [hasRosc, hasDb, hasBeads, hasToml, hasFormulas] = await Promise.all([
-    pathExists(`${clean}/.roscaelifer`),
-    pathExists(`${clean}/.roscaelifer/roscaelifer.db`),
-    pathExists(`${clean}/.beads`),
-    pathExists(`${clean}/roscaelifer.toml`),
-    pathExists(`${clean}/formulas`),
-  ]);
-  if (!hasRosc && !hasDb && !hasBeads && !hasToml) return null;
+async function probeBeadsArtifacts(dir) {
+  const checks = await Promise.all(BEADS_ARTIFACTS.map((name) => pathExists(`${dir}/.beads/${name}`)));
+  return checks.some(Boolean);
+}
+
+function parseRemoteProbe(stdout) {
+  const lines = String(stdout || "").trim().split("\n");
+  if (lines.length < 7) return null;
   return {
-    repo: clean,
-    db: hasDb || hasRosc ? `${clean}/.roscaelifer/roscaelifer.db` : "",
-    bdDir: hasBeads ? `${clean}/.beads` : "",
-    config: hasToml ? `${clean}/roscaelifer.toml` : "",
-    formulasDir: hasFormulas ? `${clean}/formulas` : "",
-    hasBeads,
-    label: clean.split("/").filter(Boolean).pop() || clean,
-    source: "detected",
+    clean: lines[0],
+    hasRosc: lines[1] === "1",
+    hasDb: lines[2] === "1",
+    hasBeads: lines[3] === "1",
+    hasToml: lines[4] === "1",
+    hasFormulas: lines[5] === "1",
+    source: lines[6] || "detected",
   };
 }
 
-export async function detectRepoFromPath(startPath) {
-  let cur = normalizePath(startPath);
-  if (!cur) return null;
-  const userHome = normalizePath(home());
+function buildDetectedRepo(probe, machine = "") {
+  if (!probe) return null;
+  const { clean: repo, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, source } = probe;
+  if (!hasRosc && !hasDb && !hasBeads && !hasToml) return null;
+  return {
+    repo,
+    db: hasDb || hasRosc ? `${repo}/.roscaelifer/roscaelifer.db` : "",
+    bdDir: hasBeads ? `${repo}/.beads` : "",
+    config: hasToml ? `${repo}/roscaelifer.toml` : "",
+    formulasDir: hasFormulas ? `${repo}/formulas` : "",
+    machine: normalizeMachine(machine),
+    hasBeads,
+    label: repo.split("/").filter(Boolean).pop() || repo,
+    source: source || "detected",
+  };
+}
 
+async function probeLocalRepoRoot(dir) {
+  const clean = normalizePath(dir, "");
+  if (!clean) return null;
+  const userHome = normalizePath(home());
+  if (clean === "/" || clean === userHome) return null;
+  const [hasRosc, hasDb, hasBeads, hasToml, hasFormulas] = await Promise.all([
+    pathExists(`${clean}/.roscaelifer`),
+    pathExists(`${clean}/.roscaelifer/roscaelifer.db`),
+    probeBeadsArtifacts(clean),
+    pathExists(`${clean}/roscaelifer.toml`),
+    pathExists(`${clean}/formulas`),
+  ]);
+  return buildDetectedRepo({ clean, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, source: "detected" }, "");
+}
+
+const REMOTE_DETECT_SCRIPT = `
+start=$1
+case "$start" in
+  "~") start="$HOME" ;;
+  "~"/*) start="$HOME/\${start#"~/"}" ;;
+esac
+start=\${start%/}
+[ -z "$start" ] && start="/"
+home_clean=\${HOME%/}
+
+probe_dir() {
+  d=$1
+  src=$2
+  [ -z "$d" ] && return 1
+  if [ "$d" = "/" ] || { [ -n "$home_clean" ] && [ "$d" = "$home_clean" ]; }; then
+    return 1
+  fi
+  has_rosc=0; [ -e "$d/.roscaelifer" ] && has_rosc=1
+  has_db=0; [ -e "$d/.roscaelifer/roscaelifer.db" ] && has_db=1
+  has_beads=0
+  for marker in ${BEADS_ARTIFACTS.map((name) => `"$d/.beads/${name}"`).join(" ")}; do
+    if [ -e "$marker" ]; then has_beads=1; break; fi
+  done
+  has_toml=0; [ -e "$d/roscaelifer.toml" ] && has_toml=1
+  has_formulas=0; [ -e "$d/formulas" ] && has_formulas=1
+  if [ "$has_rosc" = "1" ] || [ "$has_db" = "1" ] || [ "$has_beads" = "1" ] || [ "$has_toml" = "1" ]; then
+    printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "$d" "$has_rosc" "$has_db" "$has_beads" "$has_toml" "$has_formulas" "$src"
+    return 0
+  fi
+  return 1
+}
+
+cur=$start
+i=0
+while [ "$i" -lt 12 ] && [ -n "$cur" ]; do
+  if [ "$cur" = "/" ] || { [ -n "$home_clean" ] && [ "$cur" = "$home_clean" ]; }; then
+    break
+  fi
+  if probe_dir "$cur" "detected"; then
+    exit 0
+  fi
+  next=\${cur%/*}
+  [ -z "$next" ] && next="/"
+  if [ "$next" = "$cur" ]; then
+    break
+  fi
+  cur=$next
+  i=$((i + 1))
+done
+
+if [ -d "$start" ] && command -v git >/dev/null 2>&1; then
+  common=$(cd "$start" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  case "$common" in
+    */.git)
+      main_repo=\${common%/.git}
+      if [ -n "$main_repo" ] && probe_dir "$main_repo" "git-common-dir"; then
+        exit 0
+      fi
+      ;;
+  esac
+fi
+exit 1
+`;
+
+export async function detectRepoFromPath(startPath, machine = "") {
+  const owner = normalizeMachine(machine);
+  let cur = normalizePath(startPath, owner);
+  if (!cur) return null;
+
+  if (owner) {
+    try {
+      const res = await exec("sh", ["-c", REMOTE_DETECT_SCRIPT, "roscaelifer-detect", cur], {
+        on: owner,
+        timeout: 6000,
+      });
+      if (res.code !== 0) return null;
+      return buildDetectedRepo(parseRemoteProbe(res.stdout), owner);
+    } catch {
+      return null;
+    }
+  }
+
+  const userHome = normalizePath(home());
   for (let i = 0; i < 12 && cur; i++) {
-    const found = await probeRepoRoot(cur);
-    if (found) return found;
     if (cur === "/" || cur === userHome) break;
+    const found = await probeLocalRepoRoot(cur);
+    if (found) return found;
     const next = parentDir(cur);
     if (!next || next === cur) break;
     cur = next;
@@ -139,14 +430,14 @@ export async function detectRepoFromPath(startPath) {
   // Linked git worktrees store .beads / .roscaelifer in the main checkout.
   try {
     const res = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      cwd: normalizePath(startPath),
+      cwd: normalizePath(startPath, ""),
       timeout: 3000,
     });
     if (res.code === 0) {
       const common = res.stdout.trim();
       const mainRepo = common.endsWith("/.git") ? common.slice(0, -5) : "";
       if (mainRepo) {
-        const found = await probeRepoRoot(mainRepo);
+        const found = await probeLocalRepoRoot(mainRepo);
         if (found) {
           found.source = "git-common-dir";
           return found;
@@ -161,11 +452,12 @@ export async function detectRepoFromPath(startPath) {
 
 export function buildContextFromProps(rawProps, overrideCtx = null) {
   const src = overrideCtx || rawProps || {};
-  const repo = normalizePath(src.repo || "");
-  const db = src.db ? normalizePath(src.db) : repo ? `${repo}/.roscaelifer/roscaelifer.db` : "";
-  const bdDir = src.bdDir ? normalizePath(src.bdDir) : repo ? `${repo}/.beads` : "";
-  const config = src.config ? normalizePath(src.config) : repo ? `${repo}/roscaelifer.toml` : "";
-  const formulasDir = src.formulasDir ? normalizePath(src.formulasDir) : repo ? `${repo}/formulas` : "";
+  const machine = normalizeMachine(src.machine ?? rawProps?.machine);
+  const repo = normalizePath(src.repo || "", machine);
+  const db = src.db ? normalizePath(src.db, machine) : repo ? `${repo}/.roscaelifer/roscaelifer.db` : "";
+  const bdDir = src.bdDir ? normalizePath(src.bdDir, machine) : repo ? `${repo}/.beads` : "";
+  const config = src.config ? normalizePath(src.config, machine) : repo ? `${repo}/roscaelifer.toml` : "";
+  const formulasDir = src.formulasDir ? normalizePath(src.formulasDir, machine) : repo ? `${repo}/formulas` : "";
   if (!repo && !db && !bdDir && !config && !formulasDir) return null;
   const ctx = {
     repo,
@@ -173,8 +465,9 @@ export function buildContextFromProps(rawProps, overrideCtx = null) {
     bdDir,
     config,
     formulasDir,
-    bin: src.bin || rawProps?.bin || "",
-    env: src.env || rawProps?.env || "",
+    machine,
+    bin: src.bin ?? rawProps?.bin ?? "",
+    env: src.env ?? rawProps?.env ?? "",
     label: src.label || "",
     source: overrideCtx ? "override" : "props",
   };
@@ -189,20 +482,37 @@ export async function resolveContext(rawProps, { focusedInfo, spaceList, paneLis
   const fromProps = buildContextFromProps(rawProps, null);
   if (fromProps) return fromProps;
 
+  const spaces = spaceList || [];
+  const activeSpace = spaces.find((s) => s.active);
+  const tabToMachine = new Map();
+  for (const space of spaces) {
+    const machine = normalizeMachine(space?.machine);
+    const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
+    for (const tab of tabs) {
+      const tabId = typeof tab === "object" ? tab?.id || tab?.tab : tab;
+      if (tabId !== undefined && tabId !== null) tabToMachine.set(String(tabId), machine);
+    }
+  }
+
   const candidates = [];
-  if (focusedInfo?.cwd) candidates.push(focusedInfo.cwd);
-  const activeSpace = (spaceList || []).find((s) => s.active);
-  if (activeSpace?.folder) candidates.push(activeSpace.folder);
+  if (focusedInfo?.cwd) {
+    candidates.push({ cwd: focusedInfo.cwd, machine: normalizeMachine(activeSpace?.machine) });
+  }
+  if (activeSpace?.folder) {
+    candidates.push({ cwd: activeSpace.folder, machine: normalizeMachine(activeSpace.machine) });
+  }
   for (const p of paneList || []) {
-    if (p?.cwd) candidates.push(p.cwd);
+    if (p?.cwd) candidates.push({ cwd: p.cwd, machine: tabToMachine.get(String(p.tab)) ?? "" });
   }
 
   const seen = new Set();
-  for (const dir of candidates) {
-    const clean = normalizePath(dir);
-    if (!clean || seen.has(clean)) continue;
-    seen.add(clean);
-    const detected = await detectRepoFromPath(clean);
+  for (const candidate of candidates) {
+    const machine = normalizeMachine(candidate.machine);
+    const clean = normalizePath(candidate.cwd, machine);
+    const key = `${machine}|${clean}`;
+    if (!clean || seen.has(key)) continue;
+    seen.add(key);
+    const detected = await detectRepoFromPath(clean, machine);
     if (detected) {
       if (rawProps?.bin) detected.bin = rawProps.bin;
       if (rawProps?.env) detected.env = rawProps.env;
@@ -229,11 +539,125 @@ export async function resolveContext(rawProps, { focusedInfo, spaceList, paneLis
   return null;
 }
 
-export async function resolveBinary(ctx) {
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function shellPart(value) {
+  const text = String(value);
+  if (text.startsWith("$HOME/")) {
+    const suffix = text.slice("$HOME".length).replace(/["\\$`]/g, "\\$&");
+    return `"$HOME${suffix}"`;
+  }
+  if (text === "~" || text.startsWith("~/")) {
+    const suffix = text.slice(1).replace(/["\\$`]/g, "\\$&");
+    return `"$HOME${suffix}"`;
+  }
+  return shellQuote(text);
+}
+
+const BINARY_CACHE = new Map();
+const BINARY_INFLIGHT = new Map();
+
+const REMOTE_BINARY_PROBE_SCRIPT = `
+for cand in "$@"; do
+  resolved=$cand
+  case "$resolved" in
+    "\\$HOME/"*) resolved="$HOME/\${resolved#\\$HOME/}" ;;
+    "~/") resolved="$HOME/" ;;
+    "~/"*) resolved="$HOME/\${resolved#~/}" ;;
+  esac
+  if out=$("$resolved" snapshot --help 2>&1); then
+    printf '__ROSCAELIFER_BIN__=%s\\n%s\\n' "$cand" "$out"
+    exit 0
+  fi
+done
+exit 1
+`;
+
+function detectSnapshotFlags(stdout, stderr) {
+  const text = `${stdout || ""}\n${stderr || ""}`;
+  return {
+    supportsCompact: /(?:^|[\s\[,|])--compact(?:[\s\]=,|]|$)/m.test(text),
+    supportsBrief: /(?:^|[\s\[,|])--brief(?:[\s\]=,|]|$)/m.test(text),
+  };
+}
+
+function binaryCacheKey(ctx) {
+  const machine = normalizeMachine(ctx?.machine);
+  const rawBin = typeof ctx?.bin === "string" ? ctx.bin.trim() : "";
+  const binHint = rawBin ? (machine ? rawBin : normalizePath(rawBin)) : "";
+  return `${machine}|${binHint}`;
+}
+
+export function invalidateBinaryCache(ctx) {
+  BINARY_CACHE.delete(binaryCacheKey(ctx));
+}
+
+function isCommandNotFoundFailure(errOrRes) {
+  if (!errOrRes) return false;
+  if (typeof errOrRes === "object" && "code" in errOrRes && errOrRes.code === 127) {
+    return true;
+  }
+  const msg = String(
+    errOrRes?.message || errOrRes?.stderr || errOrRes?.stdout || errOrRes || "",
+  ).toLowerCase();
+  return (
+    msg.includes("enoent") ||
+    msg.includes("command not found") ||
+    msg.includes("no such file or directory") ||
+    msg.includes("exited 127")
+  );
+}
+
+async function probeBinary(ctx) {
+  const machine = normalizeMachine(ctx?.machine);
+  if (machine) {
+    const candidates = [
+      ctx?.bin,
+      "roscaelifer-herdr",
+      "roscaelifer",
+      "$HOME/.local/bin/roscaelifer-herdr",
+      "$HOME/go/bin/roscaelifer-herdr",
+      "/opt/homebrew/bin/roscaelifer-herdr",
+      "/usr/local/bin/roscaelifer-herdr",
+      "$HOME/.local/bin/roscaelifer",
+      "$HOME/go/bin/roscaelifer",
+      "/opt/homebrew/bin/roscaelifer",
+      "/usr/local/bin/roscaelifer",
+    ].filter(Boolean);
+    try {
+      const res = await exec(
+        "sh",
+        ["-lc", REMOTE_BINARY_PROBE_SCRIPT, "roscaelifer-bin-probe", ...candidates],
+        { on: machine, timeout: 6000 },
+      );
+      if (res.code === 0) {
+        const text = String(res.stdout || "");
+        const nl = text.indexOf("\n");
+        const firstLine = (nl >= 0 ? text.slice(0, nl) : text).trim();
+        const helpText = nl >= 0 ? text.slice(nl + 1) : "";
+        if (firstLine.startsWith("__ROSCAELIFER_BIN__=")) {
+          const bin = firstLine.slice("__ROSCAELIFER_BIN__=".length);
+          const shellHomeRel = bin.startsWith("$HOME/") ? bin.slice("$HOME/".length) : "";
+          return {
+            cmd: bin,
+            prefixArgs: [],
+            shellHomeRel,
+            label: bin,
+            ...detectSnapshotFlags(helpText, res.stderr),
+          };
+        }
+      }
+    } catch {
+      // Fall through to not found error.
+    }
+    throw new Error(`roscaelifer binary not found on machine ${machine}`);
+  }
+
   const userHome = normalizePath(home());
-  const candidates = [];
-  if (ctx?.bin) candidates.push(normalizePath(ctx.bin));
-  candidates.push(
+  const candidates = [
+    ctx?.bin ? normalizePath(ctx.bin) : "",
     "roscaelifer-herdr",
     `${userHome}/.local/bin/roscaelifer-herdr`,
     `${userHome}/go/bin/roscaelifer-herdr`,
@@ -244,16 +668,21 @@ export async function resolveBinary(ctx) {
     `${userHome}/go/bin/roscaelifer`,
     "/opt/homebrew/bin/roscaelifer",
     "/usr/local/bin/roscaelifer",
-  );
+  ];
 
   for (const bin of candidates) {
     if (!bin) continue;
     try {
       // Probe with the snapshot subcommand so legacy roscaelifer builds that
-      // lack it are not selected.
+      // lack it are not selected, and inspect --help for --compact / --brief.
       const res = await exec(bin, ["snapshot", "--help"], { timeout: 4000 });
       if (res.code === 0) {
-        return { cmd: bin, prefixArgs: [], label: bin };
+        return {
+          cmd: bin,
+          prefixArgs: [],
+          label: bin,
+          ...detectSnapshotFlags(res.stdout, res.stderr),
+        };
       }
     } catch {
       // Try next candidate.
@@ -264,10 +693,25 @@ export async function resolveBinary(ctx) {
     try {
       const goCheck = await exec("go", ["version"], { timeout: 3000 });
       if (goCheck.code === 0) {
+        let flags = { supportsCompact: false, supportsBrief: false };
+        try {
+          const helpRes = await exec("go", ["run", "./cmd/roscaelifer", "snapshot", "--help"], {
+            cwd: ctx.repo,
+            timeout: 8000,
+          });
+          if (helpRes.code === 0) {
+            flags = detectSnapshotFlags(helpRes.stdout, helpRes.stderr);
+          }
+        } catch {
+          // Keep default false flags if help probe fails.
+        }
         return {
           cmd: "go",
           prefixArgs: ["run", "./cmd/roscaelifer"],
           label: "go run ./cmd/roscaelifer",
+          isGoFallback: true,
+          repo: ctx.repo,
+          ...flags,
         };
       }
     } catch {
@@ -280,12 +724,65 @@ export async function resolveBinary(ctx) {
   );
 }
 
+export async function resolveBinary(ctx, { force = false } = {}) {
+  const key = binaryCacheKey(ctx);
+  if (!force && BINARY_CACHE.has(key)) {
+    const cached = BINARY_CACHE.get(key);
+    if (!cached.isGoFallback || cached.repo === (ctx?.repo || "")) {
+      return cached;
+    }
+  }
+
+  if (!force && BINARY_INFLIGHT.has(key)) {
+    return BINARY_INFLIGHT.get(key);
+  }
+
+  const promise = probeBinary(ctx)
+    .then((runner) => {
+      BINARY_CACHE.set(key, runner);
+      return runner;
+    })
+    .finally(() => {
+      if (BINARY_INFLIGHT.get(key) === promise) {
+        BINARY_INFLIGHT.delete(key);
+      }
+    });
+
+  BINARY_INFLIGHT.set(key, promise);
+  return promise;
+}
+
 export async function execRoscaelifer(ctx, runner, args, opts = {}) {
   const resolved = runner || (await resolveBinary(ctx));
   const fullArgs = [...(resolved.prefixArgs || []), ...args];
   const cwd = ctx?.repo || undefined;
   const timeout = opts.timeout ?? 30000;
-  return exec(resolved.cmd, fullArgs, { ...(cwd ? { cwd } : {}), timeout });
+  const machine = normalizeMachine(ctx?.machine);
+  try {
+    let res;
+    if (machine) {
+      const command = resolved.shellHomeRel ? `$HOME/${resolved.shellHomeRel}` : resolved.cmd;
+      const commandLine = [command, ...fullArgs].map(shellPart).join(" ");
+      const remoteCwd = cwd?.startsWith("~");
+      const remoteCommand = remoteCwd ? `cd ${shellPart(cwd)} && ${commandLine}` : commandLine;
+      res = await exec("sh", ["-lc", remoteCommand], {
+        ...(!remoteCwd && cwd ? { cwd } : {}),
+        on: machine,
+        timeout,
+      });
+    } else {
+      res = await exec(resolved.cmd, fullArgs, { ...(cwd ? { cwd } : {}), timeout });
+    }
+    if (res && isCommandNotFoundFailure(res)) {
+      invalidateBinaryCache(ctx);
+    }
+    return res;
+  } catch (err) {
+    if (isCommandNotFoundFailure(err)) {
+      invalidateBinaryCache(ctx);
+    }
+    throw err;
+  }
 }
 
 export function appendDbAndConfigFlags(args, ctx, { includeConfig = true, includeBd = false, includeFormulas = false } = {}) {
@@ -300,7 +797,10 @@ export function appendDbAndConfigFlags(args, ctx, { includeConfig = true, includ
 }
 
 export async function fetchSnapshot(ctx, runner, opts = {}) {
+  const resolved = runner || (await resolveBinary(ctx));
   const args = ["snapshot", "--json"];
+  if (resolved?.supportsCompact) args.push("--compact");
+  if (resolved?.supportsBrief) args.push("--brief");
   if (ctx?.db) args.push("--db", ctx.db);
   if (ctx?.config) args.push("--config", ctx.config);
   if (ctx?.formulasDir) args.push("--formulas-dir", ctx.formulasDir);
@@ -311,9 +811,30 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   if (opts.eventsLimit) args.push("--events-limit", String(opts.eventsLimit));
   if (opts.closedLimit) args.push("--closed-limit", String(opts.closedLimit));
 
-  const res = await execRoscaelifer(ctx, runner, args, { timeout: opts.timeout ?? 25000 });
+  let res;
+  try {
+    res = await execRoscaelifer(ctx, resolved, args, { timeout: opts.timeout ?? 25000 });
+  } catch (err) {
+    if (!opts._retried && isCommandNotFoundFailure(err)) {
+      invalidateBinaryCache(ctx);
+      const freshRunner = await resolveBinary(ctx, { force: true });
+      opts.onRunnerResolved?.(freshRunner);
+      return fetchSnapshot(ctx, freshRunner, { ...opts, _retried: true });
+    }
+    throw err;
+  }
   if (res.code !== 0) {
-    throw new Error((res.stderr || res.stdout || `snapshot exited ${res.code}`).trim());
+    const errText = (res.stderr || res.stdout || `snapshot exited ${res.code}`).trim();
+    const flagRejected =
+      (resolved?.supportsCompact || resolved?.supportsBrief) &&
+      /flag provided but not defined/i.test(errText);
+    if (!opts._retried && (isCommandNotFoundFailure(res) || flagRejected)) {
+      invalidateBinaryCache(ctx);
+      const freshRunner = await resolveBinary(ctx, { force: true });
+      opts.onRunnerResolved?.(freshRunner);
+      return fetchSnapshot(ctx, freshRunner, { ...opts, _retried: true });
+    }
+    throw new Error(errText);
   }
   try {
     return JSON.parse(res.stdout);
@@ -334,6 +855,49 @@ export async function fetchTaskDetail(ctx, runner, taskId) {
     return JSON.parse(res.stdout);
   } catch (err) {
     throw new Error(`Invalid show JSON: ${err}`);
+  }
+}
+
+function parseBdJsonOutput(stdout) {
+  const trimmed = String(stdout || "").trim();
+  if (!trimmed) return null;
+  const parse = (text) => {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed[0] || null : parsed;
+  };
+  try {
+    return parse(trimmed);
+  } catch {
+    const arrStart = trimmed.indexOf("[");
+    const objStart = trimmed.indexOf("{");
+    const start =
+      arrStart >= 0 && objStart >= 0
+        ? Math.min(arrStart, objStart)
+        : Math.max(arrStart, objStart);
+    if (start > 0) {
+      const end = trimmed[start] === "[" ? trimmed.lastIndexOf("]") : trimmed.lastIndexOf("}");
+      if (end > start) {
+        return parse(trimmed.slice(start, end + 1));
+      }
+    }
+    throw new Error("Unexpected bd show --json output format");
+  }
+}
+
+export async function fetchBeadDetail(ctx, runner, beadId) {
+  if (!beadId) return null;
+  const args = ["bd-exec"];
+  if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
+  if (ctx?.bdActor) args.push("--bd-actor", ctx.bdActor);
+  args.push("--", "show", "--json", String(beadId));
+  const res = await execRoscaelifer(ctx, runner, args, { timeout: 15000 });
+  if (res.code !== 0) {
+    throw new Error((res.stderr || res.stdout || `bd show ${beadId} exited ${res.code}`).trim());
+  }
+  try {
+    return parseBdJsonOutput(res.stdout);
+  } catch (err) {
+    throw new Error(`Invalid bd show JSON: ${err}`);
   }
 }
 

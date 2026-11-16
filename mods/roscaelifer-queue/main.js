@@ -13,17 +13,26 @@ import {
   openOverlay,
   watchFolder,
   nextCommand,
+  checking,
 } from "herdr";
 import {
   resolveContext,
   resolveBinary,
   fetchSnapshot,
   fetchTaskDetail,
+  fetchBeadDetail,
   normalizeQueue,
   saveRepoContext,
   contextKey,
+  repoIdentityKey,
   repoLabel,
   loadRepoHistory,
+  loadActiveRepo,
+  buildContextFromProps,
+  loadCachedSnapshot,
+  saveCachedSnapshot,
+  safeStorageGet,
+  safeStorageSet,
 } from "./store.js";
 import { createActions } from "./actions.js";
 import { BoardController } from "./board.js";
@@ -36,6 +45,73 @@ const TABS = [
   { id: "deps", label: "Epics & Deps" },
   { id: "mirror", label: "Mirror & Events" },
 ];
+
+const FALLBACK_POLL_MS = 10000;
+const LOCAL_WATCH_POLL_MS = 30000;
+const DETAIL_CACHE_TTL_MS = 20000;
+const DETAIL_CACHE_MAX = 50;
+const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v1";
+const CLOSED_LIMIT_OPTIONS = [50, 500, 5000];
+const DEFAULT_CLOSED_LIMIT = 500;
+
+function herdrLiveFingerprint(agentList, termList, spaceList) {
+  const aSig = (agentList || []).map((a) => `${a?.address || ""}:${a?.status || ""}`).join("|");
+  const tSig = (termList || []).map((t) => `${t?.address || ""}:${t?.state || ""}:${t?.status || ""}`).join("|");
+  const sSig = String((spaceList || []).length);
+  return `${aSig}#${tSig}#${sSig}`;
+}
+
+function guessInitialContext(rawProps, sharedOverride) {
+  const fromOverride = buildContextFromProps(rawProps, sharedOverride);
+  if (fromOverride) return fromOverride;
+  const fromProps = buildContextFromProps(rawProps, null);
+  if (fromProps) return fromProps;
+
+  const focusedInfo = focused();
+  const activeSpace = spaces().find((s) => s.active);
+  const cwd = focusedInfo?.cwd || activeSpace?.folder || "";
+  const machine = typeof activeSpace?.machine === "string" ? activeSpace.machine.trim() : "";
+  const history = loadRepoHistory();
+
+  if (cwd) {
+    const cleanCwd = cwd.replace(/\/+$/, "") || "/";
+    let best = null;
+    for (const item of history) {
+      if ((item.machine || "") !== machine || !item.repo) continue;
+      const cleanRepo = item.repo.replace(/\/+$/, "") || "/";
+      if (cleanCwd === cleanRepo || cleanCwd.startsWith(`${cleanRepo}/`)) {
+        if (!best || cleanRepo.length > best.repo.length) {
+          best = item;
+        }
+      }
+    }
+    if (best) {
+      return {
+        ...best,
+        bin: best.bin || rawProps?.bin || "",
+        source: "history",
+      };
+    }
+    return null;
+  }
+
+  const activeSaved = loadActiveRepo();
+  if (activeSaved) {
+    return {
+      ...activeSaved,
+      bin: activeSaved.bin || rawProps?.bin || "",
+      source: "history",
+    };
+  }
+  if (history.length > 0) {
+    return {
+      ...history[0],
+      bin: history[0].bin || rawProps?.bin || "",
+      source: "history",
+    };
+  }
+  return null;
+}
 
 function topButton(id, label, iconPath, { bg, fg, border, busy = false, badge = null, onClick }) {
   return Button.new(id)
@@ -76,36 +152,70 @@ function topButton(id, label, iconPath, { bg, fg, border, busy = false, badge = 
 
 export default class RoscaeliferQueue extends View {
   init(rawProps, cx) {
-    if (rawProps?.dialogType) {
+    const initProps = {
+      ...(rawProps && typeof rawProps === "object" ? rawProps : {}),
+      ...(props() ?? {}),
+    };
+    if (initProps.dialogType) {
       this.isDialog = true;
-      this.dialog = new DialogHandler(rawProps, cx);
+      this.dialog = new DialogHandler(initProps, cx);
       return;
     }
 
     this.isDialog = false;
     this.handle = cx.focus_handle();
     this.tab = "queue";
+    const storedClosedLimit = safeStorageGet(CLOSED_LIMIT_KEY, DEFAULT_CLOSED_LIMIT);
+    this.closedLimit =
+      Number.isInteger(storedClosedLimit) && CLOSED_LIMIT_OPTIONS.includes(storedClosedLimit)
+        ? storedClosedLimit
+        : DEFAULT_CLOSED_LIMIT;
     this.ctx = null;
     this.runner = null;
     this.snapshot = null;
     this.queue = null;
     this.selectedId = null;
     this.detail = null;
+    this.beadDetail = null;
+    this.detailItemId = null;
     this.detailTaskId = null;
+    this.detailBeadId = null;
     this.detailLoading = false;
     this.detailError = null;
+    this.detailReqSeq = 0;
+    this.detailCache = new Map();
     this.loading = false;
     this.error = null;
     this.size = null;
     this.watchedDirs = new Set();
+    this.watchHandles = new Map();
     this.debounceTimer = null;
+    this.pollTimer = null;
+    this.pollIntervalMs = 0;
+    this.refreshSeq = 0;
+    this._normSnapshot = null;
+    this._normLiveFp = null;
+    this._normQueue = null;
     this.lastRefreshSignal = shared("roscaelifer.refresh") ?? null;
     this.lastOverrideSignal = JSON.stringify(shared("roscaelifer.ctxOverride") ?? null);
-    this.lastHerdrLocation = "";
+    this.lastHerdrLocation = this.locationKey();
+    this.signalTimer = null;
 
     this.board = new BoardController(cx);
     this.inspector = new InspectorController(cx);
     this.deps = new DepsController(cx);
+
+    const guessedCtx = guessInitialContext(initProps, shared("roscaelifer.ctxOverride") ?? null);
+    if (guessedCtx) {
+      // Adopt the guessed context even without a cached snapshot, so the first render
+      // does not see `!this.ctx` and kick off a second, competing refresh.
+      const cached = loadCachedSnapshot(guessedCtx);
+      this.ctx = guessedCtx;
+      if (cached?.snapshot) {
+        this.snapshot = cached.snapshot;
+        this.queue = this.getNormalizedQueue(cached.snapshot);
+      }
+    }
 
     this.actions = createActions({
       getCtx: () => this.ctx,
@@ -139,8 +249,11 @@ export default class RoscaeliferQueue extends View {
       }
     });
 
-    // Gentle 10s fallback polling for external changes (dolt, remote machines, CLI).
-    cx.timer.every(10000, (cx) => this.refresh(cx, { silent: true }));
+    // `herdr-app check` loads this mod for real: skip the background work it would start.
+    if (checking()) return;
+
+    // Gentle fallback polling (10s without local FS watch, relaxed to 30s when local watchFolder is active).
+    this.updatePollTimer(cx, FALLBACK_POLL_MS);
     this.refresh(cx, { forceContext: true });
   }
 
@@ -152,6 +265,67 @@ export default class RoscaeliferQueue extends View {
       this.debounceTimer.cancel();
       this.debounceTimer = null;
     }
+    if (this.signalTimer) {
+      this.signalTimer.cancel();
+      this.signalTimer = null;
+    }
+    if (this.pollTimer) {
+      this.pollTimer.cancel();
+      this.pollTimer = null;
+      this.pollIntervalMs = 0;
+    }
+    this.clearWatchers();
+  }
+
+  getNormalizedQueue(snapshot) {
+    if (!snapshot) return null;
+    const agentList = agents();
+    const termList = terminals();
+    const spaceList = spaces();
+    const fp = herdrLiveFingerprint(agentList, termList, spaceList);
+    if (this._normSnapshot === snapshot && this._normLiveFp === fp && this._normQueue) {
+      return this._normQueue;
+    }
+    const q = normalizeQueue(snapshot, {
+      agents: agentList,
+      terminals: termList,
+      spaces: spaceList,
+    });
+    this._normSnapshot = snapshot;
+    this._normLiveFp = fp;
+    this._normQueue = q;
+    return q;
+  }
+
+  updatePollTimer(cx, intervalMs) {
+    if (!cx?.timer || this.pollIntervalMs === intervalMs) return;
+    if (this.pollTimer) {
+      this.pollTimer.cancel();
+      this.pollTimer = null;
+    }
+    this.pollIntervalMs = intervalMs;
+    this.pollTimer = cx.timer.every(intervalMs, (tickCx) => this.refresh(tickCx, { silent: true }));
+  }
+
+  clearWatchers() {
+    this.watchedDirs.clear();
+    for (const handle of this.watchHandles.values()) {
+      try {
+        handle?.cancel?.();
+      } catch {
+        // Ignore cancel failures on already settled watches.
+      }
+    }
+    this.watchHandles.clear();
+  }
+
+  setClosedLimit(nextLimit, cx) {
+    if (!CLOSED_LIMIT_OPTIONS.includes(nextLimit)) return;
+    if (nextLimit === this.closedLimit) return;
+    this.closedLimit = nextLimit;
+    safeStorageSet(CLOSED_LIMIT_KEY, nextLimit);
+    cx?.notify?.();
+    this.refresh(cx, { forceContext: false });
   }
 
   async ensureRunner() {
@@ -163,7 +337,7 @@ export default class RoscaeliferQueue extends View {
   locationKey() {
     const f = focused();
     const s = spaces().find((sp) => sp.active);
-    return `${f?.cwd || ""}|${s?.id || ""}|${s?.folder || ""}`;
+    return `${f?.cwd || ""}|${s?.id || ""}|${s?.folder || ""}|${s?.machine || ""}`;
   }
 
   scheduleDebouncedRefresh(cx) {
@@ -175,7 +349,10 @@ export default class RoscaeliferQueue extends View {
   }
 
   ensureWatchers(ctx, cx) {
-    if (!ctx) return;
+    if (!ctx || ctx.machine) {
+      this.updatePollTimer(cx, FALLBACK_POLL_MS);
+      return;
+    }
     const dirs = new Set();
     if (ctx.repo) {
       dirs.add(`${ctx.repo}/.roscaelifer`);
@@ -190,22 +367,47 @@ export default class RoscaeliferQueue extends View {
     for (const dir of dirs) {
       if (!dir || this.watchedDirs.has(dir)) continue;
       this.watchedDirs.add(dir);
-      cx.spawn(async (cx) => {
+      cx.spawn(async (watchCx) => {
         try {
           while (this.watchedDirs.has(dir)) {
-            await watchFolder(dir);
+            const handle = watchFolder(dir);
+            this.watchHandles.set(dir, handle);
+            await handle;
             if (!this.watchedDirs.has(dir)) break;
-            this.scheduleDebouncedRefresh(cx);
+            this.scheduleDebouncedRefresh(watchCx);
           }
         } catch {
           this.watchedDirs.delete(dir);
+          this.watchHandles.delete(dir);
+          if (this.watchedDirs.size === 0) {
+            this.updatePollTimer(watchCx, FALLBACK_POLL_MS);
+          }
         }
       });
     }
+
+    this.updatePollTimer(cx, this.watchedDirs.size > 0 ? LOCAL_WATCH_POLL_MS : FALLBACK_POLL_MS);
   }
 
-  refresh(cx, { forceContext = false, silent = false } = {}) {
-    if (this.loading) return;
+  applyCachedContext(nextCtx, cx) {
+    const cached = loadCachedSnapshot(nextCtx);
+    if (cached?.snapshot) {
+      this.snapshot = cached.snapshot;
+      this.queue = this.getNormalizedQueue(cached.snapshot);
+      this.error = null;
+    } else {
+      this.snapshot = null;
+      this.queue = null;
+      this.error = null;
+    }
+    cx.notify();
+  }
+
+  refresh(cx, { forceContext = false, preempt = false, silent = false } = {}) {
+    // Only an explicit override switch may preempt the refresh already in flight:
+    // starting a second one bumps `refreshSeq` and strands the first one's `loading`.
+    if (this.loading && !preempt) return;
+    const seq = ++this.refreshSeq;
     this.loading = true;
     if (!silent) cx.notify();
 
@@ -220,12 +422,28 @@ export default class RoscaeliferQueue extends View {
             paneList: panes(),
             sharedOverride,
           });
+          if (seq !== this.refreshSeq) return;
           if (contextKey(nextCtx) !== contextKey(this.ctx)) {
+            const repoChanged = repoIdentityKey(nextCtx) !== repoIdentityKey(this.ctx);
             this.ctx = nextCtx;
             this.runner = null;
-            this.watchedDirs.clear();
-            this.detail = null;
-            this.detailTaskId = null;
+            this.clearWatchers();
+            this.updatePollTimer(cx, FALLBACK_POLL_MS);
+            if (repoChanged) {
+              this.selectedId = null;
+              this.detail = null;
+              this.beadDetail = null;
+              this.detailItemId = null;
+              this.detailTaskId = null;
+              this.detailBeadId = null;
+              this.detailError = null;
+              this.detailLoading = false;
+              this.detailReqSeq += 1;
+              this.detailCache.clear();
+            }
+            if (nextCtx) {
+              this.applyCachedContext(nextCtx, cx);
+            }
           }
         }
 
@@ -237,87 +455,210 @@ export default class RoscaeliferQueue extends View {
         }
 
         const runner = await this.ensureRunner();
-        const snap = await fetchSnapshot(this.ctx, runner);
+        if (seq !== this.refreshSeq) return;
+        const snap = await fetchSnapshot(this.ctx, runner, {
+          closedLimit: this.closedLimit,
+          onRunnerResolved: (freshRunner) => {
+            if (seq === this.refreshSeq) this.runner = freshRunner;
+          },
+        });
+        if (seq !== this.refreshSeq) return;
         this.snapshot = snap;
         this.error = null;
         saveRepoContext(this.ctx);
+        saveCachedSnapshot(this.ctx, snap);
         this.ensureWatchers(this.ctx, cx);
 
-        this.queue = normalizeQueue(snap, {
-          agents: agents(),
-          terminals: terminals(),
-          spaces: spaces(),
-        });
+        this.queue = this.getNormalizedQueue(snap);
 
         const selected = this.selectedId ? this.queue.itemsById.get(this.selectedId) : null;
-        if (selected?.taskId) {
-          await this.loadDetailInternal(selected.taskId, runner);
-        } else {
+        if (selected && (selected.taskId || selected.beadId)) {
+          await this.loadItemDetail(selected, { runnerOverride: runner, force: true });
+        } else if (!selected) {
           this.detail = null;
+          this.beadDetail = null;
+          this.detailItemId = null;
           this.detailTaskId = null;
+          this.detailBeadId = null;
+          this.detailError = null;
+          this.detailLoading = false;
         }
       } catch (err) {
-        this.error = err?.message || String(err);
+        if (seq === this.refreshSeq) {
+          this.error = err?.message || String(err);
+        }
       } finally {
-        this.loading = false;
-        cx.notify();
+        if (seq === this.refreshSeq) {
+          this.loading = false;
+          cx.notify();
+        }
       }
     });
   }
 
-  async loadDetailInternal(taskId, runnerOverride = null) {
-    if (!taskId || !this.ctx) {
-      this.detail = null;
-      this.detailTaskId = null;
-      this.detailError = null;
-      return;
+  detailCacheKey(item) {
+    return `${contextKey(this.ctx)}|${item?.taskId || ""}|${item?.beadId || ""}`;
+  }
+
+  setDetailCacheEntry(key, taskDetail, beadDetail) {
+    if (this.detailCache.has(key)) {
+      this.detailCache.delete(key);
     }
-    this.detailLoading = true;
-    this.detailError = null;
-    this.detailTaskId = taskId;
-    try {
-      const runner = runnerOverride || (await this.ensureRunner());
-      this.detail = await fetchTaskDetail(this.ctx, runner, taskId);
-    } catch (err) {
-      this.detailError = err?.message || String(err);
-    } finally {
-      this.detailLoading = false;
+    this.detailCache.set(key, {
+      taskDetail,
+      beadDetail,
+      fetchedAt: Date.now(),
+    });
+    while (this.detailCache.size > DETAIL_CACHE_MAX) {
+      const oldestKey = this.detailCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.detailCache.delete(oldestKey);
     }
   }
 
-  selectItem(item, cx) {
+  async loadItemDetail(item, { runnerOverride = null, force = false } = {}) {
+    const taskId = item?.taskId || null;
+    const beadId = item?.beadId || null;
+    const itemId = item?.id || null;
+    if (!itemId || !this.ctx || (!taskId && !beadId)) {
+      this.detail = null;
+      this.beadDetail = null;
+      this.detailItemId = itemId;
+      this.detailTaskId = null;
+      this.detailBeadId = null;
+      this.detailError = null;
+      this.detailLoading = false;
+      return;
+    }
+
+    const cacheKey = this.detailCacheKey(item);
+    if (!force && this.detailCache.has(cacheKey)) {
+      const cached = this.detailCache.get(cacheKey);
+      if (Date.now() - cached.fetchedAt < DETAIL_CACHE_TTL_MS) {
+        this.detail = cached.taskDetail;
+        this.beadDetail = cached.beadDetail;
+        this.detailItemId = itemId;
+        this.detailTaskId = taskId;
+        this.detailBeadId = beadId;
+        this.detailError = null;
+        this.detailLoading = false;
+        return;
+      }
+      this.detailCache.delete(cacheKey);
+    }
+
+    const reqSeq = ++this.detailReqSeq;
+    this.detailLoading = true;
+    this.detailError = null;
+    this.detailItemId = itemId;
+    this.detailTaskId = taskId;
+    this.detailBeadId = beadId;
+
+    try {
+      const runner = runnerOverride || (await this.ensureRunner());
+      if (this.detailReqSeq !== reqSeq || this.selectedId !== itemId) return;
+
+      const [taskRes, beadRes] = await Promise.allSettled([
+        taskId ? fetchTaskDetail(this.ctx, runner, taskId) : Promise.resolve(null),
+        beadId ? fetchBeadDetail(this.ctx, runner, beadId) : Promise.resolve(null),
+      ]);
+      if (this.detailReqSeq !== reqSeq || this.selectedId !== itemId) return;
+
+      const errors = [];
+      const nextTaskDetail = taskRes.status === "fulfilled" ? taskRes.value : null;
+      if (taskRes.status === "rejected") {
+        errors.push(taskRes.reason?.message || String(taskRes.reason));
+      }
+      const nextBeadDetail = beadRes.status === "fulfilled" ? beadRes.value : null;
+      if (beadRes.status === "rejected") {
+        errors.push(beadRes.reason?.message || String(beadRes.reason));
+      }
+
+      if (taskRes.status === "fulfilled") this.detail = nextTaskDetail;
+      if (beadRes.status === "fulfilled") this.beadDetail = nextBeadDetail;
+      this.detailError = errors.length > 0 ? errors.join(" | ") : null;
+
+      if (errors.length === 0) {
+        this.setDetailCacheEntry(cacheKey, nextTaskDetail, nextBeadDetail);
+      }
+    } catch (err) {
+      if (this.detailReqSeq === reqSeq && this.selectedId === itemId) {
+        this.detailError = err?.message || String(err);
+      }
+    } finally {
+      if (this.detailReqSeq === reqSeq && this.selectedId === itemId) {
+        this.detailLoading = false;
+      }
+    }
+  }
+
+  selectItem(item, cx, { forceDetail = false } = {}) {
     if (!item) {
       this.selectedId = null;
       this.detail = null;
+      this.beadDetail = null;
+      this.detailItemId = null;
       this.detailTaskId = null;
+      this.detailBeadId = null;
+      this.detailError = null;
+      this.detailLoading = false;
+      this.detailReqSeq += 1;
       cx?.notify();
       return;
     }
+
+    const switching = this.detailItemId !== item.id;
     this.selectedId = item.id;
+    this.detailItemId = item.id;
+    this.detailTaskId = item.taskId || null;
+    this.detailBeadId = item.beadId || null;
     this.detailError = null;
-    if (item.taskId) {
-      this.detailLoading = true;
-      this.detailTaskId = item.taskId;
-      cx?.notify();
-      cx?.spawn(async (cx) => {
-        await this.loadDetailInternal(item.taskId);
-        cx.notify();
-      });
-    } else {
+    if (switching) {
       this.detail = null;
-      this.detailTaskId = null;
+      this.beadDetail = null;
+    }
+
+    if (!item.taskId && !item.beadId) {
+      this.detail = null;
+      this.beadDetail = null;
       this.detailLoading = false;
+      this.detailReqSeq += 1;
       cx?.notify();
+      return;
+    }
+
+    const cacheKey = this.detailCacheKey(item);
+    if (!forceDetail && this.detailCache.has(cacheKey)) {
+      const cached = this.detailCache.get(cacheKey);
+      if (Date.now() - cached.fetchedAt < DETAIL_CACHE_TTL_MS) {
+        this.detail = cached.taskDetail;
+        this.beadDetail = cached.beadDetail;
+        this.detailLoading = false;
+        this.detailReqSeq += 1;
+        cx?.notify();
+        return;
+      }
+    }
+
+    this.detailLoading = true;
+    cx?.notify();
+    if (cx?.spawn) {
+      cx.spawn(async (spawnCx) => {
+        await this.loadItemDetail(item, { force: forceDetail });
+        spawnCx.notify();
+      });
     }
   }
 
   openDialog(dialogType, extra = {}) {
+    if (this.isDialog) return;
+
     const dims = {
       create: { width: 520, height: 500 },
       enqueue: { width: 440, height: 340 },
       reject: { width: 460, height: 320 },
       "clean-preview": { width: 520, height: 420 },
-      "repo-config": { width: 520, height: 420 },
+      "repo-config": { width: 540, height: 500 },
     };
     const size = dims[dialogType] || { width: 480, height: 380 };
 
@@ -447,6 +788,7 @@ export default class RoscaeliferQueue extends View {
               .text_color(t.foreground)
               .cursor_pointer()
               .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .on_click(() => this.openDialog("repo-config"))
               .child(svg("mods/roscaelifer-queue/icons/folder.svg").size(13).flex_none().text_color(t.muted))
               .child(div().max_w(180).truncate().child(repoLabel(this.ctx))),
@@ -555,25 +897,32 @@ export default class RoscaeliferQueue extends View {
     const loc = this.locationKey();
     const overrideChanged = overrideSignal !== this.lastOverrideSignal;
     if (
-      refreshSignal !== this.lastRefreshSignal ||
-      overrideChanged ||
-      (!this.ctx && loc !== this.lastHerdrLocation)
+      (refreshSignal !== this.lastRefreshSignal ||
+        overrideChanged ||
+        (!this.ctx && !this.loading && loc !== this.lastHerdrLocation)) &&
+      !checking()
     ) {
       this.lastRefreshSignal = refreshSignal;
       this.lastOverrideSignal = overrideSignal;
       this.lastHerdrLocation = loc;
-      this.refresh(cx, { forceContext: overrideChanged || !this.ctx, silent: true });
+      // `render` hands out a call-scoped `Context`; the timer callback owns the task.
+      if (this.signalTimer) {
+        this.signalTimer.cancel();
+        this.signalTimer = null;
+      }
+      this.signalTimer = cx.timer.after(0, (timerCx) => {
+        this.signalTimer = null;
+        this.refresh(timerCx, {
+          forceContext: overrideChanged || !this.ctx,
+          preempt: overrideChanged,
+          silent: true,
+        });
+      });
     }
 
     const t = theme();
-    // Re-project live Herdr agents/terminals whenever Herdr live data updates.
-    const queue = this.snapshot
-      ? normalizeQueue(this.snapshot, {
-          agents: agents(),
-          terminals: terminals(),
-          spaces: spaces(),
-        })
-      : this.queue;
+    // Re-project live Herdr agents/terminals only when snapshot ref or live Herdr fingerprint changes.
+    const queue = this.snapshot ? this.getNormalizedQueue(this.snapshot) : this.queue;
     if (queue) this.queue = queue;
 
     const selectedItem =
@@ -651,6 +1000,9 @@ export default class RoscaeliferQueue extends View {
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
                       actions: this.actions,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
+                      closedLimit: this.closedLimit,
+                      onChangeClosedLimit: (nextLimit, clickCx) =>
+                        this.setClosedLimit(nextLimit, clickCx),
                     },
                     cx,
                   ),
@@ -684,16 +1036,17 @@ export default class RoscaeliferQueue extends View {
                   this.inspector.render(
                     {
                       item: selectedItem,
-                      detail: this.detailTaskId === selectedItem.taskId ? this.detail : null,
-                      detailLoading: this.detailLoading && this.detailTaskId === selectedItem.taskId,
-                      detailError: this.detailTaskId === selectedItem.taskId ? this.detailError : null,
+                      detail: this.detailItemId === selectedItem.id ? this.detail : null,
+                      beadDetail: this.detailItemId === selectedItem.id ? this.beadDetail : null,
+                      detailLoading: this.detailLoading && this.detailItemId === selectedItem.id,
+                      detailError: this.detailItemId === selectedItem.id ? this.detailError : null,
                       actions: this.actions,
                       ctx: this.ctx,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
                       onClose: (clickCx) => this.selectItem(null, clickCx),
                       onRefreshDetail: (clickCx) => {
-                        if (selectedItem?.taskId) {
-                          this.selectItem(selectedItem, clickCx);
+                        if (selectedItem?.taskId || selectedItem?.beadId) {
+                          this.selectItem(selectedItem, clickCx, { forceDetail: true });
                         }
                       },
                     },

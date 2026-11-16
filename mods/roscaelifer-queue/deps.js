@@ -2,6 +2,7 @@ import { div } from "gpui-kit";
 import {
   v_flex,
   h_flex,
+  Checkbox,
   Input,
   InputState,
   Progress,
@@ -11,6 +12,7 @@ import {
   Scrollbar,
 } from "gpui-base";
 import { settings, theme } from "herdr";
+import { createColumnScrollLock } from "./scroll-lock.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
 
@@ -191,6 +193,68 @@ function collectChain(rootId, blockersOf, unlocksOf) {
   return { upstream, downstream };
 }
 
+/**
+ * Single source of truth for an epic's child counts. Both the sidebar filter
+ * and the rendered rows read from here so the two never disagree.
+ * Returns { total, done, pct }.
+ */
+function getEpicStats(ep) {
+  const total = ep?.counts?.total ?? ep?.children?.length ?? ep?.total ?? 0;
+  const done =
+    ep?.counts !== undefined ? (ep.counts.closed ?? 0) + (ep.counts.review ?? 0) : (ep?.done ?? 0);
+  const pct =
+    typeof ep?.progress === "number"
+      ? Math.round(ep.progress * 100)
+      : total > 0
+        ? Math.round((done / total) * 100)
+        : ep?.status === "closed"
+          ? 100
+          : 0;
+  return { total, done, pct };
+}
+
+function isEpicDone(ep) {
+  if (ep?.status === "closed") return true;
+  const { total, done } = getEpicStats(ep);
+  return total > 0 && done >= total;
+}
+
+/**
+ * Sidebar visibility rule: completed epics are hidden unless "Show Done" is on,
+ * childless epics are hidden unless "Show 0" is on.
+ */
+function isEpicVisible(ep, { showDone, showEmpty }) {
+  if (isEpicDone(ep)) return showDone;
+  if (getEpicStats(ep).total <= 0) return showEmpty;
+  return true;
+}
+
+/** Shared compact checkbox used by the epic sidebar filter bar. */
+function renderFilterCheckbox(id, label, checked, onChange, t) {
+  return Checkbox.new(id)
+    .checked(checked)
+    .on_change((value, cx) => onChange(Boolean(value), cx))
+    .flex()
+    .items_center()
+    .gap(6)
+    .cursor_pointer()
+    .child(
+      div()
+        .size(14)
+        .rounded(4)
+        .border_1()
+        .border_color(checked ? t.accent : t.input)
+        .bg(checked ? t.accent : t.background)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(10)
+        .text_color(t.accent_foreground)
+        .child(checked ? "✓" : ""),
+    )
+    .child(div().text_size(11).text_color(checked ? t.foreground : t.muted).child(label));
+}
+
 export class DepsController {
   constructor(_cx) {
     this.epicsScroll = ScrollHandle.new();
@@ -199,7 +263,10 @@ export class DepsController {
     this.selectedEpicId = null; // null = All Issues
     this.chainFocusId = null;
     this.showClosedInWaves = false;
+    this.showDoneEpics = false;
+    this.showEmptyEpics = false;
     this.eventFilter = "";
+    this.handleWaveScrollWheel = createColumnScrollLock();
     this.eventFilterInput = InputState.new({ placeholder: "Filter events by task, kind, or message…" });
     this.eventFilterInput.on("change", (_e, cx) => {
       this.eventFilter = this.eventFilterInput.value();
@@ -232,6 +299,7 @@ export class DepsController {
       .id("deps-root")
       .size_full()
       .min_h(0)
+      .p(10)
       .gap(8)
       .child(
         h_flex()
@@ -256,9 +324,27 @@ export class DepsController {
       );
   }
 
+  /** Clears the epic selection when the active filters hide the selected epic. */
+  syncEpicFilterSelection(epics) {
+    if (!this.selectedEpicId) return;
+    const selected = epics.find((ep) => (ep.id || ep.beadId) === this.selectedEpicId);
+    const stillVisible =
+      selected &&
+      isEpicVisible(selected, { showDone: this.showDoneEpics, showEmpty: this.showEmptyEpics });
+    if (!stillVisible) {
+      this.selectedEpicId = null;
+      this.chainFocusId = null;
+    }
+  }
+
   renderEpicSidebar(t, { epics, items, monoFont }) {
     const nonEpicCount = items.filter((it) => it.issueType !== "epic").length;
     const closedCount = items.filter((it) => it.issueType !== "epic" && (it.bdStatus === "closed" || it.column === "closed")).length;
+    const visibleEpics = epics.filter((ep) =>
+      isEpicVisible(ep, { showDone: this.showDoneEpics, showEmpty: this.showEmptyEpics }),
+    );
+    const filteredCountText =
+      visibleEpics.length !== epics.length ? `${visibleEpics.length}/${epics.length}` : `${epics.length}`;
 
     return v_flex()
       .id("deps-epic-sidebar")
@@ -281,8 +367,52 @@ export class DepsController {
           .border_b(1)
           .border_color(t.border)
           .bg(t.chrome)
-          .child(div().text_size(12).font_semibold().text_color(t.foreground).child("Epics"))
-          .child(div().text_size(11).text_color(t.dim).child(`${epics.length}`)),
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .child(
+                div().text_size(12).font_semibold().text_color(t.foreground).child("Epics"),
+              )
+              .child(div().text_size(11).text_color(t.dim).child(filteredCountText)),
+          ),
+      )
+      .child(
+        h_flex()
+          .flex_none()
+          .h(30)
+          .px(12)
+          .gap(14)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .bg(t.chrome)
+          .child(
+            renderFilterCheckbox(
+              "deps-show-done-epics",
+              "Show Done",
+              this.showDoneEpics,
+              (checked, cx) => {
+                this.showDoneEpics = checked;
+                this.syncEpicFilterSelection(epics);
+                cx.notify();
+              },
+              t,
+            ),
+          )
+          .child(
+            renderFilterCheckbox(
+              "deps-show-empty-epics",
+              "Show 0",
+              this.showEmptyEpics,
+              (checked, cx) => {
+                this.showEmptyEpics = checked;
+                this.syncEpicFilterSelection(epics);
+                cx.notify();
+              },
+              t,
+            ),
+          ),
       )
       .child(
         div()
@@ -324,22 +454,10 @@ export class DepsController {
                   .child(this.renderProgressBar(t, "all", nonEpicCount > 0 ? Math.round((closedCount / nonEpicCount) * 100) : 0)),
               )
               .children(
-                epics.map((ep) => {
+                visibleEpics.map((ep) => {
                   const id = ep.id || ep.beadId;
                   const active = this.selectedEpicId === id;
-                  const total = ep.counts?.total ?? ep.children?.length ?? ep.total ?? 0;
-                  const done =
-                    ep.counts !== undefined
-                      ? (ep.counts.closed ?? 0) + (ep.counts.review ?? 0)
-                      : (ep.done ?? 0);
-                  const pct =
-                    typeof ep.progress === "number"
-                      ? Math.round(ep.progress * 100)
-                      : total > 0
-                        ? Math.round((done / total) * 100)
-                        : ep.status === "closed"
-                          ? 100
-                          : 0;
+                  const { total, done, pct } = getEpicStats(ep);
                   return v_flex()
                     .id(`deps-epic-${id}`)
                     .p(9)
@@ -366,6 +484,15 @@ export class DepsController {
                     .child(div().text_size(12).font_medium().text_color(t.foreground).child(ep.title || id))
                     .child(this.renderProgressBar(t, id, pct));
                 }),
+              )
+              .when(visibleEpics.length === 0 && epics.length > 0, (el) =>
+                el.child(
+                  div()
+                    .p(8)
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .child('No active epics. Toggle "Show Done" or "Show 0" above.'),
+                ),
               )
               .when(epics.length === 0, (el) =>
                 el.child(div().p(8).text_size(11.5).text_color(t.dim).child("No epics found in current bd snapshot.")),
@@ -525,6 +652,7 @@ export class DepsController {
                     .border_color(t.border)
                     .bg(t.canvas)
                     .overflow_hidden()
+                    .on_scroll_wheel((e, cx) => this.handleWaveScrollWheel(e, cx))
                     .child(
                       h_flex()
                         .flex_none()
@@ -763,6 +891,7 @@ export class DepsController {
       .id("mirror-events-root")
       .size_full()
       .min_h(0)
+      .p(10)
       .gap(8)
       .child(
         v_flex()

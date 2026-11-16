@@ -15,8 +15,10 @@ import {
 } from "gpui-base";
 import { closeOverlay, pickFolder, props, setShared, theme } from "herdr";
 import { createActions } from "./actions.js";
+import { clearActiveRepo } from "./store.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
+const normalizeMachine = (machine) => (typeof machine === "string" ? machine.trim() : "");
 
 const PRIORITIES = [
   { value: 0, label: "P0 · Critical" },
@@ -59,7 +61,10 @@ function normalizeCleanPreview(raw) {
 
 export class DialogController {
   constructor(initialProps, cx) {
-    const p = initialProps ?? props() ?? {};
+    const p = {
+      ...(initialProps && typeof initialProps === "object" ? initialProps : {}),
+      ...(props() ?? {}),
+    };
     this.p = p;
     this.dialogType = p.dialogType ?? "enqueue";
     this.ctx = p.ctx ?? {};
@@ -170,6 +175,7 @@ export class DialogController {
       }
     } else if (this.dialogType === "repo-config") {
       this.repoInput = InputState.new({ value: this.ctx.repo ?? "", placeholder: "/path/to/repo" });
+      this.machineInput = InputState.new({ value: this.ctx.machine ?? "", placeholder: "remote machine (optional)" });
       this.dbInput = InputState.new({ value: this.ctx.db ?? "", placeholder: ".roscaelifer/roscaelifer.db" });
       this.bdDirInput = InputState.new({ value: this.ctx.bdDir ?? "", placeholder: "/path/to/repo/.beads" });
       this.configInput = InputState.new({ value: this.ctx.config ?? "", placeholder: "roscaelifer.toml" });
@@ -178,6 +184,7 @@ export class DialogController {
       this.focusedField = "repo";
       for (const [name, st] of [
         ["repo", this.repoInput],
+        ["machine", this.machineInput],
         ["db", this.dbInput],
         ["bdDir", this.bdDirInput],
         ["config", this.configInput],
@@ -300,6 +307,7 @@ export class DialogController {
     if (this.dialogType === "repo-config") {
       const nextCtx = {
         repo: this.repoInput.value().trim(),
+        machine: this.machineInput.value().trim(),
         db: this.dbInput.value().trim(),
         bdDir: this.bdDirInput.value().trim(),
         config: this.configInput.value().trim(),
@@ -753,6 +761,23 @@ export class DialogController {
   }
 
   renderRepoConfig(t) {
+    const updateRepoPaths = (folder) => {
+      const prevRepo = this.repoInput.value().trim();
+      const derived = [
+        [this.dbInput, `${prevRepo}/.roscaelifer/roscaelifer.db`, `${folder}/.roscaelifer/roscaelifer.db`],
+        [this.bdDirInput, `${prevRepo}/.beads`, `${folder}/.beads`],
+        [this.configInput, `${prevRepo}/roscaelifer.toml`, `${folder}/roscaelifer.toml`],
+        [this.formulasDirInput, `${prevRepo}/formulas`, `${folder}/formulas`],
+      ];
+      this.repoInput.set_value(folder);
+      for (const [input, oldDefault, nextDefault] of derived) {
+        const current = input.value().trim();
+        if (!current || current === oldDefault) {
+          input.set_value(nextDefault);
+        }
+      }
+    };
+
     const fieldRow = (name, label, inputState, pickable = false) =>
       v_flex()
         .gap(4)
@@ -778,7 +803,11 @@ export class DialogController {
                   cx.spawn(async (cx) => {
                     const folder = await pickFolder({ prompt: `Select ${label}` });
                     if (folder) {
-                      inputState.set_value(folder);
+                      if (name === "repo") {
+                        updateRepoPaths(folder);
+                      } else {
+                        inputState.set_value(folder);
+                      }
                       cx.notify();
                     }
                   });
@@ -788,6 +817,20 @@ export class DialogController {
         );
 
     const history = Array.isArray(this.p.history) ? this.p.history : [];
+    const historyLabels = history.map((h, idx) => h.label || h.repo || h.db || `Repo ${idx + 1}`);
+    const labelCounts = new Map();
+    for (const label of historyLabels) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+    const displayHistoryLabel = (h, idx) => {
+      const label = historyLabels[idx];
+      if ((labelCounts.get(label) || 0) < 2) return label;
+      const base = h.repo || h.bdDir || h.db || "";
+      const parent = base.replace(/\/+$/, "").split("/").filter(Boolean).slice(-2, -1)[0] || "repo";
+      return h.machine ? `${label} @${h.machine}` : `${label} · ${parent}`;
+    };
+    const currentRepo = this.repoInput.value().trim();
+    const currentMachine = normalizeMachine(this.machineInput.value());
+    const currentDB = this.dbInput.value().trim();
+    const currentBDDir = this.bdDirInput.value().trim();
     return v_flex()
       .gap(10)
       .child(div().text_size(12).text_color(t.dim).child("Override auto-detected repository paths for this mod view."))
@@ -801,21 +844,28 @@ export class DialogController {
                 .gap(6)
                 .flex_wrap()
                 .children(
-                  history.slice(0, 6).map((h, idx) =>
-                    div()
+                  history.slice(0, 6).map((h, idx) => {
+                    const active =
+                      normalizeMachine(h.machine) === currentMachine &&
+                      ((h.repo && String(h.repo).trim() === currentRepo) ||
+                        (h.db && String(h.db).trim() === currentDB) ||
+                        (h.bdDir && String(h.bdDir).trim() === currentBDDir));
+                    return div()
                       .id(`dlg-hist-${idx}`)
                       .px(8)
                       .py(4)
                       .rounded(5)
                       .border_1()
-                      .border_color(t.border)
-                      .bg(t.raised)
+                      .border_color(active ? t.accent : t.border)
+                      .bg(active ? t.selected : t.raised)
                       .text_size(11.5)
                       .text_color(t.foreground)
+                      .font_medium()
                       .cursor_pointer()
                       .hover((s) => s.bg(t.hover))
                       .on_click((_e, cx) => {
                         this.repoInput.set_value(h.repo || "");
+                        this.machineInput.set_value(h.machine || "");
                         this.dbInput.set_value(h.db || "");
                         this.bdDirInput.set_value(h.bdDir || "");
                         this.configInput.set_value(h.config || "");
@@ -823,14 +873,15 @@ export class DialogController {
                         this.binInput.set_value(h.bin || "");
                         cx.notify();
                       })
-                      .child(h.label || h.repo || h.db || `Repo ${idx + 1}`),
-                  ),
+                      .child(displayHistoryLabel(h, idx));
+                  }),
                 ),
             ),
         ),
       )
       .child(fieldRow("repo", "Repository Root", this.repoInput, true))
-      .child(fieldRow("db", "SQLite DB Path (--db)", this.dbInput, false))
+      .child(fieldRow("machine", "Machine (blank = local)", this.machineInput, false))
+      .child(fieldRow("db", "Roscaelifer DB Path (--db)", this.dbInput, false))
       .child(fieldRow("bdDir", "Beads Directory (.beads)", this.bdDirInput, true))
       .child(fieldRow("config", "Herdr Env Config (roscaelifer.toml)", this.configInput, false))
       .child(fieldRow("formulasDir", "Formulas Directory", this.formulasDirInput, true))
@@ -939,6 +990,7 @@ export class DialogController {
           .child(
             this.dialogType === "repo-config"
               ? this.renderBtn(t, "dlg-reset-ctx", "Reset Auto-Detect", () => {
+                  clearActiveRepo();
                   setShared("roscaelifer.ctxOverride", null);
                   setShared("roscaelifer.refresh", Date.now());
                   this.close();

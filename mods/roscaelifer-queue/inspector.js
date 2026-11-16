@@ -161,7 +161,7 @@ export class InspectorController {
     this.hcError = null;
   }
 
-  render({ item, detail, detailLoading, detailError, actions, ctx, onOpenDialog, onClose, onRefreshDetail }, cx) {
+  render({ item, detail, beadDetail, detailLoading, detailError, actions, ctx, onOpenDialog, onClose, onRefreshDetail }, cx) {
     const t = theme();
     if (!item) {
       return v_flex()
@@ -220,10 +220,10 @@ export class InspectorController {
       this.resetTail();
     }
 
-    const bodyText = taskDetail?.body || item.body || item.description || "";
-    const acText = item.acceptanceCriteria || item.issue?.acceptance_criteria || "";
-    const notesText = item.notes || item.issue?.notes || "";
-    const closeReason = item.closeReason || item.issue?.close_reason || "";
+    const bodyText = taskDetail?.body || beadDetail?.description || item.body || item.description || "";
+    const acText = beadDetail?.acceptance_criteria || item.acceptanceCriteria || item.issue?.acceptance_criteria || "";
+    const notesText = beadDetail?.notes || item.notes || item.issue?.notes || "";
+    const closeReason = beadDetail?.close_reason || item.closeReason || item.issue?.close_reason || "";
     const busy = actions?.isBusy ? actions.isBusy() : false;
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const resolvedMachine =
@@ -334,7 +334,7 @@ export class InspectorController {
                 h_flex()
                   .items_center()
                   .gap(4)
-                  .when(Boolean(item.taskId && onRefreshDetail), (el) =>
+                  .when(Boolean((item.taskId || item.beadId) && onRefreshDetail), (el) =>
                     el.child(
                       Button.new("insp-refresh-detail")
                         .size(24)
@@ -343,7 +343,7 @@ export class InspectorController {
                         .justify_center()
                         .rounded(5)
                         .hover((s) => s.bg(t.hover))
-                        .tooltip("Refresh task detail")
+                        .tooltip("Refresh detail")
                         .on_click((_e, cx) => onRefreshDetail(cx))
                         .child(svg(I(detailLoading ? "spinner" : "refresh")).size(13).text_color(t.muted).when(detailLoading, (s) => s.spin(900))),
                     ),
@@ -413,6 +413,30 @@ export class InspectorController {
               // Detail error banner
               .when(Boolean(detailError), (el) =>
                 el.child(div().p(8).rounded(6).bg(alpha(t.ansi1, "18")).border_1().border_color(alpha(t.ansi1, "44")).text_size(11.5).text_color(t.ansi1).child(`Detail error: ${detailError}`)),
+              )
+              // Detail loading indicator (when brief snapshot omitted text fields)
+              .when(
+                detailLoading &&
+                  !bodyText.trim() &&
+                  !acText.trim() &&
+                  !notesText.trim() &&
+                  !closeReason.trim() &&
+                  !detailError,
+                (el) =>
+                  el.child(
+                    h_flex()
+                      .p(10)
+                      .gap(8)
+                      .items_center()
+                      .rounded(8)
+                      .bg(t.background)
+                      .border_1()
+                      .border_color(t.border)
+                      .text_size(11.5)
+                      .text_color(t.muted)
+                      .child(svg(I("spinner")).size(12).flex_none().spin(900))
+                      .child("Loading bead details…"),
+                  ),
               )
               // Body / Description
               .when(Boolean(bodyText.trim()), (el) =>
