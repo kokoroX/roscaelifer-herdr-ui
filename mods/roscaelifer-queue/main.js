@@ -207,6 +207,7 @@ export default class RoscaeliferQueue extends View {
     this.detailReqSeq = 0;
     this.detailCache = new Map();
     this.loading = false;
+    this.loadingSilent = false;
     this.error = null;
     this.size = null;
     this.watchedDirs = new Set();
@@ -462,9 +463,18 @@ export default class RoscaeliferQueue extends View {
     // `loading`. A refresh that has been stuck for >35s is also reclaimed so the UI can
     // never latch on a dead task.
     const stale = this.loadingStartedAt > 0 && Date.now() - this.loadingStartedAt > 35000;
-    if (this.loading && !preempt && !stale) return;
+    if (this.loading && !preempt && !stale) {
+      // A silent background refresh is in flight; an explicit refresh must still give the
+      // user feedback, so surface the busy state instead of swallowing the request.
+      if (!silent && this.loadingSilent) {
+        this.loadingSilent = false;
+        cx.notify();
+      }
+      return;
+    }
     const seq = ++this.refreshSeq;
     this.loading = true;
+    this.loadingSilent = Boolean(silent);
     this.loadingStartedAt = Date.now();
     if (!silent) cx.notify();
 
@@ -552,6 +562,7 @@ export default class RoscaeliferQueue extends View {
       } finally {
         if (seq === this.refreshSeq) {
           this.loading = false;
+          this.loadingSilent = false;
           this.loadingStartedAt = 0;
           cx.notify();
         }
@@ -934,7 +945,7 @@ export default class RoscaeliferQueue extends View {
               bg: t.raised,
               fg: t.foreground,
               border: t.border,
-              busy: this.loading,
+              busy: this.loading && !this.loadingSilent,
               onClick: (_e, cx) => this.refresh(cx, { forceContext: false, preempt: true }),
             }),
           ),
