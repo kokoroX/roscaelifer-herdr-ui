@@ -134,6 +134,13 @@ function guessInitialContext(rawProps, sharedOverride) {
   return null;
 }
 
+// A cached snapshot may still carry the previous session's live runner state; clear it so a
+// stale `Runner active` spinner never flashes before the first real `snapshot` returns.
+function clearCachedRunnerState(snapshot) {
+  if (!snapshot?.runner) return snapshot;
+  return { ...snapshot, runner: { ...snapshot.runner, active: false, lock_held: false } };
+}
+
 function topButton(id, label, iconPath, { bg, fg, border, busy = false, badge = null, onClick }) {
   return Button.new(id)
     .h(28)
@@ -248,8 +255,9 @@ export default class RoscaeliferQueue extends View {
       const cached = loadCachedSnapshot(guessedCtx);
       this.ctx = guessedCtx;
       if (cached?.snapshot) {
-        this.snapshot = cached.snapshot;
-        this.queue = this.getNormalizedQueue(cached.snapshot);
+        const cachedSnapshot = clearCachedRunnerState(cached.snapshot);
+        this.snapshot = cachedSnapshot;
+        this.queue = this.getNormalizedQueue(cachedSnapshot);
       }
     }
 
@@ -482,8 +490,9 @@ export default class RoscaeliferQueue extends View {
   applyCachedContext(nextCtx, cx) {
     const cached = loadCachedSnapshot(nextCtx);
     if (cached?.snapshot) {
-      this.snapshot = cached.snapshot;
-      this.queue = this.getNormalizedQueue(cached.snapshot);
+      const cachedSnapshot = clearCachedRunnerState(cached.snapshot);
+      this.snapshot = cachedSnapshot;
+      this.queue = this.getNormalizedQueue(cachedSnapshot);
       this.error = null;
     } else {
       this.snapshot = null;
@@ -867,7 +876,8 @@ export default class RoscaeliferQueue extends View {
   renderTopBar(t) {
     const queue = this.queue;
     const runner = queue?.runner || {};
-    const runnerActive = Boolean(runner.active || runner.lock_held);
+    const runnerActive =
+      runner.active !== undefined ? Boolean(runner.active) : Boolean(runner.lock_held);
     const runnerTooltip = runnerActive
       ? [`Runner active`, runner.pid ? `pid ${runner.pid}` : "", runner.mode || "", runner.log_path || ""]
           .filter(Boolean)
