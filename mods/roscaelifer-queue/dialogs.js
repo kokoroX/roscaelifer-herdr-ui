@@ -195,7 +195,7 @@ export class DialogController {
       this.bdDirInput = InputState.new({ value: "", placeholder: "/path/to/project/.beads" });
       this.configInput = InputState.new({ value: "", placeholder: "roscaelifer.toml" });
       this.formulasDirInput = InputState.new({ value: "", placeholder: "formulas" });
-      this.binInput = InputState.new({ value: "", placeholder: "roscaelifer-herdr (optional override)" });
+      this.binInput = InputState.new({ value: "", placeholder: "roscaelifer (optional override)" });
       this.envInput = InputState.new({ value: "", placeholder: "optional default environment" });
       this.focusedField = "name";
       for (const [name, st] of [

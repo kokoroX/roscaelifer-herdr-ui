@@ -809,12 +809,7 @@ async function probeBinary(ctx) {
   if (machine) {
     const candidates = [
       ctx?.bin,
-      "roscaelifer-herdr",
       "roscaelifer",
-      "$HOME/.local/bin/roscaelifer-herdr",
-      "$HOME/go/bin/roscaelifer-herdr",
-      "/opt/homebrew/bin/roscaelifer-herdr",
-      "/usr/local/bin/roscaelifer-herdr",
       "$HOME/.local/bin/roscaelifer",
       "$HOME/go/bin/roscaelifer",
       "/opt/homebrew/bin/roscaelifer",
@@ -852,11 +847,6 @@ async function probeBinary(ctx) {
   const userHome = normalizePath(home());
   const candidates = [
     ctx?.bin ? normalizePath(ctx.bin) : "",
-    "roscaelifer-herdr",
-    `${userHome}/.local/bin/roscaelifer-herdr`,
-    `${userHome}/go/bin/roscaelifer-herdr`,
-    "/opt/homebrew/bin/roscaelifer-herdr",
-    "/usr/local/bin/roscaelifer-herdr",
     "roscaelifer",
     `${userHome}/.local/bin/roscaelifer`,
     `${userHome}/go/bin/roscaelifer`,
@@ -914,7 +904,7 @@ async function probeBinary(ctx) {
   }
 
   throw new Error(
-    "roscaelifer binary not found in props().bin, PATH, ~/.local/bin/roscaelifer-herdr, ~/go/bin/roscaelifer-herdr, ~/.local/bin/roscaelifer, or ~/go/bin/roscaelifer",
+    "roscaelifer binary not found in props().bin, PATH, ~/.local/bin/roscaelifer, or ~/go/bin/roscaelifer",
   );
 }
 
