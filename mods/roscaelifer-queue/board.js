@@ -13,8 +13,9 @@ import {
   ProgressIndicator,
   ScrollHandle,
   Scrollbar,
+  TextView,
 } from "gpui-base";
-import { settings, theme } from "herdr";
+import { settings, theme, notify } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
 
 const ROSCAELIFER_COLUMNS = [
@@ -136,6 +137,15 @@ function chip(text, color, bg, borderColor = null) {
     .child(text);
 }
 
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/\n/g, "<br/>");
+}
+
 function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, onClick }) {
   return Button.new(id)
     .h(22)
@@ -189,6 +199,8 @@ export class BoardController {
       queue: null,
       envFilter: null,
       onlyQueued: null,
+      showWip: null,
+      showEphemeral: null,
       query: null,
       columns: null,
       visibleAll: null,
@@ -258,7 +270,14 @@ export class BoardController {
     return this._lastVisible;
   }
 
-  matchesFilter(item) {
+  matchesFilter(item, { showWip = true, showEphemeral = false } = {}) {
+    if (item.isWip) {
+      if (!showWip && !(showEphemeral && item.ephemeral)) {
+        return false;
+      }
+    } else if (item.ephemeral && !showEphemeral) {
+      return false;
+    }
     if (this.envFilter !== "all" && item.env !== this.envFilter) {
       return false;
     }
@@ -584,6 +603,16 @@ export class BoardController {
     const actionRow = interactive
       ? this.renderCardActions(item, { actions, onOpenDialog }, t)
       : null;
+    const cardIdText = item.beadId && item.taskId ? `${item.beadId} · #${item.taskId}` : item.id;
+    const cardCopyText = [
+      cardIdText,
+      String(item.title || ""),
+      item.agentStatus ? `status: ${item.agentStatus}` : item.taskStatus ? `status: ${item.taskStatus}` : item.bdStatus ? `status: ${item.bdStatus}` : "",
+      item.actionReason ? `action: ${item.actionReason}` : "",
+      item.error || item.lastError ? `error: ${item.error || item.lastError}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     return v_flex()
       .p(10)
@@ -605,7 +634,23 @@ export class BoardController {
         h_flex()
           .items_center()
           .gap(6)
-          .when(Boolean(item.ephemeral), (el) =>
+          .when(Boolean(item.isWip), (el) =>
+            el.child(
+              div()
+                .px(6)
+                .py(1)
+                .rounded(5)
+                .bg((t.working || t.accent) + "28")
+                .border_1()
+                .border_color((t.working || t.accent) + "88")
+                .text_size(10.5)
+                .font_semibold()
+                .text_color(t.working || t.accent)
+                .whitespace_nowrap()
+                .child("WIP"),
+            ),
+          )
+          .when(Boolean(item.ephemeral && !item.isWip), (el) =>
             el.child(chip("ephemeral", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
           )
           .when(Boolean(pStyle), (el) =>
@@ -633,14 +678,29 @@ export class BoardController {
           .when(Boolean(item.agentStatus), (el) =>
             el.child(this.renderAgentStatus(item, t, { interactive })),
           )
-          .when(Boolean(sessionLabel), (el) => el.child(chip(sessionLabel, t.accent, t.accent + "18"))),
+          .when(Boolean(sessionLabel), (el) => el.child(chip(sessionLabel, t.accent, t.accent + "18")))
+          .when(interactive, (el) =>
+            el.child(
+              miniBtn(`card-copy-${item.id}`, "Copy", {
+                bg: t.raised,
+                fg: t.muted,
+                border: t.border,
+                onClick: (_e, cx) => {
+                  cx.write_to_clipboard(cardCopyText);
+                  notify({ title: "Copied", body: cardIdText, level: "success", timeout: 1500 });
+                },
+              }),
+            ),
+          ),
       )
       .child(
-        div()
-          .text_size(12.5)
-          .font_medium()
-          .text_color(t.foreground)
-          .child(item.title),
+        interactive
+          ? TextView.html(`card-title-${item.id}`, `<span>${escapeHtml(item.title || "")}</span>`).selectable(true)
+          : div()
+              .text_size(12.5)
+              .font_medium()
+              .text_color(t.foreground)
+              .child(item.title),
       )
       .child(
         h_flex()
@@ -699,7 +759,7 @@ export class BoardController {
       .when(Boolean(actionRow), (el) => el.child(actionRow));
   }
 
-  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral } = {}) {
+  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral } = {}) {
     const envs = queue?.envs || [];
 
     const envTab = (id, label, active, extra, onClick) =>
@@ -788,6 +848,35 @@ export class BoardController {
                     ),
                 ),
             ),
+          )
+          .child(
+            Switch.new("filter-wip")
+              .checked(showWip)
+              .on_change((_checked, clickCx) => {
+                onToggleShowWip?.(!showWip, clickCx);
+              })
+              .flex()
+              .items_center()
+              .gap(7)
+              .cursor_pointer()
+              .child(
+                h_flex()
+                  .w(28)
+                  .h(16)
+                  .p(2)
+                  .rounded(8)
+                  .items_center()
+                  .bg(showWip ? t.working || t.accent : t.border)
+                  .when(showWip, (el) => el.justify_end())
+                  .when(!showWip, (el) => el.justify_start())
+                  .child(div().size(12).rounded(6).bg(showWip ? t.accent_foreground : t.muted)),
+              )
+              .child(
+                div()
+                  .text_size(11.5)
+                  .text_color(showWip ? t.foreground : t.muted)
+                  .child("WIP"),
+              ),
           )
           .child(
             Switch.new("filter-ephemeral")
@@ -979,13 +1068,15 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  getFilteredColumns(queue) {
+  getFilteredColumns(queue, { showWip = true, showEphemeral = false } = {}) {
     const query = this.query.trim();
     const cached = this._filterCache;
     if (
       cached.queue === queue &&
       cached.envFilter === this.envFilter &&
       cached.onlyQueued === this.onlyQueued &&
+      cached.showWip === showWip &&
+      cached.showEphemeral === showEphemeral &&
       cached.query === query &&
       cached.mode === this.mode
     ) {
@@ -999,7 +1090,9 @@ export class BoardController {
     const visibleAll = [];
     const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
     for (const col of boardColumns) {
-      const listItems = (cols[col.key] || []).filter((item) => this.matchesFilter(item));
+      const listItems = (cols[col.key] || []).filter((item) =>
+        this.matchesFilter(item, { showWip, showEphemeral }),
+      );
       columns[col.key] = listItems;
       visibleAll.push(...listItems);
     }
@@ -1010,6 +1103,8 @@ export class BoardController {
       queue,
       envFilter: this.envFilter,
       onlyQueued: this.onlyQueued,
+      showWip,
+      showEphemeral,
       query,
       mode: this.mode,
       columns,
@@ -1019,10 +1114,13 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showEphemeral = false, onToggleShowEphemeral }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral }, cx) {
     void cx;
     const t = theme();
-    const { columns: cols, visibleAll, closedItemsByKey } = this.getFilteredColumns(queue);
+    const { columns: cols, visibleAll, closedItemsByKey } = this.getFilteredColumns(queue, {
+      showWip,
+      showEphemeral,
+    });
     const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
 
     const colViews = boardColumns.map((col) => {
@@ -1086,7 +1184,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showEphemeral, onToggleShowEphemeral }))
+      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

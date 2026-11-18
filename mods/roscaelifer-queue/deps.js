@@ -355,12 +355,14 @@ export class DepsController {
     return stats;
   }
 
-  getWaveData(queue, epics, items) {
+  getWaveData(queue, epics, items, { showWip = true, showEphemeral = false } = {}) {
     const cached = this._waveCache;
     if (
       cached.queue === queue &&
       cached.selectedEpicId === this.selectedEpicId &&
-      cached.showClosedInWaves === this.showClosedInWaves
+      cached.showClosedInWaves === this.showClosedInWaves &&
+      cached.showWip === showWip &&
+      cached.showEphemeral === showEphemeral
     ) {
       return cached.data;
     }
@@ -372,6 +374,11 @@ export class DepsController {
       : null;
     const scopedItems = items.filter((it) => {
       if (it.issueType === "epic") return false;
+      if (it.isWip) {
+        if (!showWip && !(showEphemeral && it.ephemeral)) return false;
+      } else if (it.ephemeral && !showEphemeral) {
+        return false;
+      }
       if (this.selectedEpicId) {
         const key = it.beadId || it.id;
         const inEpic =
@@ -389,12 +396,14 @@ export class DepsController {
       queue,
       selectedEpicId: this.selectedEpicId,
       showClosedInWaves: this.showClosedInWaves,
+      showWip,
+      showEphemeral,
       data,
     };
     return data;
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = false, onToggleShowEphemeral }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const items = queue?.items ?? [];
@@ -420,7 +429,7 @@ export class DepsController {
           .min_h(0)
           .gap(8)
           .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats }))
-          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral })),
+          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -627,8 +636,8 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral = false, onToggleShowEphemeral }) {
-    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items);
+  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip = true, showEphemeral = false, onToggleShowEphemeral }) {
+    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showWip, showEphemeral });
     const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
     this._minWavesContentW = minContentW;
     this.clampWavesScrollX(minContentW);
@@ -861,7 +870,8 @@ export class DepsController {
                                       .items_center()
                                       .gap(5)
                                       .child(div().text_size(11).font_family(monoFont).text_color(t.accent).child(id))
-                                      .when(Boolean(it.ephemeral), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
+                                      .when(Boolean(it.isWip), (el) => el.child(pill(t, "WIP", t.working || t.accent)))
+                                      .when(Boolean(it.ephemeral && !it.isWip), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
                                       .when(it.priority !== undefined && it.priority !== null, (el) =>
                                         el.child(pill(t, `P${it.priority}`, it.priority <= 1 ? t.ansi1 : t.muted)),
                                       ),

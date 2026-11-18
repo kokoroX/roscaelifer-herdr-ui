@@ -53,6 +53,7 @@ const LOCAL_WATCH_POLL_MS = 30000;
 const DETAIL_CACHE_TTL_MS = 20000;
 const DETAIL_CACHE_MAX = 50;
 const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v2";
+const SHOW_WIP_KEY = "roscaelifer.showWip.v1";
 const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v1";
 const ACTIVE_TAB_KEY = "roscaelifer.activeTab.v1";
 const CLOSED_LIMIT_OPTIONS = [50, 500, 5000, "all"];
@@ -191,6 +192,9 @@ export default class RoscaeliferQueue extends View {
       (Number.isInteger(storedClosedLimit) && CLOSED_LIMIT_OPTIONS.includes(storedClosedLimit))
         ? storedClosedLimit
         : DEFAULT_CLOSED_LIMIT;
+    const storedShowWip = safeStorageGet(SHOW_WIP_KEY, true);
+    this.showWip =
+      storedShowWip === null || storedShowWip === undefined ? true : Boolean(storedShowWip);
     this.showEphemeral = Boolean(safeStorageGet(SHOW_EPHEMERAL_KEY, false));
     this.ctx = null;
     this.runner = null;
@@ -218,6 +222,7 @@ export default class RoscaeliferQueue extends View {
     this.refreshSeq = 0;
     this.refreshTask = null;
     this.loadingStartedAt = 0;
+    this.ignoreSelfWatchUntil = 0;
     this._normSnapshot = null;
     this._normLiveFp = null;
     this._normQueue = null;
@@ -272,6 +277,8 @@ export default class RoscaeliferQueue extends View {
           this.actions.tick({}, cx);
         } else if (cmd === "new-bead") {
           this.openDialog("create");
+        } else if (cmd === "new-wip") {
+          this.openDialog("create-wip");
         } else if (cmd === "search") {
           this.setTab("queue");
           this.board.focusSearch();
@@ -372,6 +379,15 @@ export default class RoscaeliferQueue extends View {
     this.refresh(cx, { forceContext: false, preempt: true });
   }
 
+  setShowWip(next, cx) {
+    const value = Boolean(next);
+    if (value === this.showWip) return;
+    this.showWip = value;
+    safeStorageSet(SHOW_WIP_KEY, value);
+    cx?.notify?.();
+    this.refresh(cx, { forceContext: false, preempt: true });
+  }
+
   setShowEphemeral(next, cx) {
     const value = Boolean(next);
     if (value === this.showEphemeral) return;
@@ -402,6 +418,24 @@ export default class RoscaeliferQueue extends View {
     });
   }
 
+  shouldIgnoreSelfWatch(changed) {
+    if (!this.loading && !this.detailLoading && Date.now() >= this.ignoreSelfWatchUntil) {
+      return false;
+    }
+    if (!Array.isArray(changed) || changed.length === 0) return false;
+    return changed.every((entry) => {
+      const name = String(entry ?? "").split("/").pop();
+      if (!name) return false;
+      return (
+        name === "roscaelifer.db-wal" ||
+        name === "roscaelifer.db-shm" ||
+        name === "roscaelifer.db.lock" ||
+        name === "dolt-server.log" ||
+        name.endsWith(".lock")
+      );
+    });
+  }
+
   ensureWatchers(ctx, cx) {
     if (!ctx || ctx.machine) {
       this.updatePollTimer(cx, FALLBACK_POLL_MS);
@@ -426,8 +460,10 @@ export default class RoscaeliferQueue extends View {
           while (this.watchedDirs.has(dir)) {
             const handle = watchFolder(dir);
             this.watchHandles.set(dir, handle);
-            await handle;
+            const changed = await handle;
             if (!this.watchedDirs.has(dir)) break;
+            if (Array.isArray(changed) && changed.length === 0) continue;
+            if (this.shouldIgnoreSelfWatch(changed)) continue;
             this.scheduleDebouncedRefresh(watchCx);
           }
         } catch {
@@ -526,6 +562,7 @@ export default class RoscaeliferQueue extends View {
         const snap = await fetchSnapshot(this.ctx, runner, {
           closedLimit: this.closedLimit,
           includeEphemeral: this.showEphemeral,
+          includeWip: this.showWip,
           onRunnerResolved: (freshRunner) => {
             if (seq === this.refreshSeq) this.runner = freshRunner;
           },
@@ -543,7 +580,7 @@ export default class RoscaeliferQueue extends View {
           // Detail fetch runs in its own task so a slow single item never blocks the
           // snapshot refresh or the Refresh button.
           cx.spawn(async (detailCx) => {
-            await this.loadItemDetail(selected, { runnerOverride: runner, force: true });
+            await this.loadItemDetail(selected, { runnerOverride: runner, force: true, silent: true });
             detailCx.notify();
           });
         } else if (!selected) {
@@ -564,6 +601,7 @@ export default class RoscaeliferQueue extends View {
           this.loading = false;
           this.loadingSilent = false;
           this.loadingStartedAt = 0;
+          this.ignoreSelfWatchUntil = Date.now() + 1200;
           cx.notify();
         }
       }
@@ -571,7 +609,8 @@ export default class RoscaeliferQueue extends View {
   }
 
   detailCacheKey(item) {
-    return `${contextKey(this.ctx)}|ephemeral:${this.showEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
+    const includeEphemeral = Boolean(this.showEphemeral || item?.ephemeral || item?.isWip);
+    return `${contextKey(this.ctx)}|ephemeral:${includeEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
   }
 
   setDetailCacheEntry(key, taskDetail, beadDetail) {
@@ -590,7 +629,7 @@ export default class RoscaeliferQueue extends View {
     }
   }
 
-  async loadItemDetail(item, { runnerOverride = null, force = false } = {}) {
+  async loadItemDetail(item, { runnerOverride = null, force = false, silent = false } = {}) {
     const taskId = item?.taskId || null;
     const beadId = item?.beadId || null;
     const itemId = item?.id || null;
@@ -622,7 +661,11 @@ export default class RoscaeliferQueue extends View {
     }
 
     const reqSeq = ++this.detailReqSeq;
-    this.detailLoading = true;
+    const quietUpdate =
+      silent && this.detailItemId === itemId && (this.detail !== null || this.beadDetail !== null);
+    if (!quietUpdate) {
+      this.detailLoading = true;
+    }
     this.detailError = null;
     this.detailItemId = itemId;
     this.detailTaskId = taskId;
@@ -635,7 +678,9 @@ export default class RoscaeliferQueue extends View {
       const [taskRes, beadRes] = await Promise.allSettled([
         taskId ? fetchTaskDetail(this.ctx, runner, taskId) : Promise.resolve(null),
         beadId
-          ? fetchBeadDetail(this.ctx, runner, beadId, { includeEphemeral: this.showEphemeral })
+          ? fetchBeadDetail(this.ctx, runner, beadId, {
+              includeEphemeral: Boolean(this.showEphemeral || item?.ephemeral || item?.isWip),
+            })
           : Promise.resolve(null),
       ]);
       if (this.detailReqSeq !== reqSeq || this.selectedId !== itemId) return;
@@ -662,6 +707,7 @@ export default class RoscaeliferQueue extends View {
         this.detailError = err?.message || String(err);
       }
     } finally {
+      this.ignoreSelfWatchUntil = Date.now() + 1200;
       if (this.detailReqSeq === reqSeq && this.selectedId === itemId) {
         this.detailLoading = false;
       }
@@ -731,6 +777,7 @@ export default class RoscaeliferQueue extends View {
 
     const dims = {
       create: { width: 520, height: 500 },
+      "create-wip": { width: 540, height: 590 },
       enqueue: { width: 440, height: 340 },
       reject: { width: 460, height: 320 },
       "clean-preview": { width: 520, height: 420 },
@@ -819,7 +866,13 @@ export default class RoscaeliferQueue extends View {
 
   renderTopBar(t) {
     const queue = this.queue;
-    const lockHeld = Boolean(queue?.runner?.lock_held);
+    const runner = queue?.runner || {};
+    const runnerActive = Boolean(runner.active || runner.lock_held);
+    const runnerTooltip = runnerActive
+      ? [`Runner active`, runner.pid ? `pid ${runner.pid}` : "", runner.mode || "", runner.log_path || ""]
+          .filter(Boolean)
+          .join(" · ")
+      : "Runner idle (starts automatically on Queue / Dispatch)";
     const pendingCleanups = (queue?.items || []).reduce(
       (sum, item) => sum + (item.pendingCleanupCount || 0),
       0,
@@ -866,10 +919,11 @@ export default class RoscaeliferQueue extends View {
               .gap(5)
               .items_center()
               .rounded(5)
-              .bg(lockHeld ? (t.working || t.accent) + "20" : t.raised)
+              .tooltip(runnerTooltip)
+              .bg(runnerActive ? (t.working || t.accent) + "20" : t.raised)
               .text_size(11)
-              .text_color(lockHeld ? t.working || t.accent : t.dim)
-              .when(lockHeld, (el) =>
+              .text_color(runnerActive ? t.working || t.accent : t.dim)
+              .when(runnerActive, (el) =>
                 el.child(
                   svg("mods/roscaelifer-queue/icons/spinner.svg")
                     .size(10)
@@ -877,8 +931,8 @@ export default class RoscaeliferQueue extends View {
                     .spin(900),
                 ),
               )
-              .when(!lockHeld, (el) => el.child(div().size(6).rounded(3).bg(t.dim)))
-              .child(lockHeld ? "Runner active" : "Runner idle"),
+              .when(!runnerActive, (el) => el.child(div().size(6).rounded(3).bg(t.dim)))
+              .child(runnerActive ? "Runner active" : "Runner idle"),
           ),
       )
       .child(
@@ -915,6 +969,14 @@ export default class RoscaeliferQueue extends View {
         h_flex()
           .gap(6)
           .items_center()
+          .child(
+            topButton("btn-new-wip", "New WIP Card", "mods/roscaelifer-queue/icons/plus.svg", {
+              bg: t.raised,
+              fg: t.foreground,
+              border: t.border,
+              onClick: () => this.openDialog("create-wip"),
+            }),
+          )
           .child(
             topButton("btn-new-bead", "New Bead", "mods/roscaelifer-queue/icons/plus.svg", {
               bg: t.solid,
@@ -1069,6 +1131,8 @@ export default class RoscaeliferQueue extends View {
                       closedLimit: this.closedLimit,
                       onChangeClosedLimit: (nextLimit, clickCx) =>
                         this.setClosedLimit(nextLimit, clickCx),
+                      showWip: this.showWip,
+                      onToggleShowWip: (next, clickCx) => this.setShowWip(next, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
@@ -1089,6 +1153,8 @@ export default class RoscaeliferQueue extends View {
                       closedLimit: this.closedLimit,
                       onChangeClosedLimit: (nextLimit, clickCx) =>
                         this.setClosedLimit(nextLimit, clickCx),
+                      showWip: this.showWip,
+                      onToggleShowWip: (next, clickCx) => this.setShowWip(next, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
@@ -1105,6 +1171,7 @@ export default class RoscaeliferQueue extends View {
                       snapshot: this.snapshot,
                       mode: this.tab,
                       selectedId: this.selectedId,
+                      showWip: this.showWip,
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),

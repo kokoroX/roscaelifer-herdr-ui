@@ -508,9 +508,23 @@ async function pathExists(p) {
   }
 }
 
-async function probeBeadsArtifacts(dir) {
-  const checks = await Promise.all(BEADS_ARTIFACTS.map((name) => pathExists(`${dir}/.beads/${name}`)));
+async function probeBeadsDirArtifacts(beadsDir) {
+  if (!beadsDir) return false;
+  const clean = String(beadsDir).replace(/\/+$/, "");
+  if (!clean) return false;
+  const checks = await Promise.all(BEADS_ARTIFACTS.map((name) => pathExists(`${clean}/${name}`)));
   return checks.some(Boolean);
+}
+
+async function probeBeadsArtifacts(dir) {
+  return probeBeadsDirArtifacts(`${dir}/.beads`);
+}
+
+export async function hasLiveBeadsDir(ctx) {
+  const bdDir = typeof ctx?.bdDir === "string" ? ctx.bdDir.trim() : "";
+  if (!bdDir) return false;
+  if (normalizeMachine(ctx?.machine)) return true;
+  return probeBeadsDirArtifacts(bdDir);
 }
 
 function parseRemoteProbe(stdout) {
@@ -982,14 +996,22 @@ export function appendDbAndConfigFlags(args, ctx, { includeConfig = true, includ
 
 export async function fetchSnapshot(ctx, runner, opts = {}) {
   const resolved = runner || (await resolveBinary(ctx));
+  const bdActive =
+    opts.bd === true ? true : opts.bd === false ? false : await hasLiveBeadsDir(ctx);
   const args = ["snapshot", "--json"];
   if (resolved?.supportsCompact) args.push("--compact");
   if (resolved?.supportsBrief) args.push("--brief");
-  if (opts.includeEphemeral && resolved?.supportsIncludeEphemeral) args.push("--include-ephemeral");
+  if (
+    bdActive &&
+    (opts.includeEphemeral || opts.includeWip !== false) &&
+    resolved?.supportsIncludeEphemeral
+  ) {
+    args.push("--include-ephemeral");
+  }
   if (ctx?.db) args.push("--db", ctx.db);
   if (ctx?.config) args.push("--config", ctx.config);
   if (ctx?.formulasDir) args.push("--formulas-dir", ctx.formulasDir);
-  if (ctx?.bdDir || opts.bd !== false) {
+  if (bdActive) {
     args.push("--bd");
     if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
   }
@@ -1165,6 +1187,15 @@ function parseHcAddressFromThread(threadId) {
   return idx >= 0 ? rest.slice(idx + 1) : "";
 }
 
+// A real Herdr terminal address never starts with "worktree-"; those values are
+// worktree placeholders written into pane_id/hc_address and must not be treated
+// as attachable terminals.
+function isTerminalAddress(addr) {
+  if (typeof addr !== "string") return false;
+  const value = addr.trim();
+  return value.length > 0 && !value.startsWith("worktree-");
+}
+
 function normalizeAddress(addr, envObj) {
   if (!addr) return [];
   const value = String(addr);
@@ -1249,9 +1280,11 @@ function normalizeSteps(rawSteps, envObj, lookup) {
   const steps = Array.isArray(rawSteps) ? rawSteps : [];
   return steps.map((s) => {
     const attempt = s.current_attempt || s.attempt || null;
+    const attemptAddress = attempt?.hc_address;
+    const threadAddress = parseHcAddressFromThread(attempt?.thread_id);
     const hcAddress =
-      attempt?.hc_address ||
-      parseHcAddressFromThread(attempt?.thread_id) ||
+      (isTerminalAddress(attemptAddress) ? String(attemptAddress).trim() : null) ||
+      (isTerminalAddress(threadAddress) ? String(threadAddress).trim() : null) ||
       null;
     const liveAgent = hcAddress ? lookup.findAgent(hcAddress, envObj) : null;
     const liveTerminal = hcAddress ? lookup.findTerminal(hcAddress, envObj) : null;
@@ -1429,6 +1462,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     let envLabel = null;
     let formulaLabel = null;
     let isOptedIn = false;
+    let hasWipLabel = false;
     let needsReview = false;
     let hasFailedLabel = false;
     let isCancelledLabel = false;
@@ -1438,6 +1472,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       if (label.startsWith("env:") && envLabel === null) envLabel = label.slice(4);
       if (label.startsWith("formula:") && formulaLabel === null) formulaLabel = label.slice(8);
       if (label === "roscaelifer") isOptedIn = true;
+      if (label === "wip") hasWipLabel = true;
       if (label === "roscaelifer-review") needsReview = true;
       if (label === "roscaelifer-failed") hasFailedLabel = true;
       if (label === "roscaelifer-cancelled") {
@@ -1462,6 +1497,9 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       intakePlan?.formula ||
       formulaLabel ||
       null;
+    const isWip =
+      hasWipLabel ||
+      (!issue && typeof formula === "string" && formula.startsWith("worker-"));
     const project =
       task?.project ||
       intakePlan?.project ||
@@ -1485,10 +1523,12 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     const sessionStep = liveStep || currentStep || [...steps].reverse().find((step) => step.hcAddress) || null;
     let hcAddress = sessionStep?.hcAddress || null;
     if (!hcAddress && taskPendingCleanups.length > 0) {
-      hcAddress = taskPendingCleanups[0].hc_address || taskPendingCleanups[0].pane_id || null;
+      const candidate = taskPendingCleanups[0].hc_address || taskPendingCleanups[0].pane_id || null;
+      hcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
     }
     if (!hcAddress && sidecars.length > 0) {
-      hcAddress = sidecars[0].pane_id || null;
+      const candidate = sidecars[0].pane_id || null;
+      hcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
     }
 
     const liveAgent =
@@ -1664,6 +1704,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       intakePlan,
       isReady,
       isOptedIn,
+      isWip,
       needsReview,
       hasFailedLabel,
       hasRunningStep,
@@ -1682,6 +1723,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       item.env,
       item.branch,
       ...item.labels,
+      item.isWip ? "wip" : "",
       item.formula,
       item.project,
       item.assignee,
@@ -1693,11 +1735,22 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     return item;
   }
 
+  const seenWorkBeadIds = new Set();
   for (const issue of workIssues) {
+    seenWorkBeadIds.add(issue.id);
     const metaTaskId = stripTaskMetaPrefix(issue?.metadata?.["roscaelifer.task"]);
     const matchingTasks = tasksByBead.get(issue.id) || [];
     const task = pickBestTaskForBead(matchingTasks, metaTaskId);
     const item = buildItem({ issue, task });
+    items.push(item);
+    itemsById.set(item.id, item);
+  }
+
+  for (const [beadIdKey, matchingTasks] of tasksByBead.entries()) {
+    if (seenWorkBeadIds.has(beadIdKey)) continue;
+    const task = pickBestTaskForBead(matchingTasks, null);
+    if (!task) continue;
+    const item = buildItem({ issue: null, task });
     items.push(item);
     itemsById.set(item.id, item);
   }
@@ -1817,7 +1870,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     intakePreview: intakeList,
     bdAvailable,
     bdError,
-    runner: snap.runner || { lock_path: "", lock_held: false },
+    runner: snap.runner || { lock_path: "", lock_held: false, active: false },
     paths: snap.paths || {},
     generatedAt: snap.generated_at || null,
     spacesCount: (spaces || []).length,

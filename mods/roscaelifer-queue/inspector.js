@@ -1,6 +1,6 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Button, TextView, ScrollHandle, Scrollbar } from "gpui-base";
-import { hc, theme, settings } from "herdr";
+import { hc, theme, settings, notify } from "herdr";
 
 const I = (name) => `mods/roscaelifer-queue/icons/${name}.svg`;
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
@@ -30,6 +30,53 @@ function formatTimestamp(iso) {
   const d = new Date(ms);
   const pad = (n) => String(n).padStart(2, "0");
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/\n/g, "<br/>");
+}
+
+// Renders text verbatim (no Markdown parsing, so command args, paths and `[...]`
+// survive) inside a selectable TextView so it can be drag-selected and copied.
+function selectableText(id, text) {
+  return TextView.html(id, `<span>${escapeHtml(text)}</span>`).selectable(true);
+}
+
+function copyBtn(t, id, text) {
+  const value = String(text ?? "");
+  return Button.new(id)
+    .h(20)
+    .px(6)
+    .flex()
+    .items_center()
+    .gap(4)
+    .rounded(5)
+    .bg(t.raised)
+    .border_1()
+    .border_color(t.border)
+    .text_size(10.5)
+    .font_medium()
+    .text_color(t.muted)
+    .cursor_pointer()
+    .tooltip("Copy to clipboard")
+    .when(!value, (el) => el.opacity(0.45).disabled(true))
+    .when(Boolean(value), (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+    .on_click((_e, cx) => {
+      if (!value) return;
+      cx.write_to_clipboard(value);
+      notify({
+        title: "Copied",
+        body: value.length > 90 ? `${value.slice(0, 87)}…` : value,
+        level: "success",
+        timeout: 1500,
+      });
+    })
+    .child("Copy");
 }
 
 function statusColor(status, t) {
@@ -124,6 +171,20 @@ export class InspectorController {
     this.hcLoading = false;
     this.hcError = null;
     this.expandedStep = null;
+    this.copiedKey = null;
+  }
+
+  copyToClipboard(cx, key, text) {
+    const value = String(text ?? "");
+    if (!value) return;
+    cx.write_to_clipboard(value);
+    this.copiedKey = key;
+    cx.notify();
+    cx?.timer?.after(1500, (tickCx) => {
+      if (this.copiedKey !== key) return;
+      this.copiedKey = null;
+      tickCx.notify();
+    });
   }
 
   refreshTail(address, cx) {
@@ -311,10 +372,19 @@ export class InspectorController {
       }
     }
 
+    const taskVars = taskDetail?.vars ?? detail?.vars ?? item.task?.vars ?? {};
+    const beadMeta = beadDetail?.metadata ?? item.issue?.metadata ?? {};
+    const varCwd = taskVars?.cwd || beadMeta?.["roscaelifer.var.cwd"] || "";
+    const varModel = taskVars?.model || beadMeta?.["roscaelifer.var.model"] || "";
+    const varMcp = taskVars?.mcp_profile || beadMeta?.["roscaelifer.var.mcp_profile"] || "";
+
     const metaRows = [];
     if (item.env) metaRows.push(["Env", item.env]);
     if (item.formula) metaRows.push(["Formula", item.formula]);
     if (item.project) metaRows.push(["Project", item.project]);
+    if (varCwd && varCwd !== worktree) metaRows.push(["Cwd", varCwd]);
+    if (varModel) metaRows.push(["Model", varModel]);
+    if (varMcp) metaRows.push(["MCP Profile", varMcp]);
     if (branch) metaRows.push(["Branch", branch]);
     if (worktree) metaRows.push(["Worktree", worktree]);
     if (hcAddress) metaRows.push(["Terminal", hcAddress]);
@@ -351,10 +421,41 @@ export class InspectorController {
                   .items_center()
                   .gap(6)
                   .flex_wrap()
-                  .when(Boolean(item.beadId), (el) => el.child(div().px(6).py(2).rounded(4).bg(t.raised).font_family(monoFont).text_size(11).text_color(t.accent).child(item.beadId)))
-                  .when(Boolean(item.taskId), (el) => el.child(div().px(6).py(2).rounded(4).bg(t.raised).font_family(monoFont).text_size(11).text_color(t.muted).child(`#${item.taskId}`)))
+                  .when(Boolean(item.beadId), (el) =>
+                    el.child(
+                      div()
+                        .px(6)
+                        .py(2)
+                        .rounded(4)
+                        .bg(t.raised)
+                        .font_family(monoFont)
+                        .text_size(11)
+                        .text_color(t.accent)
+                        .cursor_pointer()
+                        .tooltip("Click to copy")
+                        .on_click((_e, cx) => this.copyToClipboard(cx, `bead-${item.id}`, item.beadId))
+                        .child(this.copiedKey === `bead-${item.id}` ? `${item.beadId} ✓` : item.beadId),
+                    ),
+                  )
+                  .when(Boolean(item.taskId), (el) =>
+                    el.child(
+                      div()
+                        .px(6)
+                        .py(2)
+                        .rounded(4)
+                        .bg(t.raised)
+                        .font_family(monoFont)
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .cursor_pointer()
+                        .tooltip("Click to copy")
+                        .on_click((_e, cx) => this.copyToClipboard(cx, `task-${item.id}`, `#${item.taskId}`))
+                        .child(this.copiedKey === `task-${item.id}` ? `#${item.taskId} ✓` : `#${item.taskId}`),
+                    ),
+                  )
                   .when(Boolean(prioLabel), (el) => el.child(badge(t, prioLabel, item.priority <= 1 ? t.ansi1 : t.muted)))
-                  .when(Boolean(item.ephemeral || beadDetail?.ephemeral), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
+                  .when(Boolean(item.isWip), (el) => el.child(badge(t, "WIP", t.accent, true)))
+                  .when(Boolean((item.ephemeral || beadDetail?.ephemeral) && !item.isWip), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
                   .child(badge(t, statusText, statusCol))
                   .when(Boolean(item.agentStatus), (el) => el.child(badge(t, `agent:${item.agentStatus}`, statusColor(item.agentStatus, t))))
                   .when(Boolean(item.sessionInfo?.spaceName || item.sessionInfo?.tabName), (el) => el.child(badge(t, [item.sessionInfo.spaceName, item.sessionInfo.tabName].filter(Boolean).join(" · "), t.accent))),
@@ -363,6 +464,7 @@ export class InspectorController {
                 h_flex()
                   .items_center()
                   .gap(4)
+                  .flex_none()
                   .when(Boolean((item.taskId || item.beadId) && onRefreshDetail), (el) =>
                     el.child(
                       Button.new("insp-refresh-detail")
@@ -374,7 +476,12 @@ export class InspectorController {
                         .hover((s) => s.bg(t.hover))
                         .tooltip("Refresh detail")
                         .on_click((_e, cx) => onRefreshDetail(cx))
-                        .child(svg(I(detailLoading ? "spinner" : "refresh")).size(13).text_color(t.muted).when(detailLoading, (s) => s.spin(900))),
+                        .when(detailLoading, (el) =>
+                          el.child(svg(I("spinner")).size(13).flex_none().text_color(t.muted).spin(900)),
+                        )
+                        .when(!detailLoading, (el) =>
+                          el.child(svg(I("refresh")).size(13).flex_none().text_color(t.muted)),
+                        ),
                     ),
                   )
                   .when(Boolean(onClose), (el) =>
@@ -393,7 +500,7 @@ export class InspectorController {
                   ),
               ),
           )
-          .child(div().text_size(14.5).font_semibold().line_height("20px").text_color(t.foreground).child(item.title || item.id))
+          .child(div().text_size(14.5).font_semibold().line_height("20px").text_color(t.foreground).child(selectableText(`insp-title-${item.id}`, item.title || item.id)))
           .when((item.labels ?? []).length > 0, (el) =>
             el.child(
               h_flex()
@@ -434,14 +541,32 @@ export class InspectorController {
                           .gap(8)
                           .items_start()
                           .child(div().w(68).flex_none().text_size(11).text_color(t.dim).child(k))
-                          .child(div().flex_1().min_w(0).text_size(11.5).font_family(monoFont).text_color(t.foreground).child(String(v))),
+                          .child(
+                            div()
+                              .flex_1()
+                              .min_w(0)
+                              .text_size(11.5)
+                              .font_family(monoFont)
+                              .text_color(t.foreground)
+                              .child(selectableText(`insp-meta-${item.id}-${String(k).toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, String(v))),
+                          ),
                       ),
                     ),
                 ),
               )
               // Detail error banner
               .when(Boolean(detailError), (el) =>
-                el.child(div().p(8).rounded(6).bg(alpha(t.ansi1, "18")).border_1().border_color(alpha(t.ansi1, "44")).text_size(11.5).text_color(t.ansi1).child(`Detail error: ${detailError}`)),
+                el.child(
+                  div()
+                    .p(8)
+                    .rounded(6)
+                    .bg(alpha(t.ansi1, "18"))
+                    .border_1()
+                    .border_color(alpha(t.ansi1, "44"))
+                    .text_size(11.5)
+                    .text_color(t.ansi1)
+                    .child(selectableText(`insp-detail-error-${item.id}`, `Detail error: ${detailError}`)),
+                ),
               )
               // Detail loading indicator (when brief snapshot omitted text fields)
               .when(
@@ -506,7 +631,7 @@ export class InspectorController {
                 ),
               )
               // Step Pipeline
-              .when(steps.length > 0, (el) => el.child(this.renderSteps(t, steps, detailLinks, monoFont)))
+              .when(steps.length > 0, (el) => el.child(this.renderSteps(t, steps, detailLinks, monoFont, item.id)))
               // Latest Reply
               .when(Boolean(reply && String(reply).trim()), (el) =>
                 el.child(
@@ -537,7 +662,17 @@ export class InspectorController {
                     .gap(6)
                     .child(sectionHeader(t, "Notes"))
                     .when(Boolean(closeReason.trim()), (c) =>
-                      c.child(div().p(8).rounded(6).bg(alpha(t.done, "18")).border_1().border_color(alpha(t.done, "44")).text_size(12).text_color(t.foreground).child(`Close reason: ${closeReason}`)),
+                      c.child(
+                        div()
+                          .p(8)
+                          .rounded(6)
+                          .bg(alpha(t.done, "18"))
+                          .border_1()
+                          .border_color(alpha(t.done, "44"))
+                          .text_size(12)
+                          .text_color(t.foreground)
+                          .child(selectableText(`insp-close-reason-${item.id}`, `Close reason: ${closeReason}`)),
+                      ),
                     )
                     .when(Boolean(notesText.trim()), (c) =>
                       c.child(
@@ -555,13 +690,13 @@ export class InspectorController {
                 ),
               )
               // Events Timeline
-              .when(events.length > 0, (el) => el.child(this.renderEvents(t, events, monoFont))),
+              .when(events.length > 0, (el) => el.child(this.renderEvents(t, events, monoFont, item.id))),
           )
           .child(Scrollbar.vertical("inspector-scroll").absolute().inset_0()),
       );
   }
 
-  renderSteps(t, steps, detailLinks, monoFont) {
+  renderSteps(t, steps, detailLinks, monoFont, itemId = "item") {
     return v_flex()
       .gap(6)
       .child(sectionHeader(t, `Pipeline Steps (${steps.length})`))
@@ -646,16 +781,47 @@ export class InspectorController {
                   .text_size(11)
                   .font_family(monoFont)
                   .text_color(t.dim)
-                  .when(Boolean(curHandle), (c) => c.child(`terminal: ${curHandle}`))
-                  .when(Boolean(cur?.branch), (c) => c.child(`branch: ${cur.branch}`))
-                  .when(Boolean(cur?.worktree), (c) => c.child(`worktree: ${cur.worktree}`))
+                  .when(Boolean(curHandle), (c) =>
+                    c.child(selectableText(`insp-step-meta-${itemId}-${stepId}-terminal`, `terminal: ${curHandle}`)),
+                  )
+                  .when(Boolean(cur?.branch), (c) =>
+                    c.child(selectableText(`insp-step-meta-${itemId}-${stepId}-branch`, `branch: ${cur.branch}`)),
+                  )
+                  .when(Boolean(cur?.worktree), (c) =>
+                    c.child(selectableText(`insp-step-meta-${itemId}-${stepId}-worktree`, `worktree: ${cur.worktree}`)),
+                  )
                   .when(Boolean(cur?.effective_link || cur?.link || detailLinks?.[stepId]), (c) =>
-                    c.child(`link: ${cur?.effective_link || cur?.link || detailLinks?.[stepId]}`),
+                    c.child(
+                      selectableText(
+                        `insp-step-meta-${itemId}-${stepId}-link`,
+                        `link: ${cur?.effective_link || cur?.link || detailLinks?.[stepId]}`,
+                      ),
+                    ),
                   ),
               ),
             )
             .when(Boolean(s.detail), (el) =>
-              el.child(div().p(7).rounded(6).bg(t.raised).text_size(11.5).text_color(s.status === "failed" ? t.ansi1 : t.muted).child(String(s.detail))),
+              el.child(
+                div()
+                  .p(7)
+                  .rounded(6)
+                  .bg(t.raised)
+                  .child(
+                    h_flex()
+                      .items_start()
+                      .justify_between()
+                      .gap(6)
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .text_size(11.5)
+                          .text_color(s.status === "failed" ? t.ansi1 : t.muted)
+                          .child(selectableText(`insp-step-detail-${itemId}-${stepId}`, String(s.detail))),
+                      )
+                      .child(copyBtn(t, `insp-step-detail-copy-${itemId}-${stepId}`, String(s.detail))),
+                  ),
+              ),
             )
             .when(isExpanded && attempts.length > 0, (el) =>
               el.child(
@@ -665,7 +831,7 @@ export class InspectorController {
                   .border_t(1)
                   .border_color(t.border)
                   .children(
-                    attempts.map((a) =>
+                    attempts.map((a, ai) =>
                       v_flex()
                         .p(6)
                         .gap(2)
@@ -678,10 +844,38 @@ export class InspectorController {
                             .child(div().font_medium().text_color(t.foreground).child(`#${a.n} · ${a.status}`))
                             .child(div().text_color(t.dim).child(formatTimestamp(a.created_at || a.started_at))),
                         )
-                        .when(Boolean(a.hc_address || a.thread_id), (c) => c.child(div().font_family(monoFont).text_color(t.dim).child(`handle: ${a.hc_address || a.thread_id}`)))
-                        .when(Boolean(a.error), (c) => c.child(div().text_color(t.ansi1).child(String(a.error))))
+                        .when(Boolean(a.hc_address || a.thread_id), (c) =>
+                          c.child(
+                            div()
+                              .font_family(monoFont)
+                              .text_color(t.dim)
+                              .child(
+                                selectableText(
+                                  `insp-att-${itemId}-${stepId}-${ai}-handle`,
+                                  `handle: ${a.hc_address || a.thread_id}`,
+                                ),
+                              ),
+                          ),
+                        )
+                        .when(Boolean(a.error), (c) =>
+                          c.child(
+                            div()
+                              .text_color(t.ansi1)
+                              .child(selectableText(`insp-att-${itemId}-${stepId}-${ai}-error`, String(a.error))),
+                          ),
+                        )
                         .when(Boolean(a.reply && String(a.reply).trim()), (c) =>
-                          c.child(div().pt(2).text_color(t.muted).child(String(a.reply).slice(0, 280))),
+                          c.child(
+                            div()
+                              .pt(2)
+                              .text_color(t.muted)
+                              .child(
+                                selectableText(
+                                  `insp-att-${itemId}-${stepId}-${ai}-reply`,
+                                  String(a.reply).slice(0, 280),
+                                ),
+                              ),
+                          ),
                         ),
                     ),
                   ),
@@ -717,9 +911,15 @@ export class InspectorController {
                     .cursor_pointer()
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
                     .on_click((_e, cx) => this.refreshTail(hcAddress, cx))
-                    .child(svg(I(this.hcLoading ? "spinner" : "refresh")).size(11).text_color(t.muted).when(this.hcLoading, (s) => s.spin(900)))
+                    .when(this.hcLoading, (el) =>
+                      el.child(svg(I("spinner")).size(11).flex_none().text_color(t.muted).spin(900)),
+                    )
+                    .when(!this.hcLoading, (el) =>
+                      el.child(svg(I("refresh")).size(11).flex_none().text_color(t.muted)),
+                    )
                     .child("Refresh"),
                 )
+                .child(copyBtn(t, "insp-term-copy", this.hcTail || ""))
             : null,
         ),
       )
@@ -766,13 +966,11 @@ export class InspectorController {
                 .text_size(11)
                 .line_height("15px")
                 .when(this.hcLoading && !this.hcTail, (c) => c.child(div().text_color(t.dim).child(`Reading ${hcAddress}…`)))
-                .when(Boolean(this.hcError), (c) => c.child(div().text_color(t.ansi1).child(this.hcError)))
+                .when(Boolean(this.hcError), (c) =>
+                  c.child(selectableText(`insp-hc-error-${item.id}`, String(this.hcError))),
+                )
                 .when(Boolean(this.hcTail && !this.hcError), (c) =>
-                  c.children(
-                    String(this.hcTail)
-                      .split("\n")
-                      .map((line) => div().text_color(t.foreground).child(line || " ")),
-                  ),
+                  c.child(selectableText(`insp-hc-tail-${item.id}`, String(this.hcTail))),
                 ),
             )
             .child(Scrollbar.vertical("insp-hc-tail-scroll").absolute().inset_0()),
@@ -780,7 +978,7 @@ export class InspectorController {
       );
   }
 
-  renderEvents(t, events, monoFont) {
+  renderEvents(t, events, monoFont, itemId = "item") {
     const ordered = [...events].reverse();
     return v_flex()
       .gap(6)
@@ -818,7 +1016,12 @@ export class InspectorController {
                     .child(div().text_size(10.5).font_family(monoFont).text_color(t.dim).child(formatTimestamp(ev.created_at))),
                 )
                 .when(Boolean(ev.detail || ev.message), (el) =>
-                  el.child(div().text_size(11.5).text_color(t.muted).child(String(ev.detail || ev.message))),
+                  el.child(
+                    selectableText(
+                      `insp-ev-detail-${itemId}-${idx}-${ev.id ?? "event"}`,
+                      String(ev.detail || ev.message),
+                    ),
+                  ),
                 );
             }),
           ),

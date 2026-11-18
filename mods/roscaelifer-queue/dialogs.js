@@ -13,12 +13,13 @@ import {
   Textarea,
   TextareaState,
 } from "gpui-base";
-import { closeOverlay, focused, panes, pickFolder, props, setShared, spaces, theme } from "herdr";
+import { closeOverlay, focused, home, panes, pickFolder, props, setShared, spaces, theme } from "herdr";
 import { createActions } from "./actions.js";
 import {
   clearActiveProjectMirror,
   deleteGlobalProject,
   detectCurrentWorkspaceProject,
+  hasLiveBeadsDir,
   loadGlobalProjectsConfig,
   repoIdentityKey,
   saveActiveProjectMirror,
@@ -44,6 +45,22 @@ const ISSUE_TYPES = [
   { value: "epic", label: "epic" },
   { value: "chore", label: "chore" },
 ];
+
+const WORKER_FORMULAS = [
+  "worker-inplace",
+  "worker-isolated",
+  "worker-verify",
+  "worker-git",
+  "worker-browser",
+];
+
+const WIP_MODELS = [
+  { value: "group/cheap", label: "group/cheap (default)" },
+  { value: "group/standard", label: "group/standard" },
+  { value: "group/never-stuck", label: "group/never-stuck" },
+];
+
+const MCP_PROFILE_PRESETS = ["playwright", "chrome-devtools"];
 
 function normalizeCleanPreview(raw) {
   if (!raw) return { actions: [], errors: [], empty: true };
@@ -99,10 +116,13 @@ export class DialogController {
 
     // Dropdown state keyed by field name
     this.openSelect = null;
+    // Guards the press sequence that dismisses a select: `on_mouse_down_out`
+    // closes it before the following `on_click` on the trigger is delivered.
+    this._selectDismissedAt = null;
     this.selectHighlight = 0;
     this.selectFocus = {};
     this.listFocus = {};
-    for (const key of ["formula", "env", "priority", "type", "blocks"]) {
+    for (const key of ["formula", "env", "priority", "type", "blocks", "model"]) {
       this.selectFocus[key] = cx.focus_handle();
       this.listFocus[key] = cx.focus_handle();
     }
@@ -110,55 +130,66 @@ export class DialogController {
     // Dialog-specific state
     const formulaDefault = this.item?.formula || this.formulas[0]?.name || this.formulas[0] || "";
     const envDefault = this.item?.env || "";
+    this.hasBd = null;
 
     if (this.dialogType === "enqueue") {
       this.formula = typeof formulaDefault === "string" ? formulaDefault : "";
       this.env = typeof envDefault === "string" ? envDefault : "";
       this.wakeDeferred = this.item?.bdStatus === "deferred";
       this.handle.focus();
-    } else if (this.dialogType === "create") {
-      this.titleInput = InputState.new({ placeholder: "Short actionable bead title" });
-      this.descInput = TextareaState.new({ placeholder: "Description, context, acceptance criteria…", rows: 5 });
+    } else if (this.dialogType === "create" || this.dialogType === "create-wip") {
+      this.titleInput = InputState.new({
+        placeholder: this.dialogType === "create-wip" ? "Short WIP task title" : "Short actionable bead title",
+      });
+      this.descInput = TextareaState.new({ placeholder: "Description, task instructions, acceptance criteria…", rows: 5 });
       this.blocksInput = InputState.new({ placeholder: "Optional bead ID(s), e.g. rsc-123" });
+      const defaultCwd = this.defaultWipCwd();
+      this.cwdInput = InputState.new({
+        value: defaultCwd,
+        placeholder: defaultCwd ? `${defaultCwd} (working directory)` : "/path/to/working/dir (optional)",
+      });
+      this.mcpInput = InputState.new({ placeholder: "Optional, e.g. playwright or chrome-devtools" });
       this.priority = 2;
       this.issueType = "task";
       this.formula = typeof formulaDefault === "string" ? formulaDefault : "";
-      this.env = "";
+      this.wipFormula = this.defaultWipFormula();
+      this.model = "group/cheap";
+      this.env = this.dialogType === "create-wip" ? (this.ctx?.env || "") : "";
       this.blocksSelected = [];
       this.enqueueNow = true;
       this.focusedField = null;
 
+      for (const [name, st] of [
+        ["title", this.titleInput],
+        ["desc", this.descInput],
+        ["blocks", this.blocksInput],
+        ["cwd", this.cwdInput],
+        ["mcp", this.mcpInput],
+      ]) {
+        st.on("focus", (_e, cx) => {
+          this.focusedField = name;
+          cx.notify();
+        });
+        st.on("blur", (_e, cx) => {
+          if (this.focusedField === name) this.focusedField = null;
+          cx.notify();
+        });
+      }
       this.titleInput.on("change", (_e, cx) => {
         this.error = null;
-        cx.notify();
-      });
-      this.titleInput.on("focus", (_e, cx) => {
-        this.focusedField = "title";
-        cx.notify();
-      });
-      this.titleInput.on("blur", (_e, cx) => {
-        if (this.focusedField === "title") this.focusedField = null;
-        cx.notify();
-      });
-      this.descInput.on("focus", (_e, cx) => {
-        this.focusedField = "desc";
-        cx.notify();
-      });
-      this.descInput.on("blur", (_e, cx) => {
-        if (this.focusedField === "desc") this.focusedField = null;
-        cx.notify();
-      });
-      this.blocksInput.on("focus", (_e, cx) => {
-        this.focusedField = "blocks";
-        cx.notify();
-      });
-      this.blocksInput.on("blur", (_e, cx) => {
-        if (this.focusedField === "blocks") this.focusedField = null;
         cx.notify();
       });
 
       this.titleInput.focus();
       cx.timer.after(120, () => this.titleInput.focus());
+      cx.spawn(async (probeCx) => {
+        try {
+          this.hasBd = await hasLiveBeadsDir(this.ctx);
+        } catch {
+          this.hasBd = false;
+        }
+        probeCx.notify();
+      });
     } else if (this.dialogType === "reject") {
       this.feedbackInput = TextareaState.new({ placeholder: "Explain why this review is rejected and what needs fixing…", rows: 5 });
       this.feedbackFocused = true;
@@ -328,6 +359,29 @@ export class DialogController {
       return;
     }
 
+    if (this.dialogType === "create-wip") {
+      const title = this.titleInput.value().trim();
+      if (!title) {
+        this.error = "Title is required.";
+        this.titleInput.focus();
+        cx.notify();
+        return;
+      }
+      this.runMutation(cx, () =>
+        this.actions.createWipCard({
+          title,
+          description: this.descInput.value().trim(),
+          formula: this.wipFormula || "worker-inplace",
+          cwd: this.cwdInput.value().trim(),
+          model: this.model || "group/cheap",
+          mcpProfile: this.mcpInput.value().trim(),
+          env: this.env || undefined,
+          priority: this.priority,
+        }),
+      );
+      return;
+    }
+
     if (this.dialogType === "reject") {
       const beadId = this.item?.beadId || this.item?.id;
       const feedback = this.feedbackInput.value().trim();
@@ -419,6 +473,53 @@ export class DialogController {
     });
   }
 
+  defaultWipCwd() {
+    if (this.ctx?.repo) return this.ctx.repo;
+    if (this.ctx?.machine) return "";
+    const activeSpace = (spaces() || []).find((s) => s.active);
+    const candidate = focused()?.cwd || activeSpace?.folder || "";
+    const clean = String(candidate || "").replace(/\/+$/, "");
+    const userHome = String(home() || "").replace(/\/+$/, "");
+    if (!clean || clean === "/" || clean === userHome) return "";
+    return clean;
+  }
+
+  defaultWipFormula() {
+    const names = this.formulas
+      .map((f) => (typeof f === "string" ? f : f?.name))
+      .filter(Boolean);
+    for (const std of WORKER_FORMULAS) {
+      if (names.includes(std)) return std;
+    }
+    return WORKER_FORMULAS[0];
+  }
+
+  wipFormulaOptions() {
+    const seen = new Set(WORKER_FORMULAS);
+    const extras = [];
+    for (const f of this.formulas) {
+      const name = typeof f === "string" ? f : f?.name;
+      if (name && name.startsWith("worker-") && !seen.has(name)) {
+        seen.add(name);
+        extras.push(name);
+      }
+    }
+    return [...WORKER_FORMULAS, ...extras].map((n) => ({ value: n, label: n }));
+  }
+
+  toggleMcpProfile(profile, cx) {
+    const current = this.mcpInput
+      .value()
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const next = current.includes(profile)
+      ? current.filter((item) => item !== profile)
+      : [...current, profile];
+    this.mcpInput.set_value(next.join(", "));
+    cx?.notify?.();
+  }
+
   formulaOptions() {
     const names = this.formulas
       .map((f) => (typeof f === "string" ? f : f?.name))
@@ -453,6 +554,26 @@ export class DialogController {
       .bg(t.background)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => {
+        const dismissed = this._selectDismissedAt;
+        if (dismissed && dismissed.key === key && Date.now() - dismissed.at < 200) {
+          this._selectDismissedAt = null;
+          return;
+        }
+        this._selectDismissedAt = null;
+        this.openSelect = isOpen ? null : key;
+        if (isOpen) {
+          triggerFocus.focus();
+        } else {
+          this.selectHighlight = Math.max(
+            0,
+            options.findIndex((o) => String(o.value) === String(currentVal)),
+          );
+          listFocus.focus();
+        }
+        cx.stop_propagation();
+        cx.notify();
+      })
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(selectedOpt?.label ?? String(currentVal || "Select…")))
       .child(div().text_size(11).text_color(t.dim).child(isOpen ? "▲" : "▼"));
 
@@ -469,6 +590,13 @@ export class DialogController {
       .bg(t.popover)
       .shadow_md()
       .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+      .on_mouse_down_out((_e, cx) => {
+        if (this.openSelect !== key) return;
+        this.openSelect = null;
+        this._selectDismissedAt = { key, at: Date.now() };
+        triggerFocus.focus();
+        cx.notify();
+      })
       .on_key_down((e, cx) => {
         if (!options.length) return;
         if (e.key === "down") {
@@ -483,10 +611,14 @@ export class DialogController {
           const opt = options[this.selectHighlight] ?? options[0];
           if (opt) onPick(opt.value);
           this.openSelect = null;
+          this._selectDismissedAt = null;
+          triggerFocus.focus();
           cx.stop_propagation();
           cx.notify();
         } else if (e.key === "escape") {
           this.openSelect = null;
+          this._selectDismissedAt = null;
+          triggerFocus.focus();
           cx.stop_propagation();
           cx.notify();
         }
@@ -510,6 +642,8 @@ export class DialogController {
             .on_click((_e, cx) => {
               onPick(opt.value);
               this.openSelect = null;
+              this._selectDismissedAt = null;
+              triggerFocus.focus();
               cx.notify();
             })
             .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(opt.label))
@@ -637,6 +771,34 @@ export class DialogController {
 
     return v_flex()
       .gap(12)
+      .when(this.hasBd === false, (el) =>
+        el.child(
+          h_flex()
+            .p(8)
+            .gap(8)
+            .items_center()
+            .justify_between()
+            .rounded(7)
+            .bg(alpha(t.blocked || t.ansi3, "18"))
+            .border_1()
+            .border_color(alpha(t.blocked || t.ansi3, "55"))
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(11.5)
+                .text_color(t.blocked || t.ansi3)
+                .child("No .beads directory in this project. Switch to WIP Card for standalone tasks."),
+            )
+            .child(
+              this.renderBtn(t, "dlg-switch-to-wip", "Switch to WIP Card", (_e, cx) => {
+                this.dialogType = "create-wip";
+                this.error = null;
+                cx.notify();
+              }),
+            ),
+        ),
+      )
       .child(
         v_flex()
           .gap(5)
@@ -764,6 +926,211 @@ export class DialogController {
               .child(this.enqueueNow ? "✓" : ""),
           )
           .child(div().text_size(12.5).text_color(t.foreground).child("Enqueue immediately (add roscaelifer label)")),
+      );
+  }
+
+  renderCreateWip(t) {
+    const activeMcps = new Set(
+      this.mcpInput
+        .value()
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    const modeNote =
+      this.hasBd === true
+        ? "Creates an ephemeral WIP bead (roscaelifer, wip, formula) and ensures the runner."
+        : this.hasBd === false
+          ? "No .beads directory — creates a standalone roscaelifer WIP task and ensures the runner."
+          : "Detecting project .beads / standalone WIP mode…";
+
+    return v_flex()
+      .gap(12)
+      .child(
+        div()
+          .px(10)
+          .py(7)
+          .rounded(7)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .text_size(11.5)
+          .text_color(t.muted)
+          .child(modeNote),
+      )
+      .child(
+        v_flex()
+          .gap(5)
+          .child(div().text_size(11.5).font_medium().text_color(t.muted).child("Title *"))
+          .child(
+            Input.new(this.titleInput)
+              .h(34)
+              .px(10)
+              .rounded(7)
+              .border_1()
+              .border_color(this.focusedField === "title" ? t.accent : t.input)
+              .bg(t.background)
+              .text_size(13)
+              .text_color(t.foreground),
+          ),
+      )
+      .child(
+        v_flex()
+          .gap(5)
+          .child(div().text_size(11.5).font_medium().text_color(t.muted).child("Task / Description"))
+          .child(
+            Textarea.new(this.descInput)
+              .w_full()
+              .h(110)
+              .p(10)
+              .rounded(7)
+              .border_1()
+              .border_color(this.focusedField === "desc" ? t.accent : t.input)
+              .bg(t.background)
+              .text_size(12.5)
+              .text_color(t.foreground),
+          ),
+      )
+      .child(
+        h_flex()
+          .gap(10)
+          .child(
+            div()
+              .flex_1()
+              .child(
+                this.renderSelect(
+                  t,
+                  "formula",
+                  "Worker Formula",
+                  this.wipFormulaOptions(),
+                  this.wipFormula,
+                  (v) => (this.wipFormula = v),
+                ),
+              ),
+          )
+          .child(
+            div()
+              .flex_1()
+              .child(
+                this.renderSelect(
+                  t,
+                  "model",
+                  "Model",
+                  WIP_MODELS,
+                  this.model,
+                  (v) => (this.model = v),
+                ),
+              ),
+          ),
+      )
+      .child(
+        h_flex()
+          .gap(10)
+          .child(
+            div()
+              .flex_1()
+              .child(
+                this.renderSelect(
+                  t,
+                  "env",
+                  "Environment",
+                  this.envOptions(),
+                  this.env,
+                  (v) => (this.env = v),
+                ),
+              ),
+          )
+          .when(this.hasBd !== false, (el) =>
+            el.child(
+              div()
+                .flex_1()
+                .child(
+                  this.renderSelect(
+                    t,
+                    "priority",
+                    "Priority",
+                    PRIORITIES,
+                    this.priority,
+                    (v) => (this.priority = Number(v)),
+                  ),
+                ),
+            ),
+          ),
+      )
+      .child(
+        v_flex()
+          .gap(5)
+          .child(div().text_size(11.5).font_medium().text_color(t.muted).child("Working Directory (cwd, optional)"))
+          .child(
+            h_flex()
+              .gap(6)
+              .child(
+                Input.new(this.cwdInput)
+                  .flex_1()
+                  .h(32)
+                  .px(10)
+                  .rounded(7)
+                  .border_1()
+                  .border_color(this.focusedField === "cwd" ? t.accent : t.input)
+                  .bg(t.background)
+                  .text_size(12)
+                  .text_color(t.foreground),
+              )
+              .when(!this.ctx?.machine, (el) =>
+                el.child(
+                  this.renderBtn(t, "dlg-wip-pick-cwd", "Browse…", (_e, cx) => {
+                    cx.spawn(async (pickCx) => {
+                      const folder = await pickFolder({ prompt: "Select Worker Working Directory" });
+                      if (folder) {
+                        this.cwdInput.set_value(folder);
+                        pickCx.notify();
+                      }
+                    });
+                  }),
+                ),
+              ),
+          ),
+      )
+      .child(
+        v_flex()
+          .gap(6)
+          .child(div().text_size(11.5).font_medium().text_color(t.muted).child("MCP Profile (optional)"))
+          .child(
+            Input.new(this.mcpInput)
+              .h(32)
+              .px(10)
+              .rounded(7)
+              .border_1()
+              .border_color(this.focusedField === "mcp" ? t.accent : t.input)
+              .bg(t.background)
+              .text_size(12)
+              .text_color(t.foreground),
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(div().text_size(11).text_color(t.dim).child("Presets:"))
+              .children(
+                MCP_PROFILE_PRESETS.map((preset) => {
+                  const active = activeMcps.has(preset);
+                  return div()
+                    .id(`dlg-mcp-preset-${preset}`)
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .border_1()
+                    .border_color(active ? t.accent : t.border)
+                    .bg(active ? alpha(t.accent, "22") : t.raised)
+                    .text_size(11)
+                    .text_color(active ? t.accent : t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => this.toggleMcpProfile(preset, cx))
+                    .child(preset);
+                }),
+              ),
+          ),
       );
   }
 
@@ -1106,6 +1473,7 @@ export class DialogController {
     const titles = {
       enqueue: "Queue / Dispatch Bead",
       create: "New Bead",
+      "create-wip": "New WIP Card",
       reject: "Reject Review",
       "clean-preview": cleanLabel ? `Clean Preview · ${cleanLabel}` : "Clean Pending Resources",
       "project-config": "Project Configuration",
@@ -1114,6 +1482,7 @@ export class DialogController {
     const confirmLabels = {
       enqueue: this.busy ? "Working…" : "Dispatch Now",
       create: this.busy ? "Creating…" : "Create Bead",
+      "create-wip": this.busy ? "Creating…" : "Create & Run",
       reject: this.busy ? "Rejecting…" : "Reject & Reopen",
       "clean-preview": this.busy ? "Cleaning…" : "Confirm Clean",
       "project-config": this.busy ? "Saving…" : (this.editingProjectId ? "Save & Activate" : "Create & Activate"),
@@ -1123,7 +1492,7 @@ export class DialogController {
     const canSubmit =
       !this.busy &&
       (this.dialogType !== "reject" || Boolean(this.feedbackInput.value().trim())) &&
-      (this.dialogType !== "create" || Boolean(this.titleInput.value().trim())) &&
+      ((this.dialogType !== "create" && this.dialogType !== "create-wip") || Boolean(this.titleInput.value().trim())) &&
       (this.dialogType !== "clean-preview" || (!this.loadingPreview && Boolean(this.preview && !this.preview.empty)));
 
     return v_flex()
@@ -1183,6 +1552,7 @@ export class DialogController {
               .pr(6)
               .when(this.dialogType === "enqueue", (el) => el.child(this.renderEnqueue(t)))
               .when(this.dialogType === "create", (el) => el.child(this.renderCreate(t)))
+              .when(this.dialogType === "create-wip", (el) => el.child(this.renderCreateWip(t)))
               .when(this.dialogType === "reject", (el) => el.child(this.renderReject(t)))
               .when(this.dialogType === "clean-preview", (el) => el.child(this.renderCleanPreview(t)))
               .when(this.dialogType === "repo-config" || this.dialogType === "project-config", (el) => el.child(this.renderProjectConfig(t))),
