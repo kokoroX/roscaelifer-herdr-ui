@@ -6,6 +6,7 @@ import {
   spaces,
   panes,
   focused,
+  home,
   props,
   theme,
   shared,
@@ -29,6 +30,8 @@ import {
   loadActiveRepo,
   loadActiveProjectMirror,
   loadGlobalProjectsConfig,
+  upsertGlobalProject,
+  detectActiveRunnerMismatch,
   buildContextFromProps,
   loadCachedSnapshot,
   saveCachedSnapshot,
@@ -141,6 +144,12 @@ function clearCachedRunnerState(snapshot) {
   return { ...snapshot, runner: { ...snapshot.runner, active: false, lock_held: false } };
 }
 
+function shortenHomePath(value) {
+  const path = String(value || "").replace(/\/+$/, "");
+  const userHome = String(home() || "").replace(/\/+$/, "");
+  return userHome && path.startsWith(`${userHome}/`) ? `~${path.slice(userHome.length)}` : path;
+}
+
 function topButton(id, label, iconPath, { bg, fg, border, busy = false, badge = null, onClick }) {
   return Button.new(id)
     .h(28)
@@ -220,6 +229,8 @@ export default class RoscaeliferQueue extends View {
     this.loading = false;
     this.loadingSilent = false;
     this.error = null;
+    this.runnerMismatch = null;
+    this.dismissedMismatchKey = "";
     this.size = null;
     this.watchedDirs = new Set();
     this.watchHandles = new Map();
@@ -435,9 +446,9 @@ export default class RoscaeliferQueue extends View {
       const name = String(entry ?? "").split("/").pop();
       if (!name) return false;
       return (
-        name === "roscaelifer.db-wal" ||
-        name === "roscaelifer.db-shm" ||
-        name === "roscaelifer.db.lock" ||
+        name.endsWith(".db-wal") ||
+        name.endsWith(".db-shm") ||
+        name.endsWith(".db.lock") ||
         name === "dolt-server.log" ||
         name.endsWith(".lock")
       );
@@ -537,6 +548,7 @@ export default class RoscaeliferQueue extends View {
           if (seq !== this.refreshSeq) return;
           if (contextKey(nextCtx) !== contextKey(this.ctx)) {
             const repoChanged = repoIdentityKey(nextCtx) !== repoIdentityKey(this.ctx);
+            this.runnerMismatch = null;
             this.ctx = nextCtx;
             this.runner = null;
             this.clearWatchers();
@@ -582,6 +594,32 @@ export default class RoscaeliferQueue extends View {
         saveCachedSnapshot(this.ctx, snap);
         this.ensureWatchers(this.ctx, cx);
 
+        if (snap?.runner?.active === true) {
+          if (this.runnerMismatch) {
+            this.runnerMismatch = null;
+            cx.notify();
+          }
+        } else if (this.ctx && !checking()) {
+          // Runner probing runs off the critical path so it cannot delay the first
+          // paint or the Refresh button.
+          const probeCtx = this.ctx;
+          cx.spawn(async (mismatchCx) => {
+            try {
+              const mismatch = await detectActiveRunnerMismatch(probeCtx);
+              if (seq !== this.refreshSeq || contextKey(probeCtx) !== contextKey(this.ctx)) return;
+              if (this.snapshot?.runner?.active === true) return;
+              const nextKey = mismatch ? JSON.stringify(mismatch) : "";
+              const currentKey = this.runnerMismatch ? JSON.stringify(this.runnerMismatch) : "";
+              if (nextKey !== currentKey) {
+                this.runnerMismatch = mismatch;
+                mismatchCx.notify();
+              }
+            } catch {
+              // Best-effort probe: a ps failure must not affect the queue.
+            }
+          });
+        }
+
         this.queue = this.getNormalizedQueue(snap);
 
         const selected = this.selectedId ? this.queue.itemsById.get(this.selectedId) : null;
@@ -614,6 +652,56 @@ export default class RoscaeliferQueue extends View {
           cx.notify();
         }
       }
+    });
+  }
+
+  switchToDetectedRunner(cx) {
+    const mismatch = this.runnerMismatch;
+    const ctx = this.ctx;
+    if (!mismatch || !ctx) return;
+    cx.spawn(async (switchCx) => {
+      let savedProject = false;
+      if (ctx.projectId) {
+        try {
+          const config = await loadGlobalProjectsConfig();
+          const project = config.projects.find((item) => item.id === ctx.projectId);
+          if (project) {
+            await upsertGlobalProject(
+              {
+                ...project,
+                db: mismatch.db,
+                formulasDir: mismatch.formulasDir || project.formulasDir,
+                config: project.config || mismatch.config,
+                bdDir: project.bdDir || mismatch.bdDir,
+                env: project.env || mismatch.env,
+                updatedAt: Date.now(),
+              },
+              project.id,
+            );
+            savedProject = true;
+          }
+        } catch (err) {
+          this.error = `Unable to update saved project: ${err?.message || String(err)}`;
+        }
+      }
+      if (savedProject) {
+        setShared("roscaelifer.ctxOverride", null);
+      } else {
+        setShared("roscaelifer.ctxOverride", {
+          ...ctx,
+          db: mismatch.db,
+          formulasDir: mismatch.formulasDir || ctx.formulasDir,
+          config: mismatch.config || ctx.config,
+          bdDir: mismatch.bdDir || ctx.bdDir,
+          env: mismatch.env || ctx.env,
+          source: "runner",
+          updatedAt: Date.now(),
+        });
+      }
+      setShared("roscaelifer.refresh", Date.now());
+      this.runnerMismatch = null;
+      switchCx.notify();
+      this.refresh(switchCx, { forceContext: true, preempt: true });
     });
   }
 
@@ -1059,6 +1147,13 @@ export default class RoscaeliferQueue extends View {
     }
 
     const t = theme();
+    const mismatch = this.runnerMismatch;
+    const mismatchKey = mismatch && this.ctx ? `${this.ctx.db || ""}|${mismatch.db || ""}` : "";
+    const showRunnerMismatch = Boolean(mismatch && mismatchKey && mismatchKey !== this.dismissedMismatchKey);
+    const mismatchNote =
+      mismatch?.formulasDir && this.ctx?.formulasDir && mismatch.formulasDir !== this.ctx.formulasDir
+        ? ` · formulas ${shortenHomePath(mismatch.formulasDir)}`
+        : "";
     // Re-project live Herdr agents/terminals only when snapshot ref or live Herdr fingerprint changes.
     const queue = this.snapshot ? this.getNormalizedQueue(this.snapshot) : this.queue;
     if (queue) this.queue = queue;
@@ -1105,6 +1200,61 @@ export default class RoscaeliferQueue extends View {
                 .text_size(11.5)
                 .on_click(() => this.openDialog("project-config"))
                 .child("Configure Project"),
+            ),
+        ),
+      )
+      .when(showRunnerMismatch, (el) =>
+        el.child(
+          h_flex()
+            .px(12)
+            .py(8)
+            .gap(8)
+            .items_center()
+            .justify_between()
+            .bg((t.ansi3 || t.blocked || t.accent) + "20")
+            .border_b(1)
+            .border_color(t.border)
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(12)
+                .text_color(t.ansi3 || t.blocked || t.accent)
+                .child(
+                  `Active runner (PID ${mismatch.pid}) detected on ${shortenHomePath(mismatch.db)}${mismatchNote}`,
+                ),
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .child(
+                  Button.new("runner-mismatch-switch")
+                    .h(24)
+                    .px(8)
+                    .rounded(5)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(11.5)
+                    .on_click((_e, clickCx) => this.switchToDetectedRunner(clickCx))
+                    .child("Switch DB"),
+                )
+                .child(
+                  Button.new("runner-mismatch-dismiss")
+                    .h(24)
+                    .px(8)
+                    .rounded(5)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(11.5)
+                    .on_click((_e, clickCx) => {
+                      this.dismissedMismatchKey = mismatchKey;
+                      clickCx.notify();
+                    })
+                    .child("Dismiss"),
+                ),
             ),
         ),
       )

@@ -1,5 +1,13 @@
 import * as fs from "fs/promises";
 import { exec, focused, home, panes, readTextFile, spaces, checking } from "herdr";
+import {
+  matchActiveRunner,
+  parseRunningRoscaeliferProcesses,
+  parseTomlBdSection,
+  parseTomlTopLevelDb,
+  selectDetectedPaths,
+  stateDbCandidates,
+} from "./detect.js";
 
 const HISTORY_KEY = "roscaelifer.repoHistory.v1";
 const ACTIVE_REPO_KEY = "roscaelifer.activeRepo.v1";
@@ -527,8 +535,26 @@ export async function hasLiveBeadsDir(ctx) {
   return probeBeadsDirArtifacts(bdDir);
 }
 
+/**
+ * @typedef {Object} RepoProbe
+ * @property {string} clean
+ * @property {boolean} hasRosc
+ * @property {boolean} hasDb
+ * @property {boolean} hasBeads
+ * @property {boolean} hasToml
+ * @property {boolean} hasFormulas
+ * @property {string} source
+ * @property {boolean} [hasRoscFormulas]
+ * @property {string} [stateDb]
+ * @property {string} [tomlFormulasDir]
+ * @property {string} [tomlDb]
+ * @property {string} [home]
+ */
+
 function parseRemoteProbe(stdout) {
-  const lines = String(stdout || "").trim().split("\n");
+  // Legacy scripts emitted only the first seven lines; missing extension lines
+  // simply fall back to empty values.
+  const lines = String(stdout || "").trim().split(/\r?\n/);
   if (lines.length < 7) return null;
   return {
     clean: lines[0],
@@ -538,19 +564,115 @@ function parseRemoteProbe(stdout) {
     hasToml: lines[4] === "1",
     hasFormulas: lines[5] === "1",
     source: lines[6] || "detected",
+    hasRoscFormulas: lines[7] === "1",
+    stateDb: lines[8] || "",
+    tomlFormulasDir: lines[9] || "",
+    home: lines[10] || "",
+    // 12th line: the top-level `db` of roscaelifer.toml (added after the
+    // formulas_dir/home lines, so older scripts simply leave it empty).
+    tomlDb: lines[11] || "",
   };
 }
 
-function buildDetectedRepo(probe, machine = "") {
+/**
+ * @param {string} machine
+ * @param {string} [homeHint]
+ * @returns {Promise<{ processes: import("./detect.js").RunningRunner[], userHome: string }>}
+ */
+async function readRunningProcessesWithHome(machine, homeHint = "") {
+  const owner = normalizeMachine(machine);
+  try {
+    if (owner && !homeHint) {
+      // Resolve the remote HOME in the same shell as `ps`: exec() passes argv
+      // verbatim, so a single -c command is needed to expand $HOME remotely.
+      const res = await exec(
+        "sh",
+        ["-c", 'printf "%s\\n" "$HOME"; ps -eo pid=,args='],
+        { on: owner, timeout: 3000 },
+      );
+      if (res && res.code === 0) {
+        const text = String(res.stdout || "");
+        const nl = text.indexOf("\n");
+        const homeLine = (nl >= 0 ? text.slice(0, nl) : text).trim();
+        const psStdout = nl >= 0 ? text.slice(nl + 1) : "";
+        const userHome = normalizePath(homeLine, owner);
+        return { processes: parseRunningRoscaeliferProcesses(psStdout, userHome), userHome };
+      }
+      return { processes: [], userHome: "" };
+    }
+    const res = await exec("ps", ["-eo", "pid=,args="], {
+      ...(owner ? { on: owner } : {}),
+      timeout: 3000,
+    });
+    if (res && res.code === 0) {
+      const userHome = owner ? normalizePath(homeHint, owner) : normalizePath(home());
+      return { processes: parseRunningRoscaeliferProcesses(res.stdout, userHome), userHome };
+    }
+  } catch {
+    // Runner probing is best effort: never block repo detection on `ps`.
+  }
+  return { processes: [], userHome: owner ? normalizePath(homeHint, owner) : "" };
+}
+
+/**
+ * @param {string} machine
+ * @param {string} [homeHint]
+ * @returns {Promise<import("./detect.js").RunningRunner[]>}
+ */
+async function readRunningProcesses(machine, homeHint = "") {
+  return (await readRunningProcessesWithHome(machine, homeHint)).processes;
+}
+
+/**
+ * @param {string} repoDir
+ * @param {string} stateBaseDir
+ * @returns {Promise<string>}
+ */
+async function findStateDb(repoDir, stateBaseDir) {
+  const candidates = stateDbCandidates(repoDir, stateBaseDir);
+  if (!candidates.length) return "";
+  const checked = await Promise.all(candidates.map(async (candidate) => ({
+    candidate,
+    db: await pathExists(candidate),
+    runner: await pathExists(`${candidate}.runner.json`),
+  })));
+  const withRunner = checked.find((entry) => entry.db && entry.runner);
+  return withRunner?.candidate || checked.find((entry) => entry.db)?.candidate || "";
+}
+
+/**
+ * @param {RepoProbe} probe
+ * @param {string} [machine]
+ * @param {{ processes?: import("./detect.js").RunningRunner[], userHome?: string, tomlBd?: import("./detect.js").TomlBdSection, tomlDb?: string }} [options]
+ */
+function buildDetectedRepo(probe, machine = "", options = {}) {
   if (!probe) return null;
-  const { clean: repo, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, source } = probe;
-  if (!hasRosc && !hasDb && !hasBeads && !hasToml) return null;
+  const { clean: repo, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, hasRoscFormulas, stateDb, source } = probe;
+  const userHome = options.userHome || "";
+  const tomlBd = options.tomlBd || { dir: "", formulasDir: probe.tomlFormulasDir || "" };
+  const tomlDb = options.tomlDb !== undefined ? options.tomlDb : probe.tomlDb || "";
+  const processes = options.processes || [];
+  const flags = { repo, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, hasRoscFormulas, userHome, tomlBd, tomlDb };
+  const basePaths = selectDetectedPaths(flags);
+  const activeRunner = matchActiveRunner(processes, {
+    repo,
+    bdDir: basePaths.bdDir,
+    config: basePaths.config,
+    formulasDir: basePaths.formulasDir,
+    userHome,
+    excludeWip: true,
+  });
+  if (!hasRosc && !hasDb && !hasBeads && !hasToml && !hasRoscFormulas && !stateDb && !activeRunner) {
+    return null;
+  }
+  const paths = selectDetectedPaths({ ...flags, stateDb, activeRunner });
   return {
     repo,
-    db: hasDb || hasRosc ? `${repo}/.roscaelifer/roscaelifer.db` : "",
-    bdDir: hasBeads ? `${repo}/.beads` : "",
-    config: hasToml ? `${repo}/roscaelifer.toml` : "",
-    formulasDir: hasFormulas ? `${repo}/formulas` : "",
+    db: paths.db,
+    bdDir: paths.bdDir,
+    config: paths.config,
+    formulasDir: paths.formulasDir,
+    env: paths.env,
     machine: normalizeMachine(machine),
     hasBeads,
     label: repo.split("/").filter(Boolean).pop() || repo,
@@ -558,19 +680,38 @@ function buildDetectedRepo(probe, machine = "") {
   };
 }
 
-async function probeLocalRepoRoot(dir) {
+/**
+ * @param {string} dir
+ * @param {{ processes?: import("./detect.js").RunningRunner[], userHome?: string }} [options]
+ */
+async function probeLocalRepoRoot(dir, options = {}) {
   const clean = normalizePath(dir, "");
   if (!clean) return null;
-  const userHome = normalizePath(home());
+  const userHome = options.userHome || normalizePath(home());
   if (clean === "/" || clean === userHome) return null;
-  const [hasRosc, hasDb, hasBeads, hasToml, hasFormulas] = await Promise.all([
+  const [hasRosc, hasDb, hasBeads, hasToml, hasFormulas, hasRoscFormulas] = await Promise.all([
     pathExists(`${clean}/.roscaelifer`),
     pathExists(`${clean}/.roscaelifer/roscaelifer.db`),
     probeBeadsArtifacts(clean),
     pathExists(`${clean}/roscaelifer.toml`),
     pathExists(`${clean}/formulas`),
+    pathExists(`${clean}/.roscaelifer/formulas`),
   ]);
-  return buildDetectedRepo({ clean, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, source: "detected" }, "");
+  let tomlText = "";
+  if (hasToml) {
+    try {
+      tomlText = (await readTextFile(`${clean}/roscaelifer.toml`)) || "";
+    } catch {
+      // Keep filesystem-only detection when TOML cannot be read.
+    }
+  }
+  const stateDb = await findStateDb(clean, `${userHome}/.local/state/roscaelifer`);
+  const processes = options.processes || (await readRunningProcesses("", userHome));
+  return buildDetectedRepo(
+    { clean, hasRosc, hasDb, hasBeads, hasToml, hasFormulas, hasRoscFormulas, stateDb, source: "detected" },
+    "",
+    { processes, userHome, tomlBd: parseTomlBdSection(tomlText), tomlDb: parseTomlTopLevelDb(tomlText) },
+  );
 }
 
 const REMOTE_DETECT_SCRIPT = `
@@ -582,6 +723,7 @@ esac
 start=\${start%/}
 [ -z "$start" ] && start="/"
 home_clean=\${HOME%/}
+state_base=\${XDG_STATE_HOME:-$HOME/.local/state}/roscaelifer
 
 probe_dir() {
   d=$1
@@ -598,8 +740,64 @@ probe_dir() {
   done
   has_toml=0; [ -e "$d/roscaelifer.toml" ] && has_toml=1
   has_formulas=0; [ -e "$d/formulas" ] && has_formulas=1
-  if [ "$has_rosc" = "1" ] || [ "$has_db" = "1" ] || [ "$has_beads" = "1" ] || [ "$has_toml" = "1" ]; then
-    printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "$d" "$has_rosc" "$has_db" "$has_beads" "$has_toml" "$has_formulas" "$src"
+  has_rosc_formulas=0; [ -e "$d/.roscaelifer/formulas" ] && has_rosc_formulas=1
+  state_db=""
+  base=\${d##*/}
+  lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+  slug=$(printf '%s' "$lower" | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')
+  for cand in "$state_base/$lower.db" "$state_base/$base.db" "$state_base/$slug.db"; do
+    if [ -e "$cand" ]; then
+      if [ -e "$cand.runner.json" ]; then state_db="$cand"; break; fi
+      [ -z "$state_db" ] && state_db="$cand"
+    fi
+  done
+  toml_formulas_dir=""
+  toml_db=""
+  if [ "$has_toml" = "1" ]; then
+    toml_db=$(awk '
+      /^[[:space:]]*#/ { next }
+      substr($0, 1, 1) == "[" { exit }
+      /^[[:space:]]*db[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        sub(/[[:space:]]+#.*$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        if (length($0) >= 2) {
+          first=substr($0, 1, 1)
+          last=substr($0, length($0), 1)
+          if ((first == sprintf("%c", 34) || first == sprintf("%c", 39)) && first == last) {
+            $0=substr($0, 2, length($0) - 2)
+          }
+        }
+        print
+        exit
+      }
+    ' "$d/roscaelifer.toml" 2>/dev/null)
+    toml_formulas_dir=$(awk '
+      /^[[:space:]]*#/ { next }
+      substr($0, 1, 1) == "[" {
+        header=$0
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
+        in_bd=(header == "[bd]")
+        next
+      }
+      in_bd && /^[[:space:]]*formulas_dir[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        sub(/[[:space:]]+#.*$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+        if (length($0) >= 2) {
+          first=substr($0, 1, 1)
+          last=substr($0, length($0), 1)
+          if ((first == sprintf("%c", 34) || first == sprintf("%c", 39)) && first == last) {
+            $0=substr($0, 2, length($0) - 2)
+          }
+        }
+        print
+        exit
+      }
+    ' "$d/roscaelifer.toml" 2>/dev/null)
+  fi
+  if [ "$has_rosc" = "1" ] || [ "$has_db" = "1" ] || [ "$has_beads" = "1" ] || [ "$has_toml" = "1" ] || [ "$has_rosc_formulas" = "1" ] || [ -n "$state_db" ]; then
+    printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "$d" "$has_rosc" "$has_db" "$has_beads" "$has_toml" "$has_formulas" "$src" "$has_rosc_formulas" "$state_db" "$toml_formulas_dir" "$home_clean" "$toml_db"
     return 0
   fi
   return 1
@@ -649,16 +847,21 @@ export async function detectRepoFromPath(startPath, machine = "") {
         timeout: 6000,
       });
       if (res.code !== 0) return null;
-      return buildDetectedRepo(parseRemoteProbe(res.stdout), owner);
+      const probe = parseRemoteProbe(res.stdout);
+      if (!probe) return null;
+      const userHome = normalizePath(probe.home || "", owner);
+      const processes = await readRunningProcesses(owner, userHome);
+      return buildDetectedRepo(probe, owner, { processes, userHome });
     } catch {
       return null;
     }
   }
 
   const userHome = normalizePath(home());
+  const processes = await readRunningProcesses("", userHome);
   for (let i = 0; i < 12 && cur; i++) {
     if (cur === "/" || cur === userHome) break;
-    const found = await probeLocalRepoRoot(cur);
+    const found = await probeLocalRepoRoot(cur, { processes, userHome });
     if (found) return found;
     const next = parentDir(cur);
     if (!next || next === cur) break;
@@ -675,7 +878,7 @@ export async function detectRepoFromPath(startPath, machine = "") {
       const common = res.stdout.trim();
       const mainRepo = common.endsWith("/.git") ? common.slice(0, -5) : "";
       if (mainRepo) {
-        const found = await probeLocalRepoRoot(mainRepo);
+        const found = await probeLocalRepoRoot(mainRepo, { processes, userHome });
         if (found) {
           found.source = "git-common-dir";
           return found;
@@ -688,6 +891,42 @@ export async function detectRepoFromPath(startPath, machine = "") {
   return null;
 }
 
+/**
+ * Detect a live `roscaelifer run` that uses a different DB than the current ctx.
+ * @param {*} ctx
+ * @returns {Promise<{pid: number, db: string, formulasDir: string, config: string, bdDir: string, env: string} | null>}
+ */
+export async function detectActiveRunnerMismatch(ctx) {
+  if (!ctx || checking()) return null;
+  const machine = normalizeMachine(ctx.machine);
+  const repo = normalizePath(ctx.repo || "", machine);
+  const bdDir = normalizePath(ctx.bdDir || (repo ? `${repo}/.beads` : ""), machine);
+  const config = normalizePath(ctx.config || "", machine);
+  const formulasDir = normalizePath(ctx.formulasDir || "", machine);
+  if (!repo && !bdDir && !config) return null;
+
+  const { processes, userHome } = await readRunningProcessesWithHome(machine);
+  const activeRunner = matchActiveRunner(processes, {
+    repo,
+    bdDir,
+    config,
+    formulasDir,
+    userHome,
+    excludeWip: true,
+  });
+  if (!activeRunner?.db) return null;
+  const currentDb = normalizePath(ctx.db || "", machine);
+  if (!currentDb || normalizePath(activeRunner.db, machine) === currentDb) return null;
+  return {
+    pid: activeRunner.pid,
+    db: activeRunner.db,
+    formulasDir: activeRunner.formulasDir,
+    config: activeRunner.config,
+    bdDir: activeRunner.bdDir,
+    env: activeRunner.env,
+  };
+}
+
 export function buildContextFromProps(rawProps, overrideCtx = null) {
   const src = overrideCtx || rawProps || {};
   const machine = normalizeMachine(src.machine ?? rawProps?.machine);
@@ -695,6 +934,8 @@ export function buildContextFromProps(rawProps, overrideCtx = null) {
   const db = src.db ? normalizePath(src.db, machine) : repo ? `${repo}/.roscaelifer/roscaelifer.db` : "";
   const bdDir = src.bdDir ? normalizePath(src.bdDir, machine) : repo ? `${repo}/.beads` : "";
   const config = src.config ? normalizePath(src.config, machine) : repo ? `${repo}/roscaelifer.toml` : "";
+  // An explicit formulasDir is normalized like the other paths (legacy projects may
+  // point at .roscaelifer/formulas or a custom TOML path); only fill the default when absent.
   const formulasDir = src.formulasDir ? normalizePath(src.formulasDir, machine) : repo ? `${repo}/formulas` : "";
   if (!repo && !db && !bdDir && !config && !formulasDir) return null;
   const ctx = {

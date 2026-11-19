@@ -19,6 +19,7 @@ import {
   clearActiveProjectMirror,
   deleteGlobalProject,
   detectCurrentWorkspaceProject,
+  detectRepoFromPath,
   hasLiveBeadsDir,
   loadGlobalProjectsConfig,
   repoIdentityKey,
@@ -1290,7 +1291,6 @@ export class DialogController {
       [this.dbInput, `${previous}/.roscaelifer/roscaelifer.db`, `${folder}/.roscaelifer/roscaelifer.db`],
       [this.bdDirInput, `${previous}/.beads`, `${folder}/.beads`],
       [this.configInput, `${previous}/roscaelifer.toml`, `${folder}/roscaelifer.toml`],
-      [this.formulasDirInput, `${previous}/formulas`, `${folder}/formulas`],
     ];
     const currentName = this.projectNameInput.value().trim();
     const nextName = String(folder).replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
@@ -1300,24 +1300,34 @@ export class DialogController {
     for (const [input, oldDefault, nextDefault] of derived) {
       if (!input.value().trim() || input.value().trim() === oldDefault) input.set_value(nextDefault);
     }
+    const formulasValue = this.formulasDirInput.value().trim();
+    const oldFormulas = [`${previous}/formulas`, `${previous}/.roscaelifer/formulas`];
+    if (!formulasValue || oldFormulas.includes(formulasValue)) {
+      this.formulasDirInput.set_value(
+        formulasValue === oldFormulas[1] ? `${folder}/.roscaelifer/formulas` : `${folder}/formulas`,
+      );
+    }
     this.projectFormTouched = true;
   }
 
   applyDetectedProject(detected) {
     const value = detected && typeof detected === "object" ? detected : {};
-    // Keep the id of the project the user is currently editing.
+    // Detection is authoritative: it must also repair stale db/formulasDir values
+    // on an already saved project, so do not run updateProjectRoot() first.
     const nextRepo = typeof value.repo === "string" ? value.repo.trim() : "";
-    const previousRepo = this.repoInput.value().trim();
-    const wasEmpty = {
-      machine: !this.machineInput.value().trim(),
-      db: !this.dbInput.value().trim(),
-      bdDir: !this.bdDirInput.value().trim(),
-      config: !this.configInput.value().trim(),
-      formulasDir: !this.formulasDirInput.value().trim(),
-      bin: !this.binInput.value().trim(),
-      env: !this.envInput.value().trim(),
+    if (nextRepo) this.repoInput.set_value(nextRepo);
+
+    const fill = (input, detectedValue) => {
+      const text = typeof detectedValue === "string" ? detectedValue.trim() : "";
+      if (text) input.set_value(text);
     };
-    if (nextRepo && nextRepo !== previousRepo) this.updateProjectRoot(nextRepo);
+    fill(this.machineInput, value.machine);
+    fill(this.dbInput, value.db);
+    fill(this.bdDirInput, value.bdDir);
+    fill(this.configInput, value.config);
+    fill(this.formulasDirInput, value.formulasDir);
+    fill(this.binInput, value.bin);
+    if (!this.envInput.value().trim()) fill(this.envInput, value.env);
 
     const detectedName = String(value.name || "").trim()
       || nextRepo.replace(/\/+$/, "").split("/").filter(Boolean).pop()
@@ -1327,30 +1337,25 @@ export class DialogController {
       if (detectedName) this.projectNameInput.set_value(detectedName);
       this.autoProjectName = detectedName;
     }
-
-    const fillEmpty = (input, detectedValue) => {
-      const text = typeof detectedValue === "string" ? detectedValue.trim() : "";
-      if (text && !input.value().trim()) input.set_value(text);
-    };
-    if (wasEmpty.machine) fillEmpty(this.machineInput, value.machine);
-    if (wasEmpty.db) fillEmpty(this.dbInput, value.db);
-    if (wasEmpty.bdDir) fillEmpty(this.bdDirInput, value.bdDir);
-    if (wasEmpty.config) fillEmpty(this.configInput, value.config);
-    if (wasEmpty.formulasDir) fillEmpty(this.formulasDirInput, value.formulasDir);
-    if (wasEmpty.bin) fillEmpty(this.binInput, value.bin);
-    if (wasEmpty.env) fillEmpty(this.envInput, value.env);
     this.projectFormTouched = true;
   }
 
   detectProject(cx) {
+    if (this.busy) return;
+    const currentRepo = this.repoInput.value().trim();
+    const currentMachine = this.machineInput.value().trim();
     this.busy = true;
     this.error = null;
     cx.notify();
     cx.spawn(async (detectCx) => {
       try {
-        const detected = await detectCurrentWorkspaceProject({ focusedInfo: focused(), spaceList: spaces(), paneList: panes() });
+        const detected = currentRepo
+          ? await detectRepoFromPath(currentRepo, currentMachine)
+          : await detectCurrentWorkspaceProject({ focusedInfo: focused(), spaceList: spaces(), paneList: panes() });
         if (!detected) {
-          this.error = "No roscaelifer project detected in the focused workspace.";
+          this.error = currentRepo
+            ? `No roscaelifer project detected at ${currentRepo}.`
+            : "No roscaelifer project detected in the focused workspace.";
           return;
         }
         this.applyDetectedProject(detected);
@@ -1420,11 +1425,29 @@ export class DialogController {
             .gap(6)
             .child(Input.new(inputState).flex_1().h(32).px(10).rounded(7).border_1().border_color(this.focusedField === name ? t.accent : t.input).bg(t.background).text_size(12).text_color(t.foreground))
             .when(pickable, (el) => el.child(this.renderBtn(t, `dlg-pick-${name}`, "Browse…", (_e, cx) => {
+              if (this.busy) return;
               cx.spawn(async (pickCx) => {
                 const folder = await pickFolder({ prompt: `Select ${label}` });
-                if (folder) {
-                  if (name === "repo") this.updateProjectRoot(folder);
-                  else inputState.set_value(folder);
+                if (!folder) {
+                  pickCx.notify();
+                  return;
+                }
+                if (name !== "repo") {
+                  inputState.set_value(folder);
+                  pickCx.notify();
+                  return;
+                }
+                this.busy = true;
+                this.error = null;
+                pickCx.notify();
+                try {
+                  const detected = await detectRepoFromPath(folder, this.machineInput.value().trim());
+                  if (detected) this.applyDetectedProject(detected);
+                  else this.updateProjectRoot(folder);
+                } catch {
+                  this.updateProjectRoot(folder);
+                } finally {
+                  this.busy = false;
                   pickCx.notify();
                 }
               });
