@@ -1373,7 +1373,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     envsByName.set(obj.name, obj);
     return obj;
   });
-  if (!envsByName.has(defaultEnv)) {
+  if (defaultEnv !== "auto" && !envsByName.has(defaultEnv)) {
     const fallback = {
       name: defaultEnv,
       kind: "local",
@@ -1486,12 +1486,17 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     }
     const intakePlan = beadId ? intakeByBead.get(beadId) || null : null;
 
-    const envName =
+    const rawEnv =
       task?.resolved_env ||
       intakePlan?.env ||
       envLabel ||
       defaultEnv;
-    const envObj = envsByName.get(envName) || null;
+    // `auto` means "no concrete env yet": either the config leaves placement to the
+    // scheduler, or the task has not been locked to a resolved_env. Such items must
+    // not claim an env chip or an env that does not exist in config.envs.
+    const envPendingAuto = rawEnv === "auto";
+    const envName = envPendingAuto ? null : rawEnv;
+    const envObj = envName ? envsByName.get(envName) || null : null;
     const formula =
       task?.formula_name ||
       intakePlan?.formula ||
@@ -1679,6 +1684,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       labels,
       formula,
       env: envName,
+      envPendingAuto,
       maxRunning: envObj?.maxRunning ?? null,
       machine: envObj?.machine || null,
       project,

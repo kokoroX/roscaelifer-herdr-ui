@@ -380,6 +380,7 @@ export class InspectorController {
 
     const metaRows = [];
     if (item.env) metaRows.push(["Env", item.env]);
+    else if (item.envPendingAuto) metaRows.push(["Env", "auto (pending)"]);
     if (item.formula) metaRows.push(["Formula", item.formula]);
     if (item.project) metaRows.push(["Project", item.project]);
     if (varCwd && varCwd !== worktree) metaRows.push(["Cwd", varCwd]);

@@ -62,7 +62,7 @@ Supported block `props` fields are:
 - `config`: path to `roscaelifer.toml`
 - `formulasDir`: path to `formulas/` directory
 - `bin`: explicit path to the `roscaelifer` executable
-- `env`: default environment name
+- `env`: default environment name; `auto` defers env selection to the scheduler (see `Queue (Kanban)` above)
 - `dialogType`: internal modal prop (`enqueue`, `create`, `reject`, `clean-preview`, `project-config`; `repo-config` remains accepted for compatibility)
 
 If `roscaelifer` is not on `PATH` (or `~/.local/bin/roscaelifer`, `~/go/bin/roscaelifer`), and `repo/cmd/roscaelifer/main.go` exists with `go` available, it falls back to `go run ./cmd/roscaelifer`.
@@ -70,6 +70,10 @@ If `roscaelifer` is not on `PATH` (or `~/.local/bin/roscaelifer`, `~/go/bin/rosc
 ## Views
 
 - **Queue (Kanban)**: Six columns — `Ready`, `Queue`, `Running`, `Needs Action`, `Review`, and `Closed` — with environment capacity pills, `Queued only` filter, search input, card priority/agent status badges, step progress bar, and inline action buttons (`Enqueue`, `Dispatch`, `Options`, `Dequeue`, `Peek`, `Focus`, `Cancel`, `Approve`, `Retry`, `Re-queue`, `Pass`, `Reject`, `Clean`, `Reopen`). `Queue` holds work already waiting to run — `roscaelifer`-labelled beads awaiting intake/dependencies/a tick, plus active tasks whose steps are all still pending a concurrency slot — while `Running` only holds tasks with a step actually executing.
+
+  Environments come only from the backend `[env.*]` config: the env tabs are built from `config.envs`, so a task without a concrete env is simply filtered out of a specific-env tab and never gets an `env:auto` chip. If the selected env filter disappears from the config, the filter safely falls back to `All Envs`.
+
+  When `default_env = "auto"` the scheduler picks the env per task, so the board does not invent an `auto` tab. Items that have no explicit `env:<name>` label, no concrete `intake_preview` env, and no scheduler-locked task `resolved_env` render without an `env:` chip and carry an env-pending marker; their inspector metadata row shows `Env: auto (pending)`. Only an explicit env or a locked `resolved_env` shows a concrete env name (and `env:<name>` chip).
 - **Epics & Deps**: Epic sidebar with completion progress bars paired with topological `Wave 0`, `Wave 1`, ... lanes derived from `blocks` dependencies, `Blocked by` / `Unlocks` chips, click-to-highlight upstream/downstream chain, and a `Mirror Integrations` table.
 - **Mirror & Events**: `Mirror Integrations` table (`group_id`, `target_branch`, `status`, `commit_sha`, `detail`) above a searchable stream of task/step state transitions (`from -> to`).
 - **Inspector Drawer**: Right-hand panel (`280px`–`420px`) showing bead/task IDs, priority, labels, metadata (`Env`, `Formula`, `Project`, `Branch`, `Worktree`, `Terminal`, `Link`), Markdown-rendered description, acceptance criteria, notes, and latest attempt reply, expandable pipeline steps with attempt counts/rounds/elapsed time, `Live Terminal` (`Peek`, `Focus`, `Keep`, `Open Worktree`, and manual `Refresh` running `hc read <addr> --lines 35`), and task event timeline.

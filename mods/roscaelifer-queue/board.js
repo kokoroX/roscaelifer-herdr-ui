@@ -759,7 +759,21 @@ export class BoardController {
       .when(Boolean(actionRow), (el) => el.child(actionRow));
   }
 
+  // Env tabs only ever list real envs from config. Keep a stale filter from
+  // hiding every card (or matching a synthetic "auto" env) by resetting it.
+  syncEnvFilter(queue) {
+    if (this.envFilter === "all") return false;
+    const envs = Array.isArray(queue?.envs) ? queue.envs : [];
+    const names = new Set(
+      envs.map((env) => (typeof env === "string" ? env : env?.name)).filter(Boolean),
+    );
+    if (names.has(this.envFilter)) return false;
+    this.envFilter = "all";
+    return true;
+  }
+
   renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral } = {}) {
+    this.syncEnvFilter(queue);
     const envs = queue?.envs || [];
 
     const envTab = (id, label, active, extra, onClick) =>
@@ -1069,6 +1083,7 @@ export class BoardController {
   }
 
   getFilteredColumns(queue, { showWip = true, showEphemeral = false } = {}) {
+    this.syncEnvFilter(queue);
     const query = this.query.trim();
     const cached = this._filterCache;
     if (
