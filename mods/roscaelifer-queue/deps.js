@@ -13,6 +13,7 @@ import {
 } from "gpui-base";
 import { settings, theme } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
+import { renderProjectFilterPills } from "./board.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
 
@@ -301,12 +302,14 @@ export class DepsController {
       queue: null,
       showDoneEpics: null,
       showEmptyEpics: null,
+      projectFilter: null,
       stats: null,
     };
     this._waveCache = {
       queue: null,
       selectedEpicId: null,
       showClosedInWaves: null,
+      projectFilter: null,
       data: null,
     };
   }
@@ -329,12 +332,13 @@ export class DepsController {
     cx?.notify();
   }
 
-  getSidebarStats(queue, epics, items) {
+  getSidebarStats(queue, epics, items, projectFilter = "all") {
     const cached = this._sidebarCache;
     if (
       cached.queue === queue &&
       cached.showDoneEpics === this.showDoneEpics &&
-      cached.showEmptyEpics === this.showEmptyEpics
+      cached.showEmptyEpics === this.showEmptyEpics &&
+      cached.projectFilter === projectFilter
     ) {
       return cached.stats;
     }
@@ -350,19 +354,21 @@ export class DepsController {
       queue,
       showDoneEpics: this.showDoneEpics,
       showEmptyEpics: this.showEmptyEpics,
+      projectFilter,
       stats,
     };
     return stats;
   }
 
-  getWaveData(queue, epics, items, { showWip = true, showEphemeral = false } = {}) {
+  getWaveData(queue, epics, items, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
     const cached = this._waveCache;
     if (
       cached.queue === queue &&
       cached.selectedEpicId === this.selectedEpicId &&
       cached.showClosedInWaves === this.showClosedInWaves &&
       cached.showWip === showWip &&
-      cached.showEphemeral === showEphemeral
+      cached.showEphemeral === showEphemeral &&
+      cached.projectFilter === projectFilter
     ) {
       return cached.data;
     }
@@ -398,24 +404,39 @@ export class DepsController {
       showClosedInWaves: this.showClosedInWaves,
       showWip,
       showEphemeral,
+      projectFilter,
       data,
     };
     return data;
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
-    const items = queue?.items ?? [];
-    const epics = queue?.epics ?? [];
-    const mirrors = queue?.mirrorIntegrations ?? snapshot?.mirror_integrations ?? [];
-    const events = queue?.events ?? snapshot?.events ?? [];
+    const multi = Array.isArray(projects) && projects.length > 1;
+    const byProject = (list) =>
+      !multi || projectFilter === "all"
+        ? list
+        : list.filter((entry) => !entry?.projectId || entry.projectId === projectFilter);
+    const items = byProject(queue?.items ?? []);
+    const epics = byProject(queue?.epics ?? []);
+    const mirrors = byProject(queue?.mirrorIntegrations ?? snapshot?.mirror_integrations ?? []);
+    const events = byProject(queue?.events ?? snapshot?.events ?? []);
+
+    const projectBar = multi
+      ? renderProjectFilterPills(t, {
+          projects,
+          projectFilter,
+          onSelectProjectFilter,
+          idPrefix: "deps",
+        })
+      : null;
 
     if (mode === "mirror") {
-      return this.renderMirrorAndEvents(t, { queue, mirrors, events, onSelectItem, monoFont }, cx);
+      return this.renderMirrorAndEvents(t, { queue, mirrors, events, onSelectItem, monoFont, multi, projectBar }, cx);
     }
 
-    const sidebarStats = this.getSidebarStats(queue, epics, items);
+    const sidebarStats = this.getSidebarStats(queue, epics, items, projectFilter);
 
     return v_flex()
       .id("deps-root")
@@ -423,13 +444,14 @@ export class DepsController {
       .min_h(0)
       .p(10)
       .gap(8)
+      .when(Boolean(projectBar), (el) => el.child(projectBar))
       .child(
         h_flex()
           .flex_1()
           .min_h(0)
           .gap(8)
-          .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats }))
-          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral })),
+          .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats, projects, projectFilter }))
+          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -441,7 +463,7 @@ export class DepsController {
             .border_color(t.border)
             .bg(t.surface)
             .overflow_hidden()
-            .child(this.renderMirrorTable(t, mirrors, monoFont)),
+            .child(this.renderMirrorTable(t, mirrors, monoFont, { multi })),
         ),
       );
   }
@@ -459,7 +481,65 @@ export class DepsController {
     }
   }
 
-  renderEpicSidebar(t, { epics, items, monoFont, stats = null }) {
+  renderEpicCard(t, ep, monoFont) {
+    const id = ep.id || ep.beadId;
+    const active = this.selectedEpicId === id;
+    const { total, done, pct } = getEpicStats(ep);
+    return v_flex()
+      .id(`deps-epic-${id}`)
+      .p(9)
+      .gap(5)
+      .rounded(7)
+      .border_1()
+      .border_color(active ? t.accent : t.border)
+      .bg(active ? t.selected : t.background)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => {
+        this.selectedEpicId = active ? null : id;
+        this.chainFocusId = null;
+        cx.notify();
+      })
+      .child(
+        h_flex()
+          .justify_between()
+          .items_center()
+          .gap(6)
+          .child(div().text_size(10.5).font_family(monoFont).text_color(t.accent).child(ep.rawId || id))
+          .child(div().text_size(10.5).font_family(monoFont).text_color(t.muted).child(`${done}/${total} (${pct}%)`)),
+      )
+      .child(div().text_size(12).font_medium().text_color(t.foreground).child(ep.title || id))
+      .child(this.renderProgressBar(t, id, pct));
+  }
+
+  /** In multi-project mode epics are grouped per project so DAGs never mix. */
+  renderEpicGroups(t, { visibleEpics, projects, monoFont }) {
+    const multi = Array.isArray(projects) && projects.length > 1;
+    if (!multi) return visibleEpics.map((ep) => this.renderEpicCard(t, ep, monoFont));
+    const groups = new Map(projects.map((project) => [project.id, { project, epics: [] }]));
+    for (const ep of visibleEpics) {
+      const key = ep.projectId || projects[0]?.id;
+      if (!groups.has(key)) groups.set(key, { project: null, epics: [] });
+      groups.get(key).epics.push(ep);
+    }
+    const out = [];
+    for (const { project, epics } of groups.values()) {
+      if (epics.length === 0) continue;
+      out.push(
+        h_flex()
+          .pt(4)
+          .gap(6)
+          .items_center()
+          .child(div().size(7).rounded(4).bg(project?.color || t.accent))
+          .child(div().text_size(10.5).font_semibold().text_color(project?.color || t.muted).child(project?.name || "Other")),
+      );
+      for (const ep of epics) out.push(this.renderEpicCard(t, ep, monoFont));
+    }
+    return out;
+  }
+
+  renderEpicSidebar(t, { epics, items, monoFont, stats = null, projects = [], projectFilter = "all" }) {
+    void projectFilter;
     const cachedStats = stats || this.getSidebarStats(null, epics, items);
     const { nonEpicCount, closedCount, visibleEpics } = cachedStats;
     const filteredCountText =
@@ -572,38 +652,7 @@ export class DepsController {
                   )
                   .child(this.renderProgressBar(t, "all", nonEpicCount > 0 ? Math.round((closedCount / nonEpicCount) * 100) : 0)),
               )
-              .children(
-                visibleEpics.map((ep) => {
-                  const id = ep.id || ep.beadId;
-                  const active = this.selectedEpicId === id;
-                  const { total, done, pct } = getEpicStats(ep);
-                  return v_flex()
-                    .id(`deps-epic-${id}`)
-                    .p(9)
-                    .gap(5)
-                    .rounded(7)
-                    .border_1()
-                    .border_color(active ? t.accent : t.border)
-                    .bg(active ? t.selected : t.background)
-                    .cursor_pointer()
-                    .hover((s) => s.bg(t.hover))
-                    .on_click((_e, cx) => {
-                      this.selectedEpicId = active ? null : id;
-                      this.chainFocusId = null;
-                      cx.notify();
-                    })
-                    .child(
-                      h_flex()
-                        .justify_between()
-                        .items_center()
-                        .gap(6)
-                        .child(div().text_size(10.5).font_family(monoFont).text_color(t.accent).child(id))
-                        .child(div().text_size(10.5).font_family(monoFont).text_color(t.muted).child(`${done}/${total} (${pct}%)`)),
-                    )
-                    .child(div().text_size(12).font_medium().text_color(t.foreground).child(ep.title || id))
-                    .child(this.renderProgressBar(t, id, pct));
-                }),
-              )
+              .children(this.renderEpicGroups(t, { visibleEpics, projects, monoFont }))
               .when(visibleEpics.length === 0 && epics.length > 0, (el) =>
                 el.child(
                   div()
@@ -636,8 +685,402 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip = true, showEphemeral = false, onToggleShowEphemeral }) {
-    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showWip, showEphemeral });
+  projectGroups(projects, items, projectFilter) {
+    if (!Array.isArray(projects) || projects.length < 2) {
+      return [{ id: null, project: null, items }];
+    }
+    const active =
+      projectFilter && projectFilter !== "all"
+        ? projects.filter((project) => project.id === projectFilter)
+        : projects;
+    return active.map((project) => ({
+      id: project.id,
+      project,
+      items: items.filter((item) => item.projectId === project.id),
+    }));
+  }
+
+  scopeItems(items, epics, selectedEpic, { showWip = true, showEphemeral = false } = {}) {
+    void epics;
+    const epicChildIds = selectedEpic
+      ? new Set((selectedEpic.children ?? []).map((child) => child.id || child.beadId).filter(Boolean))
+      : null;
+    return items.filter((it) => {
+      if (it.issueType === "epic") return false;
+      if (it.isWip) {
+        if (!showWip && !(showEphemeral && it.ephemeral)) return false;
+      } else if (it.ephemeral && !showEphemeral) {
+        return false;
+      }
+      if (selectedEpic) {
+        const key = it.id || it.beadId;
+        const inEpic =
+          it.parent === selectedEpic.rawId ||
+          it.parent === selectedEpic.id ||
+          (epicChildIds && epicChildIds.has(key)) ||
+          (it.rawId && it.rawId.startsWith(`${selectedEpic.rawId}.`));
+        if (!inEpic) return false;
+      }
+      if (!this.showClosedInWaves && (it.bdStatus === "closed" || it.column === "closed")) return false;
+      return true;
+    });
+  }
+
+  renderWaveNode(t, it, { activeChainId, upstream, downstream, blockersOf, unlocksOf, scopedItems, onSelectItem, monoFont }) {
+    const id = it.beadId || it.id;
+    const isFocused = activeChainId === id;
+    const isUpstream = upstream.has(id);
+    const isDownstream = downstream.has(id);
+    const dimmed = Boolean(activeChainId) && !isFocused && !isUpstream && !isDownstream;
+    const blockers = blockersOf.get(id) ?? [];
+    const unlocks = unlocksOf.get(id) ?? [];
+    const col = statusColor(it.agentStatus || it.column || it.status, t);
+    const borderCol = isFocused
+      ? t.accent
+      : isUpstream
+        ? t.blocked
+        : isDownstream
+          ? t.done
+          : t.border;
+    const jumpTo = (targetId, cx) => {
+      this.chainFocusId = targetId;
+      const target = scopedItems.find((x) => (x.beadId || x.id) === targetId);
+      if (target) onSelectItem?.(target, cx);
+      cx.notify();
+    };
+
+    return v_flex()
+      .id(`deps-node-${it.id}`)
+      .p(9)
+      .gap(6)
+      .rounded(7)
+      .border_1()
+      .border_color(borderCol)
+      .bg(isFocused ? t.selected : t.surface)
+      .when(dimmed, (el) => el.opacity(0.42))
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => {
+        this.chainFocusId = this.chainFocusId === id ? null : id;
+        onSelectItem?.(it, cx);
+        cx.notify();
+      })
+      .child(
+        h_flex()
+          .items_center()
+          .justify_between()
+          .gap(6)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(5)
+              .child(div().text_size(11).font_family(monoFont).text_color(it.projectColor || t.accent).child(it.rawId || id))
+              .when(Boolean(it.projectName), (el) => el.child(pill(t, it.projectName, it.projectColor || t.accent)))
+              .when(Boolean(it.isWip), (el) => el.child(pill(t, "WIP", t.working || t.accent)))
+              .when(Boolean(it.ephemeral && !it.isWip), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
+              .when(it.priority !== undefined && it.priority !== null, (el) =>
+                el.child(pill(t, `P${it.priority}`, it.priority <= 1 ? t.ansi1 : t.muted)),
+              ),
+          )
+          .child(pill(t, it.column || it.status || "open", col)),
+      )
+      .child(div().text_size(12).font_medium().line_height("16px").text_color(t.foreground).child(it.title || id))
+      .when(isUpstream || isDownstream, (el) =>
+        el.child(
+          div()
+            .text_size(10.5)
+            .font_semibold()
+            .text_color(isUpstream ? t.blocked : t.done)
+            .child(isUpstream ? "↑ Upstream Blocker" : "↓ Downstream Unlocked"),
+        ),
+      )
+      .when(blockers.length > 0, (el) =>
+        el.child(
+          h_flex()
+            .gap(4)
+            .flex_wrap()
+            .items_center()
+            .child(div().text_size(10).text_color(t.dim).child("Blocked by:"))
+            .children(
+              blockers.map((bid) =>
+                div()
+                  .id(`deps-blk-${it.id}-${bid}`)
+                  .px(5)
+                  .py(1)
+                  .rounded(4)
+                  .bg(alpha(t.blocked, "1e"))
+                  .text_size(10)
+                  .font_family(monoFont)
+                  .text_color(t.blocked)
+                  .cursor_pointer()
+                  .on_click((e, cx) => {
+                    cx.stop_propagation();
+                    jumpTo(bid, cx);
+                  })
+                  .child(bid),
+              ),
+            ),
+        ),
+      )
+      .when(unlocks.length > 0, (el) =>
+        el.child(
+          h_flex()
+            .gap(4)
+            .flex_wrap()
+            .items_center()
+            .child(div().text_size(10).text_color(t.dim).child("Unlocks:"))
+            .children(
+              unlocks.map((uid) =>
+                div()
+                  .id(`deps-unl-${it.id}-${uid}`)
+                  .px(5)
+                  .py(1)
+                  .rounded(4)
+                  .bg(alpha(t.done, "1e"))
+                  .text_size(10)
+                  .font_family(monoFont)
+                  .text_color(t.done)
+                  .cursor_pointer()
+                  .on_click((e, cx) => {
+                    cx.stop_propagation();
+                    jumpTo(uid, cx);
+                  })
+                  .child(uid),
+              ),
+            ),
+        ),
+      );
+  }
+
+  renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral }) {
+    return h_flex()
+      .gap(6)
+      .items_center()
+      .child(
+        div()
+          .id("deps-toggle-ephemeral")
+          .px(8)
+          .py(3)
+          .rounded(5)
+          .border_1()
+          .border_color(showEphemeral ? t.accent : t.border)
+          .bg(showEphemeral ? alpha(t.accent, "22") : t.raised)
+          .text_size(11)
+          .text_color(showEphemeral ? t.accent : t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, clickCx) => {
+            onToggleShowEphemeral?.(!showEphemeral, clickCx);
+          })
+          .child(showEphemeral ? "Showing Ephemeral" : "Show Ephemeral"),
+      )
+      .child(
+        div()
+          .id("deps-toggle-closed")
+          .px(8)
+          .py(3)
+          .rounded(5)
+          .border_1()
+          .border_color(this.showClosedInWaves ? t.accent : t.border)
+          .bg(this.showClosedInWaves ? alpha(t.accent, "22") : t.raised)
+          .text_size(11)
+          .text_color(this.showClosedInWaves ? t.accent : t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => {
+            this.showClosedInWaves = !this.showClosedInWaves;
+            cx.notify();
+          })
+          .child(this.showClosedInWaves ? "Showing Closed" : "Show Closed"),
+      );
+  }
+
+  /** Multi-project deps graph: one section per project, so blocks DAGs never mix. */
+  renderGroupedWaves(t, { epics, groups, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral }) {
+    const selectedEpic = this.selectedEpicId
+      ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
+      : null;
+    const sections = groups.map((group) => {
+      const scopedItems = this.scopeItems(group.items, epics, selectedEpic, { showWip, showEphemeral });
+      const graph = computeWaves(scopedItems);
+      const activeChainId =
+        this.chainFocusId ||
+        (scopedItems.some((it) => (it.beadId || it.id) === selectedId) ? selectedId : null);
+      const chain = collectChain(activeChainId, graph.blockersOf, graph.unlocksOf);
+      return {
+        group,
+        scopedItems,
+        waves: graph.waves,
+        blockersOf: graph.blockersOf,
+        unlocksOf: graph.unlocksOf,
+        activeChainId,
+        upstream: chain.upstream,
+        downstream: chain.downstream,
+      };
+    });
+    const totalNodes = sections.reduce((sum, section) => sum + section.scopedItems.length, 0);
+    const totalWaves = sections.reduce((sum, section) => sum + section.waves.length, 0);
+
+    return v_flex()
+      .id("deps-waves-pane")
+      .flex_1()
+      .min_w(0)
+      .h_full()
+      .min_h(0)
+      .rounded(8)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.surface)
+      .overflow_hidden()
+      .child(
+        h_flex()
+          .flex_none()
+          .h(36)
+          .px(12)
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .border_b(1)
+          .border_color(t.border)
+          .bg(t.chrome)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(8)
+              .child(
+                div()
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(
+                    selectedEpic
+                      ? `Dependency Waves · ${selectedEpic.title || selectedEpic.rawId}`
+                      : "Dependency Waves · All Projects",
+                  ),
+              )
+              .child(div().text_size(11).text_color(t.dim).child(`${totalNodes} nodes · ${totalWaves} waves · ${groups.length} projects`)),
+          )
+          .child(this.renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral })),
+      )
+      .child(
+        div()
+          .relative()
+          .flex_1()
+          .min_h(0)
+          .child(
+            v_flex()
+              .id("deps-waves-scroll")
+              .size_full()
+              .overflow_y_scroll()
+              .p(10)
+              .gap(12)
+              .when(totalNodes === 0, (el) =>
+                el.child(
+                  div()
+                    .p(16)
+                    .text_size(12.5)
+                    .text_color(t.dim)
+                    .child('No open dependency nodes in this scope. Toggle "Show Closed" to view completed items.'),
+                ),
+              )
+              .children(
+                sections.map((section) =>
+                  v_flex()
+                    .id(`deps-project-${section.group.id || "all"}`)
+                    .gap(8)
+                    .rounded(8)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.canvas)
+                    .p(10)
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .gap(6)
+                        .child(div().size(8).rounded(4).bg(section.group.project?.color || t.accent))
+                        .child(
+                          div()
+                            .text_size(12)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(section.group.project?.name || "All Projects"),
+                        )
+                        .child(
+                          div()
+                            .text_size(11)
+                            .text_color(t.dim)
+                            .child(`${section.scopedItems.length} nodes · ${section.waves.length} waves`),
+                        )
+                        .when(Boolean(section.activeChainId), (el) =>
+                          el.child(
+                            pill(
+                              t,
+                              `Chain: ${section.activeChainId} (↑${section.upstream.size} ↓${section.downstream.size})`,
+                              t.accent,
+                            ),
+                          ),
+                        ),
+                    )
+                    .when(section.scopedItems.length === 0, (el) =>
+                      el.child(div().text_size(11.5).text_color(t.dim).child("No open items for this project.")),
+                    )
+                    .children(
+                      section.waves.map((wave) =>
+                        v_flex()
+                          .gap(6)
+                          .child(
+                            h_flex()
+                              .items_center()
+                              .gap(6)
+                              .child(div().text_size(11).font_semibold().text_color(t.muted).child(wave.label))
+                              .child(div().text_size(10.5).text_color(t.dim).child(`${wave.items.length}`)),
+                          )
+                          .child(
+                            h_flex()
+                              .flex_wrap()
+                              .gap(8)
+                              .items_start()
+                              .children(
+                                wave.items.map((it) =>
+                                  div().w(280).flex_none().child(
+                                    this.renderWaveNode(t, it, {
+                                      activeChainId: section.activeChainId,
+                                      upstream: section.upstream,
+                                      downstream: section.downstream,
+                                      blockersOf: section.blockersOf,
+                                      unlocksOf: section.unlocksOf,
+                                      scopedItems: section.scopedItems,
+                                      onSelectItem,
+                                      monoFont,
+                                    }),
+                                  ),
+                                ),
+                              ),
+                          ),
+                      ),
+                    ),
+                ),
+              ),
+          )
+          .child(Scrollbar.vertical("deps-waves-scroll").absolute().inset_0()),
+      );
+  }
+
+  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all" }) {
+    const groups = this.projectGroups(projects, items, projectFilter);
+    if (groups.length > 1) {
+      return this.renderGroupedWaves(t, {
+        epics,
+        groups,
+        onSelectItem,
+        selectedId,
+        monoFont,
+        showWip,
+        showEphemeral,
+        onToggleShowEphemeral,
+      });
+    }
+    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showWip, showEphemeral, projectFilter });
     const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
     this._minWavesContentW = minContentW;
     this.clampWavesScrollX(minContentW);
@@ -826,131 +1269,18 @@ export class DepsController {
                             .p(8)
                             .gap(8)
                             .children(
-                          wave.items.map((it) => {
-                            const id = it.beadId || it.id;
-                            const isFocused = activeChainId === id;
-                            const isUpstream = upstream.has(id);
-                            const isDownstream = downstream.has(id);
-                            const dimmed = Boolean(activeChainId) && !isFocused && !isUpstream && !isDownstream;
-                            const blockers = blockersOf.get(id) ?? [];
-                            const unlocks = unlocksOf.get(id) ?? [];
-                            const col = statusColor(it.agentStatus || it.column || it.status, t);
-
-                            const borderCol = isFocused
-                              ? t.accent
-                              : isUpstream
-                                ? t.blocked
-                                : isDownstream
-                                  ? t.done
-                                  : t.border;
-
-                            return v_flex()
-                              .id(`deps-node-${id}`)
-                              .p(9)
-                              .gap(6)
-                              .rounded(7)
-                              .border_1()
-                              .border_color(borderCol)
-                              .bg(isFocused ? t.selected : t.surface)
-                              .when(dimmed, (el) => el.opacity(0.42))
-                              .cursor_pointer()
-                              .hover((s) => s.bg(t.hover))
-                              .on_click((_e, cx) => {
-                                this.chainFocusId = this.chainFocusId === id ? null : id;
-                                onSelectItem?.(it, cx);
-                                cx.notify();
-                              })
-                              .child(
-                                h_flex()
-                                  .items_center()
-                                  .justify_between()
-                                  .gap(6)
-                                  .child(
-                                    h_flex()
-                                      .items_center()
-                                      .gap(5)
-                                      .child(div().text_size(11).font_family(monoFont).text_color(t.accent).child(id))
-                                      .when(Boolean(it.isWip), (el) => el.child(pill(t, "WIP", t.working || t.accent)))
-                                      .when(Boolean(it.ephemeral && !it.isWip), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
-                                      .when(it.priority !== undefined && it.priority !== null, (el) =>
-                                        el.child(pill(t, `P${it.priority}`, it.priority <= 1 ? t.ansi1 : t.muted)),
-                                      ),
-                                  )
-                                  .child(pill(t, it.column || it.status || "open", col)),
-                              )
-                              .child(div().text_size(12).font_medium().line_height("16px").text_color(t.foreground).child(it.title || id))
-                              .when(isUpstream || isDownstream, (el) =>
-                                el.child(
-                                  div()
-                                    .text_size(10.5)
-                                    .font_semibold()
-                                    .text_color(isUpstream ? t.blocked : t.done)
-                                    .child(isUpstream ? "↑ Upstream Blocker" : "↓ Downstream Unlocked"),
-                                ),
-                              )
-                              .when(blockers.length > 0, (el) =>
-                                el.child(
-                                  h_flex()
-                                    .gap(4)
-                                    .flex_wrap()
-                                    .items_center()
-                                    .child(div().text_size(10).text_color(t.dim).child("Blocked by:"))
-                                    .children(
-                                      blockers.map((bid) =>
-                                        div()
-                                          .id(`deps-blk-${id}-${bid}`)
-                                          .px(5)
-                                          .py(1)
-                                          .rounded(4)
-                                          .bg(alpha(t.blocked, "1e"))
-                                          .text_size(10)
-                                          .font_family(monoFont)
-                                          .text_color(t.blocked)
-                                          .cursor_pointer()
-                                          .on_click((e, cx) => {
-                                            cx.stop_propagation();
-                                            this.chainFocusId = bid;
-                                            const target = scopedItems.find((x) => (x.beadId || x.id) === bid);
-                                            if (target) onSelectItem?.(target, cx);
-                                            cx.notify();
-                                          })
-                                          .child(bid),
-                                      ),
-                                    ),
-                                ),
-                              )
-                              .when(unlocks.length > 0, (el) =>
-                                el.child(
-                                  h_flex()
-                                    .gap(4)
-                                    .flex_wrap()
-                                    .items_center()
-                                    .child(div().text_size(10).text_color(t.dim).child("Unlocks:"))
-                                    .children(
-                                      unlocks.map((uid) =>
-                                        div()
-                                          .id(`deps-unl-${id}-${uid}`)
-                                          .px(5)
-                                          .py(1)
-                                          .rounded(4)
-                                          .bg(alpha(t.done, "1e"))
-                                          .text_size(10)
-                                          .font_family(monoFont)
-                                          .text_color(t.done)
-                                          .cursor_pointer()
-                                          .on_click((e, cx) => {
-                                            cx.stop_propagation();
-                                            this.chainFocusId = uid;
-                                            const target = scopedItems.find((x) => (x.beadId || x.id) === uid);
-                                            if (target) onSelectItem?.(target, cx);
-                                            cx.notify();
-                                          })
-                                          .child(uid),
-                                      ),
-                                    ),
-                                ),
-                              );
-                          }),
+                          wave.items.map((it) =>
+                            this.renderWaveNode(t, it, {
+                              activeChainId,
+                              upstream,
+                              downstream,
+                              blockersOf,
+                              unlocksOf,
+                              scopedItems,
+                              onSelectItem,
+                              monoFont,
+                            }),
+                          ),
                             ),
                         )
                         .child(
@@ -968,7 +1298,7 @@ export class DepsController {
       );
   }
 
-  renderMirrorTable(t, mirrors, monoFont) {
+  renderMirrorTable(t, mirrors, monoFont, { multi = false } = {}) {
     return v_flex()
       .size_full()
       .min_h(0)
@@ -998,6 +1328,7 @@ export class DepsController {
           .text_size(10.5)
           .font_semibold()
           .text_color(t.dim)
+          .when(multi, (el) => el.child(div().w(110).flex_none().child("PROJECT")))
           .child(div().w(140).flex_none().child("GROUP ID"))
           .child(div().w(130).flex_none().child("TARGET BRANCH"))
           .child(div().w(90).flex_none().child("STATUS"))
@@ -1021,13 +1352,22 @@ export class DepsController {
               const sha = m.commit_sha ?? m.CommitSHA ?? "";
               const detail = m.detail ?? m.Detail ?? "";
               return h_flex()
-                .id(`mirror-row-${groupId}-${idx}`)
+                .id(`mirror-row-${m.projectId || "p"}-${groupId}-${idx}`)
                 .flex_none()
                 .min_h(30)
                 .px(12)
                 .py(5)
                 .gap(10)
                 .items_center()
+                .when(multi, (el) =>
+                  el.child(
+                    div()
+                      .w(110)
+                      .flex_none()
+                      .truncate()
+                      .child(pill(t, m.projectName || "-", m.projectColor || t.accent)),
+                  ),
+                )
                 .border_b(1)
                 .border_color(t.border)
                 .text_size(11.5)
@@ -1041,7 +1381,7 @@ export class DepsController {
       );
   }
 
-  renderMirrorAndEvents(t, { queue, mirrors, events, onSelectItem, monoFont }, _cx) {
+  renderMirrorAndEvents(t, { queue, mirrors, events, onSelectItem, monoFont, multi = false, projectBar = null }, _cx) {
     const q = this.eventFilter.trim().toLowerCase();
     const filteredEvents = events.filter((ev) => {
       if (!q) return true;
@@ -1055,6 +1395,7 @@ export class DepsController {
       .min_h(0)
       .p(10)
       .gap(8)
+      .when(Boolean(projectBar), (el) => el.child(projectBar))
       .child(
         v_flex()
           .flex_none()
@@ -1064,7 +1405,7 @@ export class DepsController {
           .border_color(t.border)
           .bg(t.surface)
           .overflow_hidden()
-          .child(this.renderMirrorTable(t, mirrors, monoFont)),
+          .child(this.renderMirrorTable(t, mirrors, monoFont, { multi })),
       )
       .child(
         v_flex()
@@ -1135,10 +1476,14 @@ export class DepsController {
                       const statusKey = ev.kind ?? ev.Kind ?? to ?? from ?? "event";
                       const detail = ev.detail ?? ev.Detail ?? ev.message ?? "";
                       const linkedItem =
-                        (queue?.items ?? []).find((it) => it.taskId === taskId || it.id === taskId || it.beadId === taskId) ?? null;
+                        (queue?.items ?? []).find(
+                          (it) =>
+                            (!ev.projectId || it.projectId === ev.projectId) &&
+                            (it.taskId === taskId || it.id === taskId || it.rawId === taskId || it.beadId === taskId),
+                        ) ?? null;
 
                       return h_flex()
-                        .id(`global-ev-${ev.id ?? idx}`)
+                        .id(`global-ev-${ev.projectId || "p"}-${ev.id ?? idx}`)
                         .flex_none()
                         .min_h(28)
                         .px(10)
@@ -1148,6 +1493,9 @@ export class DepsController {
                         .rounded(6)
                         .when(Boolean(linkedItem), (el) =>
                           el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => onSelectItem?.(linkedItem, cx)),
+                        )
+                        .when(Boolean(ev.projectName), (el) =>
+                          el.child(pill(t, ev.projectName, ev.projectColor || t.accent)),
                         )
                         .child(div().w(115).flex_none().font_family(monoFont).text_size(11).text_color(t.dim).child(formatTimestamp(ev.created_at ?? ev.CreatedAt)))
                         .child(div().w(120).flex_none().truncate().font_family(monoFont).text_size(11).text_color(t.accent).child(taskId || "-"))

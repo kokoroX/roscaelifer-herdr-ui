@@ -22,9 +22,13 @@ import {
   detectRepoFromPath,
   hasLiveBeadsDir,
   loadGlobalProjectsConfig,
+  normalizePanelMode,
+  PANEL_MODE_MULTI,
+  PANEL_MODE_SINGLE,
   repoIdentityKey,
   saveActiveProjectMirror,
   saveGlobalProjectsConfig,
+  setPanelProjectsConfig,
   upsertGlobalProject,
 } from "./store.js";
 
@@ -99,6 +103,12 @@ export class DialogController {
     this.formulas = Array.isArray(p.formulas) ? p.formulas : [];
     this.envs = Array.isArray(p.envs) ? p.envs : [];
     this.items = Array.isArray(p.items) ? p.items : [];
+    // Multi-project panel: `projects` entries are `{ id, name, ctx }` as sent by
+    // the panel, so dialogs can target any pinned project and route actions.
+    this.projects = Array.isArray(p.projects) ? p.projects.filter((entry) => entry?.id) : [];
+    this.projectsById = new Map(this.projects.map((entry) => [entry.id, entry]));
+    this.targetProjectId =
+      p.targetProjectId || this.ctx?.projectId || this.projects[0]?.id || "";
 
     this.handle = cx.focus_handle();
     this.scroll = ScrollHandle.new();
@@ -123,7 +133,7 @@ export class DialogController {
     this.selectHighlight = 0;
     this.selectFocus = {};
     this.listFocus = {};
-    for (const key of ["formula", "env", "priority", "type", "blocks", "model"]) {
+    for (const key of ["formula", "env", "priority", "type", "blocks", "model", "target-project"]) {
       this.selectFocus[key] = cx.focus_handle();
       this.listFocus[key] = cx.focus_handle();
     }
@@ -183,14 +193,7 @@ export class DialogController {
 
       this.titleInput.focus();
       cx.timer.after(120, () => this.titleInput.focus());
-      cx.spawn(async (probeCx) => {
-        try {
-          this.hasBd = await hasLiveBeadsDir(this.ctx);
-        } catch {
-          this.hasBd = false;
-        }
-        probeCx.notify();
-      });
+      this.probeBd(cx);
     } else if (this.dialogType === "reject") {
       this.feedbackInput = TextareaState.new({ placeholder: "Explain why this review is rejected and what needs fixing…", rows: 5 });
       this.feedbackFocused = true;
@@ -209,6 +212,12 @@ export class DialogController {
       this.feedbackInput.focus();
       cx.timer.after(120, () => this.feedbackInput.focus());
     } else if (this.dialogType === "clean-preview") {
+      // "Clean Pending" from the multi-project top bar cleans every pinned
+      // project; a per-card Clean still targets a single project.
+      this.cleanProjects =
+        Array.isArray(p.projects) && p.projects.length > 1 && !p.target
+          ? p.projects.filter((entry) => entry?.id && entry?.ctx)
+          : [];
       this.preview = p.cleanPreview ? normalizeCleanPreview(p.cleanPreview) : null;
       this.loadingPreview = !this.preview;
       this.handle.focus();
@@ -217,6 +226,10 @@ export class DialogController {
       }
     } else if (this.dialogType === "repo-config" || this.dialogType === "project-config") {
       this.projectsConfig = p.projectsConfig || { version: 1, activeProject: "", projects: [] };
+      this.panelMode = normalizePanelMode(this.projectsConfig.panelMode);
+      this.pinnedProjects = Array.isArray(this.projectsConfig.pinnedProjects)
+        ? [...this.projectsConfig.pinnedProjects]
+        : [];
       this.editingProjectId = null;
       this.projectFormTouched = false;
       this.autoProjectName = "";
@@ -261,6 +274,10 @@ export class DialogController {
       cx.spawn(async (loadCx) => {
         try {
           this.projectsConfig = await loadGlobalProjectsConfig();
+          this.panelMode = normalizePanelMode(this.projectsConfig.panelMode);
+          this.pinnedProjects = Array.isArray(this.projectsConfig.pinnedProjects)
+            ? [...this.projectsConfig.pinnedProjects]
+            : [];
           if (!this.projectFormTouched) this.setProjectForm(this.resolveProjectForForm(), false);
         } catch (err) {
           this.error = String(err?.message ?? err);
@@ -276,6 +293,72 @@ export class DialogController {
     if (overlayId) closeOverlay(overlayId);
   }
 
+  probeBd(cx) {
+    this.hasBd = null;
+    const spawnCx = cx && typeof cx.spawn === "function" ? cx : null;
+    if (!spawnCx) {
+      cx?.notify?.();
+      return;
+    }
+    spawnCx.spawn(async (probeCx) => {
+      try {
+        this.hasBd = await hasLiveBeadsDir(this.ctx);
+      } catch {
+        this.hasBd = false;
+      }
+      probeCx.notify();
+    });
+  }
+
+  projectSelectOptions() {
+    return this.projects.map((entry) => ({
+      value: entry.id,
+      label: entry.name || entry.id,
+    }));
+  }
+
+  setTargetProject(projectId, cx) {
+    this.targetProjectId = projectId;
+    const entry = this.projectsById.get(projectId);
+    if (entry?.ctx) {
+      const previousProjectId = this.ctx?.projectId || "";
+      const previousRepo = String(this.ctx?.repo || "").replace(/\/+$/, "");
+      this.ctx = { ...entry.ctx };
+      if (previousProjectId && previousProjectId !== projectId) {
+        // Blocked-by selections belong to the previous project's bead ids.
+        this.blocksSelected = [];
+        this.blocksInput?.set_value?.("");
+      }
+      if (this.cwdInput) {
+        const currentCwd = String(this.cwdInput.value() || "").trim();
+        if (!currentCwd || currentCwd === previousRepo) {
+          this.cwdInput.set_value(entry.ctx.repo || "");
+        }
+      }
+      if (this.dialogType === "create" || this.dialogType === "create-wip") {
+        this.probeBd(cx);
+      }
+    }
+    cx?.notify?.();
+  }
+
+  renderTargetProject(t) {
+    if (this.projects.length < 2) return null;
+    return v_flex()
+      .gap(5)
+      .child(div().text_size(11.5).font_medium().text_color(t.muted).child("Target Project"))
+      .child(
+        this.renderSelect(
+          t,
+          "target-project",
+          "Target Project",
+          this.projectSelectOptions(),
+          this.targetProjectId,
+          (value, cx) => this.setTargetProject(value, cx),
+        ),
+      );
+  }
+
   cleanTarget() {
     const t = this.p.target;
     if (!t) return {};
@@ -288,8 +371,34 @@ export class DialogController {
     this.error = null;
     cx.spawn(async (cx) => {
       try {
-        const res = await this.actions.cleanPreview(this.cleanTarget());
-        this.preview = normalizeCleanPreview(res);
+        if (this.cleanProjects.length > 1) {
+          const settled = await Promise.allSettled(
+            this.cleanProjects.map(async (entry) => ({
+              entry,
+              preview: normalizeCleanPreview(await this.actions.cleanPreview({ ctx: entry.ctx })),
+            })),
+          );
+          const actions = [];
+          const errors = [];
+          settled.forEach((result, index) => {
+            const entry = this.cleanProjects[index];
+            const name = entry?.name || entry?.id || `project-${index + 1}`;
+            if (result.status === "fulfilled") {
+              for (const action of result.value.preview.actions) {
+                actions.push({ ...action, projectId: entry.id, projectName: name });
+              }
+              for (const err of result.value.preview.errors) {
+                errors.push(`${name}: ${err}`);
+              }
+            } else {
+              errors.push(`${name}: ${result.reason?.message || String(result.reason)}`);
+            }
+          });
+          this.preview = { actions, errors, empty: actions.length === 0 && errors.length === 0 };
+        } else {
+          const res = await this.actions.cleanPreview(this.cleanTarget());
+          this.preview = normalizeCleanPreview(res);
+        }
       } catch (err) {
         this.error = String(err?.message ?? err);
       } finally {
@@ -299,10 +408,43 @@ export class DialogController {
     });
   }
 
+  executeCleanAll(cx) {
+    if (this.busy) return;
+    this.busy = true;
+    this.error = null;
+    cx.notify();
+    cx.spawn(async (cleanCx) => {
+      try {
+        const targets = this.cleanProjects.filter((entry) => entry?.ctx);
+        const settled = await Promise.allSettled(
+          targets.map((entry) => this.actions.executeClean({ ctx: entry.ctx })),
+        );
+        const failures = settled
+          .map((result, index) =>
+            result.status === "rejected"
+              ? `${targets[index]?.name || index}: ${result.reason?.message || String(result.reason)}`
+              : null,
+          )
+          .filter(Boolean);
+        if (failures.length > 0) {
+          this.error = `${failures.length}/${targets.length} projects failed · ${failures.join(" | ")}`;
+          return;
+        }
+        setShared("roscaelifer.refresh", Date.now());
+        this.close();
+      } catch (err) {
+        this.error = String(err?.message ?? err);
+      } finally {
+        this.busy = false;
+        cleanCx.notify();
+      }
+    });
+  }
+
   submit(cx, dispatchNow = false) {
     if (this.busy) return;
     if (this.dialogType === "enqueue") {
-      const beadId = this.item?.beadId || this.item?.id;
+      const beadId = this.item?.beadId || this.item?.rawId || this.item?.id;
       if (!beadId) {
         this.error = "Missing bead ID.";
         cx.notify();
@@ -384,7 +526,7 @@ export class DialogController {
     }
 
     if (this.dialogType === "reject") {
-      const beadId = this.item?.beadId || this.item?.id;
+      const beadId = this.item?.beadId || this.item?.rawId || this.item?.id;
       const feedback = this.feedbackInput.value().trim();
       if (!beadId) {
         this.error = "Missing bead ID.";
@@ -402,6 +544,10 @@ export class DialogController {
     }
 
     if (this.dialogType === "clean-preview") {
+      if (this.cleanProjects.length > 1) {
+        this.executeCleanAll(cx);
+        return;
+      }
       this.runMutation(cx, () => this.actions.executeClean(this.cleanTarget()));
       return;
     }
@@ -437,6 +583,18 @@ export class DialogController {
       cx.spawn(async (saveCx) => {
         try {
           const result = await upsertGlobalProject(nextProject, this.editingProjectId);
+          const pinned = [...this.pinnedProjects];
+          if (this.panelMode === PANEL_MODE_MULTI && !pinned.includes(result.project.id)) {
+            pinned.push(result.project.id);
+          }
+          const saved = await setPanelProjectsConfig({
+            panelMode: this.panelMode,
+            pinnedProjects: pinned,
+            activeProject: result.project.id,
+          });
+          this.projectsConfig = saved;
+          this.pinnedProjects = saved.pinnedProjects;
+          this.panelMode = saved.panelMode;
           const savedCtx = { ...result.project, projectId: result.project.id, source: "project" };
           saveActiveProjectMirror(result.project);
           setShared("roscaelifer.ctxOverride", { ...savedCtx, updatedAt: Date.now() });
@@ -610,7 +768,7 @@ export class DialogController {
           cx.notify();
         } else if (e.key === "enter") {
           const opt = options[this.selectHighlight] ?? options[0];
-          if (opt) onPick(opt.value);
+          if (opt) onPick(opt.value, cx);
           this.openSelect = null;
           this._selectDismissedAt = null;
           triggerFocus.focus();
@@ -641,7 +799,7 @@ export class DialogController {
             .when(active || highlighted, (el) => el.bg(t.selected))
             .hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => {
-              onPick(opt.value);
+              onPick(opt.value, cx);
               this.openSelect = null;
               this._selectDismissedAt = null;
               triggerFocus.focus();
@@ -671,7 +829,7 @@ export class DialogController {
           })
           .on_confirm((_e, cx) => {
             const opt = options[this.selectHighlight];
-            if (opt) onPick(opt.value);
+            if (opt) onPick(opt.value, cx);
             this.openSelect = null;
             cx.notify();
           })
@@ -764,7 +922,18 @@ export class DialogController {
   }
 
   renderCreate(t) {
-    const candidateItems = this.items.filter((it) => it.beadId && it.bdStatus !== "closed").slice(0, 40);
+    const targetPicker = this.renderTargetProject(t);
+    // Blocks may only reference beads in the target project; cross-project ids
+    // would create deps that the owning project's bd cannot resolve.
+    const targetProjectId = this.ctx?.projectId || "";
+    const candidateItems = this.items
+      .filter(
+        (it) =>
+          it.beadId &&
+          it.bdStatus !== "closed" &&
+          (!targetProjectId || !it.projectId || it.projectId === targetProjectId),
+      )
+      .slice(0, 40);
     const blockOptions = [
       { value: "", label: "(none — pick an existing bead to block)" },
       ...candidateItems.map((it) => ({ value: it.beadId, label: `${it.beadId} · ${it.title}` })),
@@ -772,6 +941,7 @@ export class DialogController {
 
     return v_flex()
       .gap(12)
+      .when(Boolean(targetPicker), (el) => el.child(targetPicker))
       .when(this.hasBd === false, (el) =>
         el.child(
           h_flex()
@@ -931,6 +1101,7 @@ export class DialogController {
   }
 
   renderCreateWip(t) {
+    const targetPicker = this.renderTargetProject(t);
     const activeMcps = new Set(
       this.mcpInput
         .value()
@@ -947,6 +1118,7 @@ export class DialogController {
 
     return v_flex()
       .gap(12)
+      .when(Boolean(targetPicker), (el) => el.child(targetPicker))
       .child(
         div()
           .px(10)
@@ -1199,7 +1371,7 @@ export class DialogController {
                   [act.task_id && act.step_id ? `${act.task_id}/${act.step_id}` : act.task_id || act.step_id, act.hc_address || act.pane_id || act.worktree || act.sidecar_file || act.path || act.target || act.marker]
                     .filter(Boolean)
                     .join(" · ");
-                const detail = [act.env, act.branch, act.session, act.worktree && act.hc_address ? act.worktree : null, act.detail, act.reason, ...sharedNotes]
+                const detail = [act.projectName, act.env, act.branch, act.session, act.worktree && act.hc_address ? act.worktree : null, act.detail, act.reason, ...sharedNotes]
                   .filter(Boolean)
                   .join(" · ");
                 return v_flex()
@@ -1377,6 +1549,10 @@ export class DialogController {
       try {
         const result = await deleteGlobalProject(this.editingProjectId);
         this.projectsConfig = result.config;
+        this.panelMode = normalizePanelMode(result.config.panelMode);
+        this.pinnedProjects = Array.isArray(result.config.pinnedProjects)
+          ? [...result.config.pinnedProjects]
+          : [];
         if (result.wasActive) {
           clearActiveProjectMirror();
           setShared("roscaelifer.ctxOverride", { __autoDetect: true, ts: Date.now() });
@@ -1401,6 +1577,8 @@ export class DialogController {
       try {
         const config = await loadGlobalProjectsConfig();
         config.activeProject = "";
+        config.panelMode = PANEL_MODE_SINGLE;
+        config.pinnedProjects = [];
         await saveGlobalProjectsConfig(config);
         clearActiveProjectMirror();
         setShared("roscaelifer.ctxOverride", { __autoDetect: true, ts: Date.now() });
@@ -1467,6 +1645,31 @@ export class DialogController {
       .gap(10)
       .child(div().text_size(12).text_color(t.dim).child("Manage saved projects (~/.config/roscaelifer/projects.json) or switch the active project."))
       .child(
+        v_flex()
+          .gap(5)
+          .child(div().text_size(11.5).font_medium().text_color(t.muted).child("Panel Mode"))
+          .child(
+            h_flex()
+              .gap(6)
+              .child(
+                this.renderPanelModeTab(t, PANEL_MODE_SINGLE, "Single Project", "Show only the active project."),
+              )
+              .child(
+                this.renderPanelModeTab(t, PANEL_MODE_MULTI, "Multi-Project Panel", "Mix pinned projects in one board (All Projects)."),
+              ),
+          )
+          .child(
+            div()
+              .text_size(11)
+              .text_color(t.dim)
+              .child(
+                this.panelMode === PANEL_MODE_MULTI
+                  ? "Check the projects to include. The board opens on All Projects and mixes their Beads / Roscaelifer columns."
+                  : "Single project mode uses the active project only.",
+              ),
+          ),
+      )
+      .child(
         h_flex().items_center().justify_between()
           .child(div().text_size(12).font_medium().text_color(t.foreground).child("Saved Projects"))
           .child(h_flex().gap(6)
@@ -1476,7 +1679,49 @@ export class DialogController {
       .when(projects.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().children(projects.map((project) => {
         const active = project.id === this.projectsConfig.activeProject;
         const selected = project.id === this.editingProjectId;
-        return div().id(`dlg-project-${project.id}`).px(8).py(5).rounded(6).border_1().border_color(active || selected ? t.accent : t.border).bg(active ? t.selected : t.raised).text_size(11.5).text_color(t.foreground).font_medium().cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.setProjectForm(project, false); cx.notify(); }).child(`${active ? "• " : ""}${projectLabel(project)}`);
+        const pinned = this.pinnedProjects.includes(project.id);
+        const showPin = this.panelMode === PANEL_MODE_MULTI;
+        return h_flex()
+          .id(`dlg-project-${project.id}`)
+          .px(8)
+          .py(5)
+          .gap(6)
+          .items_center()
+          .rounded(6)
+          .border_1()
+          .border_color(active || selected ? t.accent : t.border)
+          .bg(active ? t.selected : t.raised)
+          .text_size(11.5)
+          .text_color(t.foreground)
+          .font_medium()
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .when(showPin, (chip) =>
+            chip.child(
+              div()
+                .id(`dlg-project-pin-${project.id}`)
+                .size(14)
+                .rounded(4)
+                .border_1()
+                .border_color(pinned ? t.accent : t.input)
+                .bg(pinned ? t.accent : t.background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(10)
+                .text_color(t.accent_foreground)
+                .cursor_pointer()
+                .tooltip(pinned ? "Included in the panel" : "Include in the multi-project panel")
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  this.togglePinnedProject(project.id);
+                  cx.notify();
+                })
+                .child(pinned ? "✓" : ""),
+            ),
+          )
+          .on_click((_e, cx) => { this.setProjectForm(project, false); cx.notify(); })
+          .child(`${active ? "• " : ""}${projectLabel(project)}`);
       }))))
       .child(fieldRow("name", "Project Name", this.projectNameInput))
       .child(fieldRow("repo", "Project Root (optional)", this.repoInput, true))
@@ -1487,6 +1732,40 @@ export class DialogController {
       .child(fieldRow("formulasDir", "Formulas Directory", this.formulasDirInput, true))
       .child(fieldRow("bin", "roscaelifer Binary", this.binInput))
       .child(fieldRow("env", "Default Env (optional)", this.envInput));
+  }
+
+  renderPanelModeTab(t, mode, label, tooltip) {
+    const active = this.panelMode === mode;
+    return div()
+      .id(`dlg-panel-mode-${mode}`)
+      .px(10)
+      .py(5)
+      .rounded(6)
+      .border_1()
+      .border_color(active ? t.accent : t.input)
+      .bg(active ? t.selected : t.background)
+      .text_size(12)
+      .font_medium()
+      .text_color(active ? t.foreground : t.muted)
+      .cursor_pointer()
+      .tooltip(tooltip)
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_click((_e, cx) => {
+        this.panelMode = mode;
+        const activeId = this.editingProjectId || this.projectsConfig?.activeProject;
+        if (mode === PANEL_MODE_MULTI && this.pinnedProjects.length === 0 && activeId) {
+          this.pinnedProjects = [activeId];
+        }
+        this.error = null;
+        cx.notify();
+      })
+      .child(`${active ? "● " : ""}${label}`);
+  }
+
+  togglePinnedProject(projectId) {
+    this.pinnedProjects = this.pinnedProjects.includes(projectId)
+      ? this.pinnedProjects.filter((id) => id !== projectId)
+      : [...this.pinnedProjects, projectId];
   }
 
   render(_cx) {

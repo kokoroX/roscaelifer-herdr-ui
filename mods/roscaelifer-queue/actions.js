@@ -210,10 +210,10 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
     return busyKeys.has(key);
   }
 
-  async function runCli(args, { timeout = 30000, label = "roscaelifer" } = {}) {
-    const ctx = getCtx?.();
+  async function runCli(args, { timeout = 30000, label = "roscaelifer", ctx: ctxOverride = null } = {}) {
+    const ctx = ctxOverride || getCtx?.();
     if (!ctx) throw new Error("No project context selected");
-    const runner = (await getRunner?.()) || (await resolveBinary(ctx));
+    const runner = await resolveBinary(ctx);
     const res = await execRoscaelifer(ctx, runner, args, { timeout });
     if (res.code !== 0) {
       const msg = (res.stderr || res.stdout || `${label} exited with code ${res.code}`).trim();
@@ -222,14 +222,14 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
     return res;
   }
 
-  async function runBdExec(bdArgs, { timeout = 30000 } = {}) {
-    const ctx = getCtx?.();
+  async function runBdExec(bdArgs, { timeout = 30000, ctx: ctxOverride = null } = {}) {
+    const ctx = ctxOverride || getCtx?.();
     if (!ctx) throw new Error("No project context selected");
     const args = ["bd-exec"];
     if (ctx.bdDir) args.push("--bd-dir", ctx.bdDir);
     if (ctx.bdActor) args.push("--bd-actor", ctx.bdActor);
     args.push("--", ...bdArgs);
-    return runCli(args, { timeout, label: `bd ${bdArgs[0] || ""}`.trim() });
+    return runCli(args, { timeout, label: `bd ${bdArgs[0] || ""}`.trim(), ctx });
   }
 
   function tickArgs(ctx, { env = null, maxRunning = null, bdActive = true } = {}) {
@@ -276,12 +276,12 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
     const resolvedBdActive =
       bdActive === null || bdActive === undefined ? await hasLiveBeadsDir(ctx) : Boolean(bdActive);
     try {
-      const res = await runCli(ensureArgs(ctx, { maxRunning, bdActive: resolvedBdActive }), { timeout: 15000, label: "ensure" });
+      const res = await runCli(ensureArgs(ctx, { maxRunning, bdActive: resolvedBdActive }), { timeout: 15000, label: "ensure", ctx });
       return parseJsonTolerant(res);
     } catch (err) {
       const msg = formatError(err);
       if (allowTickFallback && /unknown command[：: ]+["']?ensure\b/i.test(msg)) {
-        await runCli(tickArgs(ctx, { env, maxRunning, bdActive: resolvedBdActive }), { timeout: 60000, label: "tick" });
+        await runCli(tickArgs(ctx, { env, maxRunning, bdActive: resolvedBdActive }), { timeout: 60000, label: "tick", ctx });
         return {};
       }
       throw err;
@@ -365,20 +365,56 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
     isBusy,
 
     tick(opts = {}, cx = null) {
-      const ctx = getCtx?.();
+      const ctx = opts.ctx || getCtx?.();
       return enqueueSerialized(
         "tick",
         "Tick",
         async () => {
           const bdActive = await hasLiveBeadsDir(ctx);
-          return runCli(tickArgs(ctx, { env: opts.env || null, maxRunning: opts.maxRunning ?? null, bdActive }), { timeout: 60000, label: "tick" });
+          return runCli(tickArgs(ctx, { env: opts.env || null, maxRunning: opts.maxRunning ?? null, bdActive }), { timeout: 60000, label: "tick", ctx });
         },
         { successBody: "Reconcile pass completed.", cx: opts?.cx || cx },
       );
     },
 
-    approveGate(taskId, stepId, cx = null) {
-      const ctx = getCtx?.();
+    /**
+     * Ticks every project concurrently in multi-project mode. One failing
+     * project never blocks the others; the notification summarises both.
+     */
+    tickProjects(ctxs = [], cx = null) {
+      const list = (Array.isArray(ctxs) ? ctxs : []).filter(Boolean);
+      if (list.length === 0) return Promise.reject(new Error("No project context selected"));
+      if (list.length === 1) return this.tick({ ctx: list[0] }, cx);
+      return enqueueSerialized(
+        "tick",
+        `Tick ${list.length} projects`,
+        async () => {
+          const settled = await Promise.allSettled(
+            list.map(async (ctx) => {
+              const bdActive = await hasLiveBeadsDir(ctx);
+              return runCli(
+                tickArgs(ctx, { bdActive }),
+                { timeout: 60000, label: "tick", ctx },
+              );
+            }),
+          );
+          const failures = settled
+            .map((entry, index) => (entry.status === "rejected" ? `${list[index]?.label || index}: ${formatError(entry.reason)}` : null))
+            .filter(Boolean);
+          if (failures.length > 0) {
+            throw new Error(`${failures.length}/${list.length} projects failed · ${failures.join(" | ")}`);
+          }
+          return { count: list.length };
+        },
+        {
+          successBody: (r) => `Tick completed for ${r?.count ?? list.length} projects.`,
+          cx,
+        },
+      );
+    },
+
+    approveGate(taskId, stepId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `approve:${taskId}:${stepId}`,
         `Approve ${taskId}`,
@@ -387,7 +423,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           if (ctx?.db) args.push("--db", ctx.db);
           if (ctx?.config) args.push("--config", ctx.config);
           args.push(String(taskId), String(stepId));
-          const res = await runCli(args, { timeout: 45000, label: "approve" });
+          const res = await runCli(args, { timeout: 45000, label: "approve", ctx });
           await ensureRunner(ctx, { allowTickFallback: false });
           return res;
         },
@@ -395,8 +431,8 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       );
     },
 
-    retryTask(taskId, stepId, cx = null) {
-      const ctx = getCtx?.();
+    retryTask(taskId, stepId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `retry:${taskId}:${stepId}`,
         `Retry ${taskId}`,
@@ -405,7 +441,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           if (ctx?.db) args.push("--db", ctx.db);
           if (ctx?.config) args.push("--config", ctx.config);
           args.push(String(taskId), String(stepId));
-          const res = await runCli(args, { timeout: 45000, label: "retry" });
+          const res = await runCli(args, { timeout: 45000, label: "retry", ctx });
           await ensureRunner(ctx, { allowTickFallback: false });
           return res;
         },
@@ -413,8 +449,8 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       );
     },
 
-    cancelTask(taskId, cx = null) {
-      const ctx = getCtx?.();
+    cancelTask(taskId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `cancel:${taskId}`,
         `Cancel ${taskId}`,
@@ -423,14 +459,14 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           if (ctx?.db) args.push("--db", ctx.db);
           if (ctx?.config) args.push("--config", ctx.config);
           args.push(String(taskId));
-          return runCli(args, { timeout: 45000, label: "cancel" });
+          return runCli(args, { timeout: 45000, label: "cancel", ctx });
         },
         { successBody: `Cancelled task ${taskId}`, cx },
       );
     },
 
-    async cleanPreview({ taskId, stepId } = {}) {
-      const ctx = getCtx?.();
+    async cleanPreview({ taskId, stepId, ctx: ctxOverride } = {}) {
+      const ctx = ctxOverride || getCtx?.();
       const args = ["clean", "--dry-run", "--json"];
       if (ctx?.db) args.push("--db", ctx.db);
       if (ctx?.config) args.push("--config", ctx.config);
@@ -440,7 +476,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       } else {
         args.push("--all-pending");
       }
-      const res = await runCli(args, { timeout: 30000, label: "clean --dry-run" });
+      const res = await runCli(args, { timeout: 30000, label: "clean --dry-run", ctx });
       try {
         return JSON.parse(res.stdout);
       } catch (err) {
@@ -448,8 +484,8 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       }
     },
 
-    executeClean({ taskId, stepId, cx: optCx } = {}, cx = null) {
-      const ctx = getCtx?.();
+    executeClean({ taskId, stepId, cx: optCx, ctx: ctxOverride } = {}, cx = null) {
+      const ctx = ctxOverride || getCtx?.();
       const key = taskId ? `clean:${taskId}` : "clean:all";
       return enqueueSerialized(
         key,
@@ -464,23 +500,23 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           } else {
             args.push("--all-pending");
           }
-          return runCli(args, { timeout: 60000, label: "clean" });
+          return runCli(args, { timeout: 60000, label: "clean", ctx });
         },
-        { successBody: taskId ? `Cleaned resources for ${taskId}` : "Cleaned all pending resources", cx: optCx || cx },
+        { successBody: taskId ? `Cleaned resources for ${taskId}` : "Cleaned pending resources", cx: optCx || cx },
       );
     },
 
     enqueueBead(
       beadId,
-      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = false, cx: optCx } = {},
+      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = false, cx: optCx, ctx: ctxOverride } = {},
       cx = null,
     ) {
-      const ctx = getCtx?.();
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `enqueue:${beadId}`,
         `Enqueue ${beadId}`,
         async () => {
-          await runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred }));
+          await runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred }), { ctx });
           const runnerResult = await ensureRunner(ctx, { allowTickFallback: false });
           return { runner: runnerResult };
         },
@@ -493,15 +529,15 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
 
     dispatchBead(
       beadId,
-      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = true, maxRunning, cx: optCx } = {},
+      { formula, env, currentLabels = [], bdStatus = null, wakeDeferred = true, maxRunning, cx: optCx, ctx: ctxOverride } = {},
       cx = null,
     ) {
-      const ctx = getCtx?.();
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `dispatch:${beadId}`,
         `Dispatch ${beadId}`,
         async () => {
-          await runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred }));
+          await runBdExec(beadUpdateArgs(beadId, { formula, env, currentLabels, bdStatus, wakeDeferred }), { ctx });
           const runnerResult = await ensureRunner(ctx, { env, maxRunning, allowTickFallback: true });
           return { runner: runnerResult };
         },
@@ -512,24 +548,25 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       );
     },
 
-    dequeueBead(beadId, cx = null) {
+    dequeueBead(beadId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `dequeue:${beadId}`,
         `Dequeue ${beadId}`,
-        async () => runBdExec(["update", beadId, "--remove-label", "roscaelifer"]),
+        async () => runBdExec(["update", beadId, "--remove-label", "roscaelifer"], { ctx }),
         { successBody: `Dequeued ${beadId}`, cx },
       );
     },
 
-    requeueBead(beadId, currentLabels = [], cx = null) {
-      return this.enqueueBead(beadId, { currentLabels }, cx);
+    requeueBead(beadId, currentLabels = [], cx = null, ctxOverride = null) {
+      return this.enqueueBead(beadId, { currentLabels, ctx: ctxOverride }, cx);
     },
 
-    createBead({ title, description, priority = 2, issueType = "task", formula, env, blocks, enqueue = false, cx: optCx } = {}, cx = null) {
+    createBead({ title, description, priority = 2, issueType = "task", formula, env, blocks, enqueue = false, cx: optCx, ctx: ctxOverride } = {}, cx = null) {
       if (!title || !String(title).trim()) {
         return Promise.reject(new Error("Title is required"));
       }
-      const ctx = getCtx?.();
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         "create-bead",
         "Create Bead",
@@ -557,7 +594,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           if (labels.length > 0) {
             bdArgs.push("--labels", labels.join(","));
           }
-          const res = await runBdExec(bdArgs);
+          const res = await runBdExec(bdArgs, { ctx });
           let createdId = null;
           try {
             const parsed = JSON.parse(res.stdout);
@@ -571,7 +608,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
               .map((s) => s.trim())
               .filter(Boolean);
             for (const targetId of targets) {
-              await runBdExec(["dep", "add", targetId, createdId, "--type", "blocks"]);
+              await runBdExec(["dep", "add", targetId, createdId, "--type", "blocks"], { ctx });
             }
           }
           const runnerResult = enqueue ? await ensureRunner(ctx, { allowTickFallback: false, bdActive: true }) : null;
@@ -596,6 +633,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
         env = "",
         priority = 2,
         cx: optCx,
+        ctx: ctxOverride,
       } = {},
       cx = null,
     ) {
@@ -603,7 +641,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       if (!trimmedTitle) {
         return Promise.reject(new Error("Title is required"));
       }
-      const ctx = getCtx?.();
+      const ctx = ctxOverride || getCtx?.();
       const trimmedDesc = String(description || "").trim();
       const formulaName = String(formula || "worker-inplace").trim() || "worker-inplace";
       const cwdVal = String(cwd || "").trim() || ctx?.repo || "";
@@ -648,7 +686,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
             if (Object.keys(metadata).length > 0) {
               bdArgs.push("--metadata", JSON.stringify(metadata));
             }
-            const res = await runBdExec(bdArgs);
+            const res = await runBdExec(bdArgs, { ctx });
             let createdId = null;
             try {
               const parsed = JSON.parse(res.stdout);
@@ -664,7 +702,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
             return { id: createdId, mode: "bd", runner: runnerResult };
           }
 
-          const runner = (await getRunner?.()) || (await resolveBinary(ctx));
+          const runner = await resolveBinary(ctx);
           if (runner?.supportsWip !== false) {
             const wipArgs = ["wip", "--json", "--bd=false"];
             if (ctx?.db) wipArgs.push("--db", ctx.db);
@@ -682,7 +720,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
             if (trimmedDesc) wipArgs.push("--body", trimmedDesc);
 
             try {
-              const res = await runCli(wipArgs, { timeout: 30000, label: "wip" });
+              const res = await runCli(wipArgs, { timeout: 30000, label: "wip", ctx });
               const parsed = await parseJsonTolerant(res);
               return {
                 id: parsed.task_id || parsed.bead_id || null,
@@ -710,7 +748,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
           if (envVal) addArgs.push("--var", `env=${envVal}`);
           if (mcpEncoded) addArgs.push("--var", `mcp_profile=${mcpEncoded}`);
 
-          const addRes = await runCli(addArgs, { timeout: 30000, label: "add" });
+          const addRes = await runCli(addArgs, { timeout: 30000, label: "add", ctx });
           const taskId = String(addRes.stdout || "").trim() || null;
           const runnerResult = await ensureRunner(ctx, {
             env: envVal || null,
@@ -727,47 +765,51 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       );
     },
 
-    approveReview(beadId, cx = null) {
+    approveReview(beadId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `approve-review:${beadId}`,
         `Approve Review ${beadId}`,
-        async () => runBdExec(["update", beadId, "--remove-label", "roscaelifer-review"]),
+        async () => runBdExec(["update", beadId, "--remove-label", "roscaelifer-review"], { ctx }),
         { successBody: `Approved ${beadId}`, cx },
       );
     },
 
-    closeBead(beadId, reason = "", cx = null) {
+    closeBead(beadId, reason = "", cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `close:${beadId}`,
         `Close ${beadId}`,
         async () => {
           const bdArgs = ["close", beadId];
           if (reason && String(reason).trim()) bdArgs.push("--reason", String(reason).trim());
-          return runBdExec(bdArgs);
+          return runBdExec(bdArgs, { ctx });
         },
         { successBody: `Closed ${beadId}`, cx },
       );
     },
 
-    rejectReview(beadId, feedback, cx = null) {
+    rejectReview(beadId, feedback, cx = null, ctxOverride = null) {
       const text = String(feedback || "").trim();
       if (!text) return Promise.reject(new Error("Review feedback is required"));
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `reject:${beadId}`,
         `Reject Review ${beadId}`,
         async () => {
-          await runBdExec(["update", beadId, "--append-notes", text]);
-          return runBdExec(["reopen", beadId]);
+          await runBdExec(["update", beadId, "--append-notes", text], { ctx });
+          return runBdExec(["reopen", beadId], { ctx });
         },
         { successBody: `Reopened ${beadId} with review feedback`, cx },
       );
     },
 
-    reopenBead(beadId, cx = null) {
+    reopenBead(beadId, cx = null, ctxOverride = null) {
+      const ctx = ctxOverride || getCtx?.();
       return enqueueSerialized(
         `reopen:${beadId}`,
         `Reopen ${beadId}`,
-        async () => runBdExec(["reopen", beadId]),
+        async () => runBdExec(["reopen", beadId], { ctx }),
         { successBody: `Reopened ${beadId}`, cx },
       );
     },

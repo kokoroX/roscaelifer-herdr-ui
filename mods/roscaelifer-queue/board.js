@@ -174,6 +174,91 @@ function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, on
     .child(label);
 }
 
+function projectPill(t, project, active, onClick) {
+  const hasError = Boolean(project.error);
+  return div()
+    .id(`project-filter-${project.id}`)
+    .h(22)
+    .px(7)
+    .gap(5)
+    .flex()
+    .items_center()
+    .rounded(5)
+    .bg(active ? t.selected : t.background)
+    .when(active, (el) => el.border_1().border_color(t.border))
+    .cursor_pointer()
+    .hover((s) => s.bg(t.hover))
+    .tooltip(
+      [
+        project.name || project.id,
+        Number.isFinite(project.itemCount) ? `${project.itemCount} items` : "",
+        hasError ? `error: ${project.error}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    )
+    .on_click((_e, cx) => {
+      cx.stop_propagation();
+      onClick?.();
+      cx.notify();
+    })
+    .child(div().size(7).rounded(4).bg(project.color || t.accent))
+    .child(
+      div()
+        .text_size(11.5)
+        .text_color(active ? t.foreground : t.muted)
+        .when(active, (el) => el.font_medium())
+        .child(project.name || project.id),
+    )
+    .when(Number.isFinite(project.itemCount), (el) =>
+      el.child(div().text_size(10.5).text_color(t.dim).child(String(project.itemCount))),
+    )
+    .when(hasError, (el) =>
+      el.child(
+        div()
+          .px(4)
+          .rounded(3)
+          .bg((t.ansi1 || t.blocked) + "28")
+          .text_size(10)
+          .font_semibold()
+          .text_color(t.ansi1 || t.blocked)
+          .child("!"),
+      ),
+    );
+}
+
+/** Shared `All Projects` + per-project filter pills for board and deps views. */
+export function renderProjectFilterPills(
+  t,
+  { projects = [], projectFilter = "all", onSelectProjectFilter, idPrefix = "project" } = {},
+) {
+  if (!Array.isArray(projects) || projects.length < 2) return null;
+  return h_flex()
+    .gap(6)
+    .items_center()
+    .child(
+      segmentTabs(`board-project-tabs-${idPrefix}`, t).child(
+        segmentTab(
+          `all-project-tab-${idPrefix}`,
+          "All Projects",
+          projectFilter === "all",
+          String(projects.reduce((sum, project) => sum + (project.itemCount || 0), 0)),
+          () => onSelectProjectFilter?.("all"),
+          t,
+        ),
+      ),
+    )
+    .child(
+      segmentTabs(`board-project-list-${idPrefix}`, t).children(
+        projects.map((project) =>
+          projectPill(t, project, projectFilter === project.id, () =>
+            onSelectProjectFilter?.(projectFilter === project.id ? "all" : project.id),
+          ),
+        ),
+      ),
+    );
+}
+
 export class BoardController {
   constructor(cx, { mode = "roscaelifer" } = {}) {
     this.mode = mode;
@@ -270,7 +355,10 @@ export class BoardController {
     return this._lastVisible;
   }
 
-  matchesFilter(item, { showWip = true, showEphemeral = false } = {}) {
+  matchesFilter(item, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
+    if (projectFilter && projectFilter !== "all" && item.projectId && item.projectId !== projectFilter) {
+      return false;
+    }
     if (item.isWip) {
       if (!showWip && !(showEphemeral && item.ephemeral)) {
         return false;
@@ -406,6 +494,7 @@ export class BoardController {
       bdStatus: item.bdStatus,
       wakeDeferred: item.bdStatus === "deferred",
       maxRunning: item.maxRunning ?? undefined,
+      ctx: item.projectCtx || undefined,
       ...extra,
     });
     const active = item.taskStatus === "active";
@@ -431,21 +520,21 @@ export class BoardController {
         btns.push(miniBtn(`act-app-${item.id}`, "Approve", {
           bg: t.solid, fg: t.solid_foreground,
           busy: actions.isBusy(`approve:${item.taskId}:${item.waitingStep.stepId}`),
-          onClick: (_e, cx) => actions.approveGate(item.taskId, item.waitingStep.stepId, cx),
+          onClick: (_e, cx) => actions.approveGate(item.taskId, item.waitingStep.stepId, cx, item.projectCtx),
         }));
       }
       if ((item.actionReason === "failed" || item.actionReason === "cancelled") && item.taskId && item.waitingStep) {
         btns.push(miniBtn(`act-retry-${item.id}`, "Retry", {
           bg: t.solid, fg: t.solid_foreground,
           busy: actions.isBusy(`retry:${item.taskId}:${item.waitingStep.stepId}`),
-          onClick: (_e, cx) => actions.retryTask(item.taskId, item.waitingStep.stepId, cx),
+          onClick: (_e, cx) => actions.retryTask(item.taskId, item.waitingStep.stepId, cx, item.projectCtx),
         }));
       }
       if (item.hasFailedLabel && item.beadId) {
         btns.push(miniBtn(`act-requeue-${item.id}`, "Re-queue", {
           bg: t.raised, fg: t.foreground, border: t.border,
           busy: actions.isBusy(`enqueue:${item.beadId}`),
-          onClick: (_e, cx) => actions.requeueBead(item.beadId, item.labels, cx),
+          onClick: (_e, cx) => actions.requeueBead(item.beadId, item.labels, cx, item.projectCtx),
         }));
       }
       if (withSession && item.hcAddress) addSessionButtons("action-");
@@ -458,7 +547,7 @@ export class BoardController {
           btns.push(miniBtn(`act-cancel-bead-${item.id}`, "Cancel", {
             bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
             busy: actions.isBusy(`cancel:${item.taskId}`),
-            onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+            onClick: (_e, cx) => actions.cancelTask(item.taskId, cx, item.projectCtx),
           }));
         }
       } else if (!item.isOptedIn) {
@@ -494,7 +583,7 @@ export class BoardController {
           miniBtn(`act-dequeue-${item.id}`, "Dequeue", {
             bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
             busy: actions.isBusy(`dequeue:${item.beadId}`),
-            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx),
+            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx, item.projectCtx),
           }),
         );
       }
@@ -509,7 +598,7 @@ export class BoardController {
         btns.push(miniBtn(`act-cancel-queue-${item.id}`, "Cancel", {
           bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
           busy: actions.isBusy(`cancel:${item.taskId}`),
-          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx, item.projectCtx),
         }));
       } else if (item.beadId) {
         // An opted-in bead that has no live task yet: ready to be dispatched.
@@ -530,7 +619,7 @@ export class BoardController {
           btns.push(miniBtn(`act-dequeue-queue-${item.id}`, "Dequeue", {
             bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
             busy: actions.isBusy(`dequeue:${item.beadId}`),
-            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx),
+            onClick: (_e, cx) => actions.dequeueBead(item.beadId, cx, item.projectCtx),
           }));
         }
       }
@@ -552,7 +641,7 @@ export class BoardController {
         btns.push(miniBtn(`act-cancel-ready-${item.id}`, "Cancel", {
           bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
           busy: actions.isBusy(`cancel:${item.taskId}`),
-          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+          onClick: (_e, cx) => actions.cancelTask(item.taskId, cx, item.projectCtx),
         }));
       }
     } else if (item.column === "running") {
@@ -560,7 +649,7 @@ export class BoardController {
       if (item.taskId) btns.push(miniBtn(`act-cancel-${item.id}`, "Cancel", {
         bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
         busy: actions.isBusy(`cancel:${item.taskId}`),
-        onClick: (_e, cx) => actions.cancelTask(item.taskId, cx),
+        onClick: (_e, cx) => actions.cancelTask(item.taskId, cx, item.projectCtx),
       }));
     } else if (item.column === "action") {
       addGateButtons();
@@ -569,7 +658,7 @@ export class BoardController {
         miniBtn(`act-pass-${item.id}`, "Pass", {
           bg: t.solid, fg: t.solid_foreground,
           busy: actions.isBusy(`approve-review:${item.beadId}`),
-          onClick: (_e, cx) => actions.approveReview(item.beadId, cx),
+          onClick: (_e, cx) => actions.approveReview(item.beadId, cx, item.projectCtx),
         }),
         miniBtn(`act-reject-${item.id}`, "Reject", {
           bg: t.raised, fg: t.ansi1 || t.blocked, border: t.border,
@@ -584,7 +673,7 @@ export class BoardController {
       if (item.beadId) btns.push(miniBtn(`act-reopen-${item.id}`, "Reopen", {
         bg: t.raised, fg: t.muted, border: t.border,
         busy: actions.isBusy(`reopen:${item.beadId}`),
-        onClick: (_e, cx) => actions.reopenBead(item.beadId, cx),
+        onClick: (_e, cx) => actions.reopenBead(item.beadId, cx, item.projectCtx),
       }));
     }
     if (!btns.length) return null;
@@ -603,7 +692,7 @@ export class BoardController {
     const actionRow = interactive
       ? this.renderCardActions(item, { actions, onOpenDialog }, t)
       : null;
-    const cardIdText = item.beadId && item.taskId ? `${item.beadId} · #${item.taskId}` : item.id;
+    const cardIdText = item.beadId && item.taskId ? `${item.beadId} · #${item.taskId}` : item.rawId || item.id;
     const cardCopyText = [
       cardIdText,
       String(item.title || ""),
@@ -673,7 +762,7 @@ export class BoardController {
               .truncate()
               .text_size(11)
               .text_color(t.muted)
-              .child(item.beadId && item.taskId ? `${item.beadId} · #${item.taskId}` : item.id),
+              .child(item.beadId && item.taskId ? `${item.beadId} · #${item.taskId}` : item.rawId || item.id),
           )
           .when(Boolean(item.agentStatus), (el) =>
             el.child(this.renderAgentStatus(item, t, { interactive })),
@@ -706,6 +795,15 @@ export class BoardController {
         h_flex()
           .flex_wrap()
           .gap(4)
+          .when(Boolean(item.projectName), (el) =>
+            el.child(
+              chip(
+                item.projectName,
+                item.projectColor || t.accent,
+                (item.projectColor || t.accent) + "22",
+              ),
+            ),
+          )
           .when(Boolean(item.formula), (el) =>
             el.child(chip(item.formula, t.foreground, t.raised, t.border)),
           )
@@ -772,12 +870,26 @@ export class BoardController {
     return true;
   }
 
-  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral } = {}) {
+  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter } = {}) {
     this.syncEnvFilter(queue);
     const envs = queue?.envs || [];
+    const multiProject = Array.isArray(projects) && projects.length > 1;
 
-    const envTab = (id, label, active, extra, onClick) =>
-      segmentTab(id, label, active, extra, onClick, t);
+    const envTab = (id, label, active, extra, onClick) => {
+      const tab = segmentTab(id, label, active, extra, onClick, t);
+      if (!multiProject) return tab;
+      const env = envs.find((entry) => (typeof entry === "string" ? entry : entry?.name) === label);
+      const split = env?.byProject ? Object.entries(env.byProject) : [];
+      if (split.length === 0) return tab;
+      const tip = split
+        .map(([projectId, counts]) => {
+          const name = projects.find((project) => project.id === projectId)?.name || projectId;
+          const cap = counts.maxRunning > 0 ? `${counts.runningWorkSteps}/${counts.maxRunning}` : `${counts.runningWorkSteps}`;
+          return `${name}: ${cap}`;
+        })
+        .join(" · ");
+      return tip ? tab.tooltip(tip) : tab;
+    };
 
     return h_flex()
       .flex_none()
@@ -795,6 +907,17 @@ export class BoardController {
           .gap(6)
           .flex_wrap()
           .items_center()
+          .when(multiProject, (el) =>
+            el.child(
+              renderProjectFilterPills(t, {
+                projects,
+                projectFilter,
+                onSelectProjectFilter,
+                idPrefix: "board",
+              }),
+            ),
+          )
+          .when(multiProject, (el) => el.child(div().w(1).h(16).bg(t.border).mx(2)))
           .child(
             segmentTabs("board-env-tabs", t)
               .child(envTab("env-tab-all", "All Envs", this.envFilter === "all", null, () => {
@@ -802,11 +925,15 @@ export class BoardController {
               }))
               .children(
                 envs.map((env) => {
+                  const scoped =
+                    projectFilter !== "all" && env.byProject?.[projectFilter]
+                      ? env.byProject[projectFilter]
+                      : env;
                   const cap =
-                    env.maxRunning > 0
-                      ? `${env.runningWorkSteps}/${env.maxRunning}`
-                      : env.runningWorkSteps > 0
-                        ? `${env.runningWorkSteps}`
+                    scoped.maxRunning > 0
+                      ? `${scoped.runningWorkSteps}/${scoped.maxRunning}`
+                      : scoped.runningWorkSteps > 0
+                        ? `${scoped.runningWorkSteps}`
                         : null;
                   return envTab(
                     `env-tab-${env.name}`,
@@ -1082,7 +1209,7 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  getFilteredColumns(queue, { showWip = true, showEphemeral = false } = {}) {
+  getFilteredColumns(queue, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
     this.syncEnvFilter(queue);
     const query = this.query.trim();
     const cached = this._filterCache;
@@ -1092,6 +1219,7 @@ export class BoardController {
       cached.onlyQueued === this.onlyQueued &&
       cached.showWip === showWip &&
       cached.showEphemeral === showEphemeral &&
+      cached.projectFilter === projectFilter &&
       cached.query === query &&
       cached.mode === this.mode
     ) {
@@ -1106,7 +1234,7 @@ export class BoardController {
     const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
     for (const col of boardColumns) {
       const listItems = (cols[col.key] || []).filter((item) =>
-        this.matchesFilter(item, { showWip, showEphemeral }),
+        this.matchesFilter(item, { showWip, showEphemeral, projectFilter }),
       );
       columns[col.key] = listItems;
       visibleAll.push(...listItems);
@@ -1120,6 +1248,7 @@ export class BoardController {
       onlyQueued: this.onlyQueued,
       showWip,
       showEphemeral,
+      projectFilter,
       query,
       mode: this.mode,
       columns,
@@ -1129,12 +1258,13 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, closedItemsByKey } = this.getFilteredColumns(queue, {
       showWip,
       showEphemeral,
+      projectFilter,
     });
     const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
 
@@ -1199,7 +1329,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral }))
+      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

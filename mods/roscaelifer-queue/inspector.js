@@ -286,6 +286,7 @@ export class InspectorController {
     const notesText = beadDetail?.notes || item.notes || item.issue?.notes || "";
     const closeReason = beadDetail?.close_reason || item.closeReason || item.issue?.close_reason || "";
     const busy = actions?.isBusy ? actions.isBusy() : false;
+    const routeCtx = item?.projectCtx || ctx || null;
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const resolvedMachine =
       item.machine ||
@@ -310,6 +311,7 @@ export class InspectorController {
                 bdStatus: item.bdStatus,
                 wakeDeferred: item.bdStatus === "deferred",
                 maxRunning: item.maxRunning ?? undefined,
+                ctx: routeCtx || undefined,
               }, cx)
             : onOpenDialog?.("enqueue", { item }), { primary: true, disabled: busy || item.isBlocked, icon: "play" }),
         );
@@ -323,51 +325,52 @@ export class InspectorController {
             bdStatus: item.bdStatus,
             wakeDeferred: item.bdStatus === "deferred",
             maxRunning: item.maxRunning ?? undefined,
+            ctx: routeCtx || undefined,
           }, cx), { primary: true, disabled: busy || item.isBlocked, icon: "play" }),
           actionBtn(t, "insp-act-options", "Options", () => onOpenDialog?.("enqueue", { item }), { disabled: busy }),
-          actionBtn(t, "insp-act-dequeue", "Dequeue", (_e, cx) => actions.dequeueBead(item.beadId, cx), { disabled: busy, icon: "close" }),
+          actionBtn(t, "insp-act-dequeue", "Dequeue", (_e, cx) => actions.dequeueBead(item.beadId, cx, routeCtx), { disabled: busy, icon: "close" }),
         );
       }
       if (item.needsReview && item.beadId) {
         actionButtons.push(
-          actionBtn(t, "insp-act-approve-rev", "Approve Review", (_e, cx) => actions.approveReview(item.beadId, cx), { primary: true, disabled: busy, icon: "check" }),
+          actionBtn(t, "insp-act-approve-rev", "Approve Review", (_e, cx) => actions.approveReview(item.beadId, cx, routeCtx), { primary: true, disabled: busy, icon: "check" }),
           actionBtn(t, "insp-act-reject-rev", "Reject…", () => onOpenDialog?.("reject", { item }), { danger: true, disabled: busy }),
         );
       }
       if (item.taskId && currentStep && (currentStep.status === "waiting_approval" || currentStep.status === "needs_human")) {
         const sid = currentStep.step_id ?? currentStep.stepId ?? currentStep.id;
         actionButtons.push(
-          actionBtn(t, "insp-act-approve-gate", `Approve ${sid}`, (_e, cx) => actions.approveGate(item.taskId, sid, cx), { primary: true, disabled: busy, icon: "check" }),
+          actionBtn(t, "insp-act-approve-gate", `Approve ${sid}`, (_e, cx) => actions.approveGate(item.taskId, sid, cx, routeCtx), { primary: true, disabled: busy, icon: "check" }),
         );
       }
       if (item.taskId && currentStep && currentStep.status === "failed") {
         const sid = currentStep.step_id ?? currentStep.stepId ?? currentStep.id;
         actionButtons.push(
-          actionBtn(t, "insp-act-retry", `Retry ${sid}`, (_e, cx) => actions.retryTask(item.taskId, sid, cx), { primary: true, disabled: busy, icon: "refresh" }),
+          actionBtn(t, "insp-act-retry", `Retry ${sid}`, (_e, cx) => actions.retryTask(item.taskId, sid, cx, routeCtx), { primary: true, disabled: busy, icon: "refresh" }),
         );
       } else if (item.beadId && item.hasFailedLabel) {
         actionButtons.push(
-          actionBtn(t, "insp-act-requeue", "Requeue", (_e, cx) => actions.requeueBead(item.beadId, item.labels || [], cx), { primary: true, disabled: busy, icon: "refresh" }),
+          actionBtn(t, "insp-act-requeue", "Requeue", (_e, cx) => actions.requeueBead(item.beadId, item.labels || [], cx, routeCtx), { primary: true, disabled: busy, icon: "refresh" }),
         );
       }
       if (item.taskId && item.taskStatus === "active") {
         actionButtons.push(
-          actionBtn(t, "insp-act-cancel", "Cancel Task", (_e, cx) => actions.cancelTask(item.taskId, cx), { danger: true, disabled: busy }),
+          actionBtn(t, "insp-act-cancel", "Cancel Task", (_e, cx) => actions.cancelTask(item.taskId, cx, routeCtx), { danger: true, disabled: busy }),
         );
       }
       if (item.beadId && item.bdStatus !== "closed" && !item.needsReview) {
         actionButtons.push(
-          actionBtn(t, "insp-act-close-bead", "Close Bead", (_e, cx) => actions.closeBead(item.beadId, "", cx), { disabled: busy }),
+          actionBtn(t, "insp-act-close-bead", "Close Bead", (_e, cx) => actions.closeBead(item.beadId, "", cx, routeCtx), { disabled: busy }),
         );
       }
       if (item.beadId && item.bdStatus === "closed") {
         actionButtons.push(
-          actionBtn(t, "insp-act-reopen-bead", "Reopen Bead", (_e, cx) => actions.reopenBead(item.beadId, cx), { disabled: busy }),
+          actionBtn(t, "insp-act-reopen-bead", "Reopen Bead", (_e, cx) => actions.reopenBead(item.beadId, cx, routeCtx), { disabled: busy }),
         );
       }
       if (item.pendingCleanup && item.taskId) {
         actionButtons.push(
-          actionBtn(t, "insp-act-clean", "Clean…", () => onOpenDialog?.("clean-preview", { target: { taskId: item.taskId } }), { disabled: busy, icon: "clean" }),
+          actionBtn(t, "insp-act-clean", "Clean…", () => onOpenDialog?.("clean-preview", { item, target: { taskId: item.taskId } }), { disabled: busy, icon: "clean" }),
         );
       }
     }
@@ -383,6 +386,7 @@ export class InspectorController {
     else if (item.envPendingAuto) metaRows.push(["Env", "auto (pending)"]);
     if (item.formula) metaRows.push(["Formula", item.formula]);
     if (item.project) metaRows.push(["Project", item.project]);
+    if (item.projectName) metaRows.push(["Workspace Project", item.projectName]);
     if (varCwd && varCwd !== worktree) metaRows.push(["Cwd", varCwd]);
     if (varModel) metaRows.push(["Model", varModel]);
     if (varMcp) metaRows.push(["MCP Profile", varMcp]);
@@ -452,6 +456,11 @@ export class InspectorController {
                         .tooltip("Click to copy")
                         .on_click((_e, cx) => this.copyToClipboard(cx, `task-${item.id}`, `#${item.taskId}`))
                         .child(this.copiedKey === `task-${item.id}` ? `#${item.taskId} ✓` : `#${item.taskId}`),
+                    ),
+                  )
+                  .when(Boolean(item.projectName), (el) =>
+                    el.child(
+                      badge(t, item.projectName, item.projectColor || t.accent),
                     ),
                   )
                   .when(Boolean(prioLabel), (el) => el.child(badge(t, prioLabel, item.priority <= 1 ? t.ansi1 : t.muted)))

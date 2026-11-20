@@ -52,6 +52,34 @@ The top-bar `project-picker` opens **Project Configuration**. It manages the glo
 
 A Project needs a non-empty `name` and at least one of `repo`, `db`, `bdDir`, `config`, or `formulasDir`. The name is user-defined and does not have to match the repository directory. `Project Configuration` lists saved projects, supports `+ New Project`, `Auto-Detect`, folder browsing with path derivation, `Save & Activate` / `Create & Activate`, deletion, and `Use Auto-Detect`. Missing or invalid global JSON falls back to an empty in-memory configuration; valid legacy `roscaelifer.repoHistory.v1` and `roscaelifer.activeRepo.v1` entries are migrated in memory and saved when the user next saves a project.
 
+### Multi-Project Panel
+
+`projects.json` accepts two optional fields that keep the version 1 shape backwards compatible:
+
+```json
+{
+  "version": 1,
+  "activeProject": "jikerental",
+  "panelMode": "multi",
+  "pinnedProjects": ["jikerental", "roscaelifer"],
+  "projects": []
+}
+```
+
+- `panelMode`: `"single"` (default, active project only) or `"multi"`.
+- `pinnedProjects`: project ids mixed into the panel in multi mode. Unknown/duplicate ids are dropped and the field defaults to empty; a multi config with no usable pins falls back to `activeProject` or the first saved project.
+
+In `Project Configuration`, switch **Panel Mode** between `Single Project` and `Multi-Project Panel`, then tick the projects to include in `Saved Projects`. Saving writes `panelMode` / `pinnedProjects` and refreshes the panel. A block-level `props.projects` array (`[{ id, name, repo, ... }]`) overrides the saved selection for that block.
+
+Multi mode opens on an **All Projects** board:
+
+- Snapshots are fetched per project with `Promise.allSettled`, so one failing project shows an error row with `Retry` while the others keep rendering.
+- Items carry a namespaced id (`<projectId>::<rawId>`) used for selection/inspector keys, while `beadId` / `taskId` / `rawId` stay intact; each card shows its project badge.
+- `All Projects` + per-project filter pills (count and error badges) sit in the board/deps toolbars. Env filters merge by `env.name`; when filtered to one project, env pills show that project's capacity.
+- `Tick` / `Clean Pending` act on the filtered project, or run concurrently across every pinned project under `All Projects`.
+- Card actions, the Inspector, `New Bead`, `New WIP Card`, and detail fetches route through the item's own `projectCtx` (DB, config, machine, formulas). `New Bead` / `New WIP Card` expose a `Target Project` selector in multi mode.
+- `Epics & Deps` groups epics and dependency waves per project so `blocks` DAGs never mix; `Mirror & Events` merges events and mirror integrations tagged with their project.
+
 Context resolution for an empty `props` block is ordered as follows: the session override sent by the dialog, the matching `activeProject` in `projects.json`, explicit block props, automatic detection from the focused pane / active space / pane working directories, and finally no context. Automatic detection never changes `activeProject`. The active project is mirrored in localStorage only for the synchronous first-frame cache; the global JSON remains authoritative after asynchronous resolution.
 
 Supported block `props` fields are:
@@ -63,6 +91,7 @@ Supported block `props` fields are:
 - `formulasDir`: path to `formulas/` directory
 - `bin`: explicit path to the `roscaelifer` executable
 - `env`: default environment name; `auto` defers env selection to the scheduler (see `Queue (Kanban)` above)
+- `projects`: optional array of project objects (`id`, `name`, `repo`, `db`, `bdDir`, `config`, `formulasDir`, `machine`, `bin`, `env`) that overrides the saved `panelMode` / `pinnedProjects` selection for this block
 - `dialogType`: internal modal prop (`enqueue`, `create`, `reject`, `clean-preview`, `project-config`; `repo-config` remains accepted for compatibility)
 
 If `roscaelifer` is not on `PATH` (or `~/.local/bin/roscaelifer`, `~/go/bin/roscaelifer`), and `repo/cmd/roscaelifer/main.go` exists with `go` available, it falls back to `go run ./cmd/roscaelifer`.
@@ -99,4 +128,5 @@ When the `roscaelifer-queue` block is focused (outside search input):
 - `layouts/roscaelifer.json` — Split workspace layout with sidebar, tabs, `roscaelifer-queue`, active terminal pane, collapsible `files`/`changes` stack, and `workspace-status` bar
 - `scripts/install-mod.sh` — Symlinks the mod (and optionally the layout) into `$HERDR_APP_HOME`
 - `scripts/check.sh` — Runs `herdr-app check` on the installed mod
+- `tests/` — Node tests (`node --test tests/*.test.mjs`) for detection, multi-project config normalization, workspace resolution, and `mergeNormalizedQueues`
 - `RECIPE.md` — Herdr build recipe specification

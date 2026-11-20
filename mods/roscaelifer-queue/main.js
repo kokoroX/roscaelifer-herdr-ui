@@ -23,6 +23,8 @@ import {
   fetchTaskDetail,
   fetchBeadDetail,
   normalizeQueue,
+  mergeNormalizedQueues,
+  resolveWorkspaceProjects,
   contextKey,
   repoIdentityKey,
   repoLabel,
@@ -35,6 +37,7 @@ import {
   buildContextFromProps,
   loadCachedSnapshot,
   saveCachedSnapshot,
+  PANEL_MODE_MULTI,
   safeStorageGet,
   safeStorageSet,
 } from "./store.js";
@@ -216,6 +219,15 @@ export default class RoscaeliferQueue extends View {
     this.runner = null;
     this.snapshot = null;
     this.queue = null;
+    // Multi-project workspace state.
+    this.panelMode = "single";
+    this.workspaceProjects = [];
+    this.workspaceKey = "";
+    this.projectSnapshots = [];
+    this.projectFilter = "all";
+    this._multiFp = null;
+    this._multiQueue = null;
+    this.pendingRefreshProjects = null;
     this.selectedId = null;
     this.detail = null;
     this.beadDetail = null;
@@ -293,7 +305,7 @@ export default class RoscaeliferQueue extends View {
         } else if (cmd === "refresh") {
           this.refresh(cx, { forceContext: true, preempt: true });
         } else if (cmd === "tick") {
-          this.actions.tick({}, cx);
+          this.runTick(cx);
         } else if (cmd === "new-bead") {
           this.openDialog("create");
         } else if (cmd === "new-wip") {
@@ -367,6 +379,53 @@ export default class RoscaeliferQueue extends View {
     return q;
   }
 
+  liveHerdr() {
+    return { agents: agents(), terminals: terminals(), spaces: spaces(), panes: panes() };
+  }
+
+  /** Re-merges pinned project queues, re-projecting live Herdr state only when it changes. */
+  getAggregatedQueue() {
+    const live = this.liveHerdr();
+    const fp = herdrLiveFingerprint(live.agents, live.terminals, live.spaces, live.panes);
+    if (this._multiFp === fp && this._multiQueue) return this._multiQueue;
+    const merged = mergeNormalizedQueues(this.projectSnapshots, live);
+    this._multiFp = fp;
+    this._multiQueue = merged;
+    return merged;
+  }
+
+  projectEntryFor(ctx) {
+    if (!ctx) return null;
+    const projectId = ctx.projectId || contextKey(ctx);
+    return this.projectSnapshots.find((entry) => entry.projectId === projectId) || null;
+  }
+
+  selectedWorkspaceContexts() {
+    const projects = this.workspaceProjects;
+    if (this.projectFilter && this.projectFilter !== "all") {
+      return projects.filter((ctx) => (ctx.projectId || contextKey(ctx)) === this.projectFilter);
+    }
+    return projects;
+  }
+
+  setProjectFilter(next, cx) {
+    this.projectFilter = next || "all";
+    if (this.deps) {
+      this.deps.selectedEpicId = null;
+      this.deps.chainFocusId = null;
+    }
+    this.selectedId = null;
+    this.detail = null;
+    this.beadDetail = null;
+    this.detailItemId = null;
+    this.detailTaskId = null;
+    this.detailBeadId = null;
+    this.detailError = null;
+    this.detailLoading = false;
+    this.detailReqSeq += 1;
+    cx?.notify?.();
+  }
+
   updatePollTimer(cx, intervalMs) {
     if (!cx?.timer || this.pollIntervalMs === intervalMs) return;
     if (this.pollTimer) {
@@ -429,11 +488,17 @@ export default class RoscaeliferQueue extends View {
     return `${f?.cwd || ""}|${s?.id || ""}|${s?.folder || ""}|${s?.machine || ""}`;
   }
 
-  scheduleDebouncedRefresh(cx) {
+  scheduleDebouncedRefresh(cx, projectId = null) {
+    if (projectId) {
+      this.pendingRefreshProjects = this.pendingRefreshProjects || new Set();
+      this.pendingRefreshProjects.add(projectId);
+    }
     if (this.debounceTimer) this.debounceTimer.cancel();
-    this.debounceTimer = cx.timer.after(250, (cx) => {
+    this.debounceTimer = cx.timer.after(250, (timerCx) => {
       this.debounceTimer = null;
-      this.refresh(cx, { silent: true });
+      const only = this.pendingRefreshProjects;
+      this.pendingRefreshProjects = null;
+      this.refresh(timerCx, { silent: true, onlyProjectIds: only });
     });
   }
 
@@ -455,24 +520,50 @@ export default class RoscaeliferQueue extends View {
     });
   }
 
-  ensureWatchers(ctx, cx) {
-    if (!ctx || ctx.machine) {
+  ensureWatchers(cx) {
+    const targets = (
+      this.panelMode === "multi" ? this.workspaceProjects : this.ctx ? [this.ctx] : []
+    ).filter((ctx) => ctx && !ctx.machine);
+    if (targets.length === 0) {
+      this.clearWatchers();
       this.updatePollTimer(cx, FALLBACK_POLL_MS);
       return;
     }
-    const dirs = new Set();
-    if (ctx.repo) {
-      dirs.add(`${ctx.repo}/.roscaelifer`);
-      dirs.add(`${ctx.repo}/.beads`);
-    }
-    if (ctx.bdDir) dirs.add(ctx.bdDir);
-    if (ctx.db) {
-      const idx = ctx.db.lastIndexOf("/");
-      if (idx > 0) dirs.add(ctx.db.slice(0, idx));
+
+    // `dir -> projectId` for every local project so a change only refreshes the
+    // project that owns the directory, not the whole workspace.
+    const wanted = new Map();
+    for (const ctx of targets) {
+      const projectId = ctx.projectId || contextKey(ctx);
+      const dirs = new Set();
+      if (ctx.repo) {
+        dirs.add(`${ctx.repo}/.roscaelifer`);
+        dirs.add(`${ctx.repo}/.beads`);
+      }
+      if (ctx.bdDir) dirs.add(ctx.bdDir);
+      if (ctx.db) {
+        const idx = ctx.db.lastIndexOf("/");
+        if (idx > 0) dirs.add(ctx.db.slice(0, idx));
+      }
+      for (const dir of dirs) {
+        if (dir && !wanted.has(dir)) wanted.set(dir, projectId);
+      }
     }
 
-    for (const dir of dirs) {
-      if (!dir || this.watchedDirs.has(dir)) continue;
+    for (const dir of [...this.watchedDirs]) {
+      if (wanted.has(dir)) continue;
+      this.watchedDirs.delete(dir);
+      const handle = this.watchHandles.get(dir);
+      this.watchHandles.delete(dir);
+      try {
+        handle?.cancel?.();
+      } catch {
+        // Ignore cancel failures on already settled watches.
+      }
+    }
+
+    for (const [dir, projectId] of wanted) {
+      if (this.watchedDirs.has(dir)) continue;
       this.watchedDirs.add(dir);
       cx.spawn(async (watchCx) => {
         try {
@@ -483,7 +574,7 @@ export default class RoscaeliferQueue extends View {
             if (!this.watchedDirs.has(dir)) break;
             if (Array.isArray(changed) && changed.length === 0) continue;
             if (this.shouldIgnoreSelfWatch(changed)) continue;
-            this.scheduleDebouncedRefresh(watchCx);
+            this.scheduleDebouncedRefresh(watchCx, projectId);
           }
         } catch {
           this.watchedDirs.delete(dir);
@@ -513,10 +604,49 @@ export default class RoscaeliferQueue extends View {
     cx.notify();
   }
 
-  refresh(cx, { forceContext = false, preempt = false, silent = false } = {}) {
+  buildProjectSnapshots(contexts) {
+    return contexts.map((ctx) => {
+      const projectId = ctx.projectId || contextKey(ctx);
+      const cached = loadCachedSnapshot(ctx);
+      const snapshot = cached?.snapshot ? clearCachedRunnerState(cached.snapshot) : null;
+      return {
+        projectId,
+        projectName: ctx.label || repoLabel(ctx),
+        projectCtx: ctx,
+        snapshot,
+        runner: null,
+        error: null,
+      };
+    });
+  }
+
+  applyCachedWorkspace(cx) {
+    this.projectSnapshots = this.buildProjectSnapshots(this.workspaceProjects);
+    this._multiFp = null;
+    this._multiQueue = null;
+    this.snapshot = null;
+    this.queue = this.getAggregatedQueue();
+    this.error = null;
+    cx?.notify?.();
+  }
+
+  resetDetailState() {
+    this.selectedId = null;
+    this.detail = null;
+    this.beadDetail = null;
+    this.detailItemId = null;
+    this.detailTaskId = null;
+    this.detailBeadId = null;
+    this.detailError = null;
+    this.detailLoading = false;
+    this.detailReqSeq += 1;
+    this.detailCache.clear();
+  }
+
+  refresh(cx, { forceContext = false, preempt = false, silent = false, onlyProjectIds = null } = {}) {
     // Only an explicit override switch or signal refresh may preempt the refresh already
-    // in flight: starting a second one bumps `refreshSeq` and strands the first one's
-    // `loading`. A refresh that has been stuck for >35s is also reclaimed so the UI can
+    // in flight: starting a second one bumps refreshSeq and strands the first one's
+    // loading. A refresh that has been stuck for >35s is also reclaimed so the UI can
     // never latch on a dead task.
     const stale = this.loadingStartedAt > 0 && Date.now() - this.loadingStartedAt > 35000;
     if (this.loading && !preempt && !stale) {
@@ -538,6 +668,39 @@ export default class RoscaeliferQueue extends View {
       try {
         const rawProps = props() ?? {};
         const sharedOverride = shared("roscaelifer.ctxOverride") ?? null;
+        // projects.json can change outside this view (dialog save, external edit),
+        // so re-read it on every refresh; it is a single local file.
+        {
+          let config = null;
+          try {
+            config = await loadGlobalProjectsConfig();
+          } catch {
+            config = null;
+          }
+          if (seq !== this.refreshSeq) return;
+          if (config) this.projectsConfig = config;
+        }
+
+        const workspace = this.projectsConfig
+          ? resolveWorkspaceProjects(this.projectsConfig, rawProps)
+          : { mode: "single", projects: [] };
+
+        if (workspace.mode === PANEL_MODE_MULTI && workspace.projects.length > 1) {
+          await this.refreshWorkspace(cx, { seq, workspace, onlyProjectIds });
+          return;
+        }
+
+        if (this.panelMode === "multi") {
+          this.panelMode = "single";
+          this.workspaceProjects = [];
+          this.projectSnapshots = [];
+          this.workspaceKey = "";
+          this.projectFilter = "all";
+          this._multiFp = null;
+          this._multiQueue = null;
+          this.clearWatchers();
+        }
+
         if (forceContext || !this.ctx || sharedOverride) {
           const nextCtx = await resolveContext(rawProps, {
             focusedInfo: focused(),
@@ -592,7 +755,7 @@ export default class RoscaeliferQueue extends View {
         this.snapshot = snap;
         this.error = null;
         saveCachedSnapshot(this.ctx, snap);
-        this.ensureWatchers(this.ctx, cx);
+        this.ensureWatchers(cx);
 
         if (snap?.runner?.active === true) {
           if (this.runnerMismatch) {
@@ -655,6 +818,121 @@ export default class RoscaeliferQueue extends View {
     });
   }
 
+  /**
+   * Multi-project refresh: one parallel fetchSnapshot per pinned project via
+   * Promise.allSettled, so a single broken project keeps its error badge while the
+   * others keep rendering. Only projects whose watch dirs changed are refetched.
+   */
+  async refreshWorkspace(cx, { seq, workspace, onlyProjectIds }) {
+    const projects = workspace.projects;
+    const workspaceKey = projects.map((ctx) => contextKey(ctx)).join("||");
+    const previous = new Map(this.projectSnapshots.map((entry) => [entry.projectId, entry]));
+    const entries = projects.map((ctx) => {
+      const projectId = ctx.projectId || contextKey(ctx);
+      const existing = previous.get(projectId);
+      return {
+        projectId,
+        projectName: ctx.label || repoLabel(ctx),
+        projectCtx: ctx,
+        snapshot: existing?.snapshot || null,
+        runner: existing?.runner || null,
+        error: existing?.error || null,
+      };
+    });
+    const contextChanged = this.panelMode !== "multi" || workspaceKey !== this.workspaceKey;
+    this.panelMode = "multi";
+    this.workspaceProjects = projects;
+    this.workspaceKey = workspaceKey;
+    this.projectSnapshots = entries;
+    this.ctx = projects[0];
+
+    if (contextChanged) {
+      this.runnerMismatch = null;
+      this.clearWatchers();
+      this.updatePollTimer(cx, FALLBACK_POLL_MS);
+      this.resetDetailState();
+      if (
+        this.projectFilter !== "all" &&
+        !projects.some((ctx) => (ctx.projectId || contextKey(ctx)) === this.projectFilter)
+      ) {
+        this.projectFilter = "all";
+      }
+      this.applyCachedWorkspace(cx);
+    }
+
+    if (entries.length === 0) {
+      this.snapshot = null;
+      this.queue = null;
+      this._multiFp = null;
+      this._multiQueue = null;
+      this.error = "No roscaelifer project detected. Open Project Config to select or create one.";
+      return;
+    }
+
+    const targets = entries.filter(
+      (entry) => !onlyProjectIds || onlyProjectIds.has(entry.projectId),
+    );
+    const fetchOpts = {
+      closedLimit: this.closedLimit,
+      includeEphemeral: this.showEphemeral,
+      includeWip: this.showWip,
+    };
+    const settled = await Promise.allSettled(
+      targets.map(async (entry) => {
+        const runner = await resolveBinary(entry.projectCtx);
+        const snap = await fetchSnapshot(entry.projectCtx, runner, fetchOpts);
+        return { entry, runner, snap };
+      }),
+    );
+    if (seq !== this.refreshSeq) return;
+
+    settled.forEach((result, index) => {
+      const entry = targets[index];
+      if (result.status === "fulfilled") {
+        entry.snapshot = result.value.snap;
+        entry.runner = result.value.runner;
+        entry.error = null;
+        saveCachedSnapshot(entry.projectCtx, result.value.snap);
+      } else {
+        entry.error = result.reason?.message || String(result.reason);
+      }
+    });
+
+    this._multiFp = null;
+    this._multiQueue = null;
+    this.snapshot = null;
+    this.queue = this.getAggregatedQueue();
+    this.error = null;
+    this.ensureWatchers(cx);
+
+    const anyActive = entries.some((entry) => entry.snapshot?.runner?.active === true);
+    if (anyActive && this.runnerMismatch) {
+      this.runnerMismatch = null;
+      cx.notify();
+    }
+
+    const selected = this.selectedId ? this.queue.itemsById.get(this.selectedId) : null;
+    if (selected && (selected.taskId || selected.beadId)) {
+      const owner = this.projectEntryFor(selected.projectCtx);
+      cx.spawn(async (detailCx) => {
+        await this.loadItemDetail(selected, {
+          runnerOverride: owner?.runner || null,
+          force: true,
+          silent: true,
+        });
+        detailCx.notify();
+      });
+    } else if (!selected) {
+      this.detail = null;
+      this.beadDetail = null;
+      this.detailItemId = null;
+      this.detailTaskId = null;
+      this.detailBeadId = null;
+      this.detailError = null;
+      this.detailLoading = false;
+    }
+  }
+
   switchToDetectedRunner(cx) {
     const mismatch = this.runnerMismatch;
     const ctx = this.ctx;
@@ -707,7 +985,8 @@ export default class RoscaeliferQueue extends View {
 
   detailCacheKey(item) {
     const includeEphemeral = Boolean(this.showEphemeral || item?.ephemeral || item?.isWip);
-    return `${contextKey(this.ctx)}|ephemeral:${includeEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
+    const itemCtx = item?.projectCtx || this.ctx;
+    return `${contextKey(itemCtx)}|ephemeral:${includeEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
   }
 
   setDetailCacheEntry(key, taskDetail, beadDetail) {
@@ -730,7 +1009,10 @@ export default class RoscaeliferQueue extends View {
     const taskId = item?.taskId || null;
     const beadId = item?.beadId || null;
     const itemId = item?.id || null;
-    if (!itemId || !this.ctx || (!taskId && !beadId)) {
+    // Items from the multi-project board carry their own project context; never
+    // fall back to another project's DB/config when fetching details.
+    const itemCtx = item?.projectCtx || this.ctx;
+    if (!itemId || !itemCtx || (!taskId && !beadId)) {
       this.detail = null;
       this.beadDetail = null;
       this.detailItemId = itemId;
@@ -769,13 +1051,13 @@ export default class RoscaeliferQueue extends View {
     this.detailBeadId = beadId;
 
     try {
-      const runner = runnerOverride || (await this.ensureRunner());
+      const runner = runnerOverride || (await resolveBinary(itemCtx));
       if (this.detailReqSeq !== reqSeq || this.selectedId !== itemId) return;
 
       const [taskRes, beadRes] = await Promise.allSettled([
-        taskId ? fetchTaskDetail(this.ctx, runner, taskId) : Promise.resolve(null),
+        taskId ? fetchTaskDetail(itemCtx, runner, taskId) : Promise.resolve(null),
         beadId
-          ? fetchBeadDetail(this.ctx, runner, beadId, {
+          ? fetchBeadDetail(itemCtx, runner, beadId, {
               includeEphemeral: Boolean(this.showEphemeral || item?.ephemeral || item?.isWip),
             })
           : Promise.resolve(null),
@@ -869,19 +1151,53 @@ export default class RoscaeliferQueue extends View {
     }
   }
 
+  dialogTargetCtx(dialogType, extra = {}) {
+    if (extra?.ctx) return extra.ctx;
+    const itemCtx = extra?.item?.projectCtx || null;
+    if (itemCtx) return itemCtx;
+    // A single explicit `projects` override (e.g. Clean Pending scoped by the
+    // project filter) targets that project.
+    if (Array.isArray(extra?.projects) && extra.projects.length === 1 && extra.projects[0]?.ctx) {
+      return extra.projects[0].ctx;
+    }
+    if (dialogType === "create" || dialogType === "create-wip") {
+      if (this.panelMode === "multi") {
+        if (this.projectFilter && this.projectFilter !== "all") {
+          const match = this.workspaceProjects.find(
+            (ctx) => (ctx.projectId || contextKey(ctx)) === this.projectFilter,
+          );
+          if (match) return match;
+        }
+        const activeId = this.projectsConfig?.activeProject;
+        if (activeId) {
+          const match = this.workspaceProjects.find((ctx) => ctx.projectId === activeId);
+          if (match) return match;
+        }
+      }
+      return this.workspaceProjects[0] || this.ctx;
+    }
+    return this.ctx;
+  }
+
   openDialog(dialogType, extra = {}) {
     if (this.isDialog) return;
 
     const dims = {
-      create: { width: 520, height: 500 },
-      "create-wip": { width: 540, height: 590 },
-      enqueue: { width: 440, height: 340 },
+      create: { width: 540, height: 560 },
+      "create-wip": { width: 560, height: 660 },
+      enqueue: { width: 460, height: 400 },
       reject: { width: 460, height: 320 },
-      "clean-preview": { width: 520, height: 420 },
-      "project-config": { width: 600, height: 660 },
-      "repo-config": { width: 600, height: 660 },
+      "clean-preview": { width: 560, height: 480 },
+      "project-config": { width: 640, height: 720 },
+      "repo-config": { width: 640, height: 720 },
     };
     const size = dims[dialogType] || { width: 480, height: 380 };
+    const dialogCtx = this.dialogTargetCtx(dialogType, extra);
+    const projectEntries = this.workspaceProjects.map((ctx) => ({
+      id: ctx.projectId || contextKey(ctx),
+      name: ctx.label || repoLabel(ctx),
+      ctx,
+    }));
 
     openOverlay({
       mod: "roscaelifer-queue",
@@ -891,7 +1207,9 @@ export default class RoscaeliferQueue extends View {
       height: size.height,
       props: {
         dialogType,
-        ctx: this.ctx,
+        ctx: dialogCtx,
+        projects: projectEntries,
+        targetProjectId: dialogCtx?.projectId || "",
         formulas: this.queue?.formulas || [],
         envs: this.queue?.envs || [],
         items: (this.queue?.items || []).slice(0, 100).map((i) => ({
@@ -900,12 +1218,37 @@ export default class RoscaeliferQueue extends View {
           title: i.title,
           status: i.status,
           column: i.column,
+          projectId: i.projectId,
+          projectName: i.projectName,
         })),
         history: loadRepoHistory(),
         projectsConfig: this.projectsConfig,
         ...extra,
       },
     });
+  }
+
+  runTick(cx) {
+    if (this.panelMode === "multi") {
+      const targets = this.selectedWorkspaceContexts();
+      if (targets.length === 0) return Promise.resolve();
+      return this.actions.tickProjects(targets, cx);
+    }
+    return this.actions.tick({}, cx);
+  }
+
+  runCleanDialog() {
+    if (this.panelMode === "multi") {
+      const targets = this.selectedWorkspaceContexts();
+      if (targets.length === 1) {
+        const ctx = targets[0];
+        this.openDialog("clean-preview", {
+          projects: [{ id: ctx.projectId || contextKey(ctx), name: ctx.label || repoLabel(ctx), ctx }],
+        });
+        return;
+      }
+    }
+    this.openDialog("clean-preview", {});
   }
 
   handleKeyDown(e, cx) {
@@ -935,7 +1278,7 @@ export default class RoscaeliferQueue extends View {
       return;
     }
     if (e.key === "t") {
-      this.actions.tick({}, cx);
+      this.runTick(cx);
       cx.stop_propagation();
       return;
     }
@@ -964,13 +1307,45 @@ export default class RoscaeliferQueue extends View {
   renderTopBar(t) {
     const queue = this.queue;
     const runner = queue?.runner || {};
-    const runnerActive =
-      runner.active !== undefined ? Boolean(runner.active) : Boolean(runner.lock_held);
-    const runnerTooltip = runnerActive
-      ? [`Runner active`, runner.pid ? `pid ${runner.pid}` : "", runner.mode || "", runner.log_path || ""]
-          .filter(Boolean)
-          .join(" · ")
-      : "Runner idle (starts automatically on Queue / Dispatch)";
+    const multi = this.panelMode === "multi" && this.workspaceProjects.length > 1;
+    const projectCount = this.workspaceProjects.length;
+    const runnerPerProject = Array.isArray(runner.perProject) ? runner.perProject : [];
+    const activeRunners = multi
+      ? runnerPerProject.filter((entry) => entry.active).length
+      : 0;
+    const runnerActive = multi
+      ? activeRunners > 0
+      : runner.active !== undefined
+        ? Boolean(runner.active)
+        : Boolean(runner.lock_held);
+    const runnerTooltip = multi
+      ? [
+          `${activeRunners}/${runnerPerProject.length || projectCount} runners active`,
+          ...runnerPerProject.map((entry) =>
+            [
+              `${entry.projectName}: ${entry.active ? `active${entry.pid ? ` pid ${entry.pid}` : ""}` : "idle"}`,
+              shortenHomePath(entry.db),
+              entry.error ? `error: ${entry.error}` : "",
+            ]
+              .filter(Boolean)
+              .join(" · "),
+          ),
+        ].join("\n")
+      : runnerActive
+        ? [`Runner active`, runner.pid ? `pid ${runner.pid}` : "", runner.mode || "", runner.log_path || ""]
+            .filter(Boolean)
+            .join(" · ")
+        : "Runner idle (starts automatically on Queue / Dispatch)";
+    const runnerLabel = multi
+      ? `${activeRunners}/${runnerPerProject.length || projectCount} runners active`
+      : runnerActive
+        ? "Runner active"
+        : "Runner idle";
+    const pickerLabel = multi
+      ? `Multi · ${projectCount} projects`
+      : this.ctx
+        ? repoLabel(this.ctx)
+        : "No project";
     const pendingCleanups = (queue?.items || []).reduce(
       (sum, item) => sum + (item.pendingCleanupCount || 0),
       0,
@@ -1008,7 +1383,7 @@ export default class RoscaeliferQueue extends View {
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .on_click(() => this.openDialog("project-config"))
               .child(svg("mods/roscaelifer-queue/icons/folder.svg").size(13).flex_none().text_color(t.muted))
-              .child(div().max_w(180).truncate().child(this.ctx ? repoLabel(this.ctx) : "No project")),
+              .child(div().max_w(180).truncate().child(pickerLabel)),
           )
           .child(
             h_flex()
@@ -1029,8 +1404,8 @@ export default class RoscaeliferQueue extends View {
                     .spin(900),
                 ),
               )
-              .when(!runnerActive, (el) => el.child(div().size(6).rounded(3).bg(t.dim)))
-              .child(runnerActive ? "Runner active" : "Runner idle"),
+              .child(div().size(6).rounded(3).bg(t.dim))
+              .child(runnerLabel),
           ),
       )
       .child(
@@ -1088,7 +1463,7 @@ export default class RoscaeliferQueue extends View {
               fg: t.foreground,
               border: t.border,
               busy: this.actions.isBusy("tick"),
-              onClick: (_e, cx) => this.actions.tick({}, cx),
+              onClick: (_e, cx) => this.runTick(cx),
             }),
           )
           .child(
@@ -1097,7 +1472,7 @@ export default class RoscaeliferQueue extends View {
               fg: pendingCleanups > 0 ? t.blocked || t.ansi3 : t.muted,
               border: t.border,
               badge: pendingCleanups,
-              onClick: () => this.openDialog("clean-preview", {}),
+              onClick: () => this.runCleanDialog(),
             }),
           )
           .child(
@@ -1155,8 +1530,17 @@ export default class RoscaeliferQueue extends View {
         ? ` · formulas ${shortenHomePath(mismatch.formulasDir)}`
         : "";
     // Re-project live Herdr agents/terminals only when snapshot ref or live Herdr fingerprint changes.
-    const queue = this.snapshot ? this.getNormalizedQueue(this.snapshot) : this.queue;
+    const queue =
+      this.panelMode === "multi"
+        ? this.getAggregatedQueue()
+        : this.snapshot
+          ? this.getNormalizedQueue(this.snapshot)
+          : this.queue;
     if (queue) this.queue = queue;
+    const projectErrors =
+      this.panelMode === "multi"
+        ? (queue?.projects || []).filter((project) => Boolean(project.error))
+        : [];
 
     const selectedItem =
       this.selectedId && queue ? queue.itemsById.get(this.selectedId) || null : null;
@@ -1258,6 +1642,62 @@ export default class RoscaeliferQueue extends View {
             ),
         ),
       )
+      .when(projectErrors.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .flex_none()
+            .bg((t.ansi1 || t.blocked) + "18")
+            .border_b(1)
+            .border_color(t.border)
+            .children(
+              projectErrors.map((project) =>
+                h_flex()
+                  .px(12)
+                  .py(5)
+                  .gap(8)
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(6)
+                      .items_center()
+                      .child(div().size(7).rounded(4).bg(project.color || t.accent))
+                      .child(div().text_size(11.5).font_medium().text_color(t.foreground).child(project.name))
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .truncate()
+                          .text_size(11.5)
+                          .text_color(t.ansi1 || t.blocked)
+                          .tooltip(project.error)
+                          .child(project.error),
+                      ),
+                  )
+                  .child(
+                    Button.new(`project-retry-${project.id}`)
+                      .h(22)
+                      .px(8)
+                      .rounded(5)
+                      .bg(t.raised)
+                      .border_1()
+                      .border_color(t.border)
+                      .text_size(11)
+                      .on_click((_e, clickCx) => {
+                        this.refresh(clickCx, {
+                          forceContext: false,
+                          preempt: true,
+                          onlyProjectIds: new Set([project.id]),
+                        });
+                      })
+                      .child("Retry"),
+                  ),
+              ),
+            ),
+        ),
+      )
       .child(
         h_flex()
           .flex_1()
@@ -1296,6 +1736,9 @@ export default class RoscaeliferQueue extends View {
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
+                      projects: queue.projects || [],
+                      projectFilter: this.projectFilter,
+                      onSelectProjectFilter: (next) => this.setProjectFilter(next),
                     },
                     cx,
                   ),
@@ -1318,6 +1761,9 @@ export default class RoscaeliferQueue extends View {
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
+                      projects: queue.projects || [],
+                      projectFilter: this.projectFilter,
+                      onSelectProjectFilter: (next) => this.setProjectFilter(next),
                     },
                     cx,
                   ),
@@ -1336,6 +1782,9 @@ export default class RoscaeliferQueue extends View {
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
+                      projects: queue.projects || [],
+                      projectFilter: this.projectFilter,
+                      onSelectProjectFilter: (next) => this.setProjectFilter(next),
                     },
                     cx,
                   ),
@@ -1360,7 +1809,7 @@ export default class RoscaeliferQueue extends View {
                       detailLoading: this.detailLoading && this.detailItemId === selectedItem.id,
                       detailError: this.detailItemId === selectedItem.id ? this.detailError : null,
                       actions: this.actions,
-                      ctx: this.ctx,
+                      ctx: selectedItem?.projectCtx || this.ctx,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
                       onClose: (clickCx) => this.selectItem(null, clickCx),
                       showEphemeral: this.showEphemeral,

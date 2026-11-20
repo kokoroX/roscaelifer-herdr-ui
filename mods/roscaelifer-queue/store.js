@@ -13,6 +13,20 @@ const HISTORY_KEY = "roscaelifer.repoHistory.v1";
 const ACTIVE_REPO_KEY = "roscaelifer.activeRepo.v1";
 const ACTIVE_PROJECT_KEY = "roscaelifer.activeProject.v1";
 const PROJECTS_CONFIG_VERSION = 1;
+export const PANEL_MODE_SINGLE = "single";
+export const PANEL_MODE_MULTI = "multi";
+// Stable per-project accent colors for the multi-project panel. A color is
+// derived from the project id so it never shifts when other projects come or go.
+const PROJECT_COLORS = [
+  "#5b9dff",
+  "#f0a44a",
+  "#5fd0a6",
+  "#d879e3",
+  "#f26d6d",
+  "#4fc4d8",
+  "#b7c95b",
+  "#a991f7",
+];
 const SNAPSHOT_CACHE_PREFIX = "roscaelifer.snapshotCache.v1:";
 const SNAPSHOT_CACHE_INDEX_KEY = "roscaelifer.snapshotCacheIndex.v1";
 const MAX_HISTORY = 10;
@@ -369,11 +383,83 @@ function migrateLegacyProjects() {
   const activeProject = active
     ? projects.find((project) => repoIdentityKey(project) === repoIdentityKey(active))?.id || ""
     : "";
-  return { version: PROJECTS_CONFIG_VERSION, activeProject, projects };
+  const pinnedProjects = activeProject ? [activeProject] : [];
+  return {
+    version: PROJECTS_CONFIG_VERSION,
+    activeProject,
+    panelMode: PANEL_MODE_SINGLE,
+    pinnedProjects,
+    projects,
+  };
 }
 
 function emptyProjectsConfig() {
-  return { version: PROJECTS_CONFIG_VERSION, activeProject: "", projects: [] };
+  return {
+    version: PROJECTS_CONFIG_VERSION,
+    activeProject: "",
+    panelMode: PANEL_MODE_SINGLE,
+    pinnedProjects: [],
+    projects: [],
+  };
+}
+
+export function normalizePanelMode(value) {
+  return value === PANEL_MODE_MULTI ? PANEL_MODE_MULTI : PANEL_MODE_SINGLE;
+}
+
+/**
+ * Deterministic accent color for a project id, so a project keeps the same
+ * color no matter which other projects are pinned into the panel.
+ */
+export function projectColorFor(projectId) {
+  const id = String(projectId ?? "");
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) {
+    hash = (hash * 31 + id.charCodeAt(i)) % 1000003;
+  }
+  return PROJECT_COLORS[hash % PROJECT_COLORS.length];
+}
+
+/**
+ * Drops duplicates, blanks and ids that do not resolve to a saved project.
+ * Pinning an unknown id would otherwise render a phantom panel entry.
+ */
+export function normalizePinnedProjects(rawPinned, projects = []) {
+  const allowed = new Set(
+    (Array.isArray(projects) ? projects : []).map((project) => project?.id).filter(Boolean),
+  );
+  const seen = new Set();
+  const out = [];
+  for (const value of Array.isArray(rawPinned) ? rawPinned : []) {
+    if (typeof value !== "string") continue;
+    const id = value.trim();
+    if (!id || seen.has(id)) continue;
+    if (allowed.size > 0 && !allowed.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Normalizes a whole projects.json payload. `panelMode` / `pinnedProjects` are
+ * optional and default to the legacy single-project behavior.
+ */
+export function normalizeProjectsConfig(raw) {
+  const projects = Array.isArray(raw?.projects)
+    ? raw.projects.map(normalizeProject).filter(Boolean)
+    : [];
+  const activeProject =
+    typeof raw?.activeProject === "string" && projects.some((project) => project.id === raw.activeProject)
+      ? raw.activeProject
+      : "";
+  return {
+    version: PROJECTS_CONFIG_VERSION,
+    activeProject,
+    panelMode: normalizePanelMode(raw?.panelMode),
+    pinnedProjects: normalizePinnedProjects(raw?.pinnedProjects, projects),
+    projects,
+  };
 }
 
 export async function loadGlobalProjectsConfig() {
@@ -396,12 +482,8 @@ export async function loadGlobalProjectsConfig() {
       clearActiveProjectMirror();
       return emptyProjectsConfig();
     }
-    const projects = parsed.projects.map(normalizeProject).filter(Boolean);
-    const activeProject = typeof parsed.activeProject === "string" && projects.some((project) => project.id === parsed.activeProject)
-      ? parsed.activeProject
-      : "";
-    const config = { version: PROJECTS_CONFIG_VERSION, activeProject, projects };
-    const active = projects.find((project) => project.id === activeProject);
+    const config = normalizeProjectsConfig(parsed);
+    const active = config.projects.find((project) => project.id === config.activeProject);
     if (active) saveActiveProjectMirror(active);
     else clearActiveProjectMirror();
     return config;
@@ -412,17 +494,79 @@ export async function loadGlobalProjectsConfig() {
 }
 
 export async function saveGlobalProjectsConfig(config) {
-  if (checking()) return config;
-  const normalized = {
-    version: PROJECTS_CONFIG_VERSION,
-    activeProject: typeof config?.activeProject === "string" ? config.activeProject : "",
-    projects: Array.isArray(config?.projects) ? config.projects.map(normalizeProject).filter(Boolean) : [],
-  };
+  const normalized = normalizeProjectsConfig(config);
+  if (checking()) return normalized;
   const jsonText = JSON.stringify(normalized, null, 2);
   const script = 'mkdir -p "$(dirname "$1")" && tmp=$(mktemp "${1}.tmp.XXXXXX") && printf \'%s\\n\' "$2" > "$tmp" && mv -f "$tmp" "$1"';
   const result = await exec("sh", ["-c", script, "roscaelifer-save-projects", projectsConfigPath(), jsonText]);
   if (result.code !== 0) throw new Error((result.stderr || result.stdout || "Unable to save projects.json").trim());
   return normalized;
+}
+
+/**
+ * Persists the multi-project panel selection. Only the fields passed in the
+ * patch are replaced; the rest of the config (including projects) is kept.
+ */
+export async function setPanelProjectsConfig(patch = {}) {
+  const config = await loadGlobalProjectsConfig();
+  const normalized = normalizeProjectsConfig({
+    ...config,
+    activeProject: patch.activeProject !== undefined ? patch.activeProject : config.activeProject,
+    panelMode: patch.panelMode !== undefined ? patch.panelMode : config.panelMode,
+    pinnedProjects: patch.pinnedProjects !== undefined ? patch.pinnedProjects : config.pinnedProjects,
+  });
+  if (checking()) return normalized;
+  return saveGlobalProjectsConfig(normalized);
+}
+
+/**
+ * Resolves which projects the panel should render.
+ *
+ * Precedence: block-level `props.projects` override > `pinnedProjects` in
+ * multi mode > `activeProject` in single mode. Returns context objects built
+ * exactly like `resolveContext` builds the single-project context.
+ */
+export function resolveWorkspaceProjects(config, rawProps = {}) {
+  const normalized = normalizeProjectsConfig(config || {});
+  const byId = new Map(normalized.projects.map((project) => [project.id, project]));
+  let mode = normalized.panelMode;
+  let selected = [];
+
+  const propsProjects = Array.isArray(rawProps?.projects) ? rawProps.projects : null;
+  if (propsProjects && propsProjects.length > 0) {
+    selected = propsProjects.map(normalizeProject).filter(Boolean);
+    if (selected.length > 0) mode = selected.length > 1 ? PANEL_MODE_MULTI : PANEL_MODE_SINGLE;
+  }
+
+  if (selected.length === 0) {
+    if (mode === PANEL_MODE_MULTI) {
+      selected = normalized.pinnedProjects.map((id) => byId.get(id)).filter(Boolean);
+      if (selected.length === 0) {
+        const active = byId.get(normalized.activeProject);
+        selected = active ? [active] : normalized.projects[0] ? [normalized.projects[0]] : [];
+      }
+    } else {
+      selected = [byId.get(normalized.activeProject)].filter(Boolean);
+    }
+  }
+
+  const contexts = selected
+    .map((project) =>
+      buildContextFromProps(rawProps, {
+        ...project,
+        projectId: project.id,
+        source: "project",
+      }),
+    )
+    .filter(Boolean);
+
+  return {
+    mode: contexts.length > 1 ? PANEL_MODE_MULTI : PANEL_MODE_SINGLE,
+    projects: contexts,
+    activeProject: normalized.activeProject,
+    pinnedProjects: normalized.pinnedProjects,
+    config: normalized,
+  };
 }
 
 export function saveActiveProjectMirror(project) {
@@ -2123,4 +2267,320 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     spacesCount: (spaces || []).length,
     panesCount: (panes || []).length,
   };
+}
+
+function compareQueueItems(a, b) {
+  const pa = a.priority ?? 99;
+  const pb = b.priority ?? 99;
+  if (pa !== pb) return pa - pb;
+  if (a.isOptedIn !== b.isOptedIn) return a.isOptedIn ? -1 : 1;
+  if (a.isReady !== b.isReady) return a.isReady ? -1 : 1;
+  const ar = a.agentStatus ? AGENT_RANK[a.agentStatus] ?? 0 : 0;
+  const br = b.agentStatus ? AGENT_RANK[b.agentStatus] ?? 0 : 0;
+  if (ar !== br) return br - ar;
+  const ap = a.projectName || "";
+  const bp = b.projectName || "";
+  if (ap !== bp) return ap < bp ? -1 : 1;
+  return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+}
+
+function eventSortMs(ev) {
+  const raw = ev?.created_at ?? ev?.CreatedAt ?? ev?.timestamp ?? ev?.ts ?? 0;
+  if (typeof raw === "number") return raw > 1e12 ? raw : raw * 1000;
+  const ms = Date.parse(String(raw || ""));
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
+/**
+ * Unwraps a Promise.allSettled-style entry or a plain project result. A plain
+ * result carries either a normalized `queue`, a raw `snapshot`, or an error.
+ */
+function normalizeProjectResult(entry, index, herdrLive) {
+  const raw = entry && typeof entry === "object" ? entry : {};
+  let source = raw;
+  let error = raw.error ?? null;
+  if (raw.status === "fulfilled") {
+    source = raw.value && typeof raw.value === "object" ? raw.value : {};
+    error = source.error ?? raw.error ?? null;
+  } else if (raw.status === "rejected") {
+    source = raw.value && typeof raw.value === "object" ? raw.value : {};
+    error = raw.reason ?? source.error ?? raw.error ?? "Unknown error";
+  }
+  const projectId = String(source.projectId || raw.projectId || `project-${index + 1}`);
+  const projectName = source.projectName || raw.projectName || projectId;
+  const projectCtx = source.projectCtx || raw.projectCtx || null;
+  let queue = source.queue && typeof source.queue === "object" ? source.queue : null;
+  if (!queue && source.snapshot && typeof source.snapshot === "object") {
+    try {
+      queue = normalizeQueue(source.snapshot, herdrLive || {});
+    } catch (err) {
+      queue = null;
+      if (!error) error = err?.message || String(err);
+    }
+  }
+  const queueRunner = queue?.runner || null;
+  // A fetched binary runner does not carry live state; only a snapshot runner does.
+  const sourceRunner =
+    source.runner && typeof source.runner === "object" && ("active" in source.runner || "lock_held" in source.runner)
+      ? source.runner
+      : null;
+  return {
+    projectId,
+    projectName,
+    projectCtx,
+    color: source.color || raw.color || projectColorFor(projectId),
+    queue,
+    runner: queueRunner || sourceRunner || null,
+    envs: Array.isArray(source.envs) ? source.envs : queue?.envs,
+    formulas: Array.isArray(source.formulas) ? source.formulas : queue?.formulas,
+    error: error ? String(error?.message ?? error) : null,
+  };
+}
+
+/**
+ * Merges per-project normalized queues into the single queue shape the panel
+ * already renders.
+ *
+ * Every item gets a namespaced `id`/`uid` of `${projectId}::${rawId}` so two
+ * projects that both have `rsc-1` cannot collide in `selectedId`, list keys or
+ * the Inspector. `rawId`, `beadId` and `taskId` stay untouched, and each item
+ * carries `projectId` / `projectName` / `projectColor` / `projectCtx` so actions
+ * and detail fetches route to the owning project's DB and config.
+ *
+ * `projectResults` accepts either plain entries (`{ projectId, projectName,
+ * projectCtx, queue | snapshot, error }`) or Promise.allSettled results.
+ */
+export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
+  const results = (Array.isArray(projectResults) ? projectResults : []).map((entry, index) =>
+    normalizeProjectResult(entry, index, herdrLive),
+  );
+
+  const projects = results.map((result) => ({
+    id: result.projectId,
+    name: result.projectName,
+    color: result.color,
+    ctx: result.projectCtx,
+    runner:
+      result.runner ||
+      result.queue?.runner || { lock_path: "", lock_held: false, active: false },
+    envs: Array.isArray(result.envs) ? result.envs : [],
+    formulas: Array.isArray(result.formulas) ? result.formulas : [],
+    error: result.error,
+    itemCount: result.queue?.items?.length ?? 0,
+  }));
+
+  const items = [];
+  const itemsByRaw = new Map();
+  const epics = [];
+
+  for (const result of results) {
+    const queue = result.queue;
+    if (!queue) continue;
+    const base = {
+      projectId: result.projectId,
+      projectName: result.projectName,
+      projectColor: result.color,
+      projectCtx: result.projectCtx || null,
+    };
+    const byRaw = new Map();
+    for (const item of queue.items || []) {
+      const rawId = item.id;
+      const uid = `${result.projectId}::${rawId}`;
+      const merged = { ...item, ...base, id: uid, uid, rawId };
+      merged._searchText = [item._searchText, result.projectName]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      items.push(merged);
+      byRaw.set(rawId, merged);
+      itemsByRaw.set(uid, merged);
+    }
+    for (const epic of queue.epics || []) {
+      const rawEpicId = epic.id;
+      const uid = `${result.projectId}::${rawEpicId}`;
+      const mergedEpic = {
+        ...epic,
+        ...base,
+        id: uid,
+        uid,
+        rawId: rawEpicId,
+        children: (epic.children || []).map((child) => byRaw.get(child.id) || child),
+      };
+      epics.push(mergedEpic);
+      if (!itemsByRaw.has(uid)) {
+        itemsByRaw.set(uid, {
+          ...base,
+          id: uid,
+          uid,
+          rawId: rawEpicId,
+          beadId: rawEpicId,
+          taskId: null,
+          title: mergedEpic.title,
+          priority: mergedEpic.priority,
+          issueType: "epic",
+          status: mergedEpic.status,
+          bdStatus: mergedEpic.status,
+          column: mergedEpic.status === "closed" ? "closed" : "ready",
+          labels: mergedEpic.labels || [],
+          blockedBy: [],
+          blocks: [],
+          issue: mergedEpic.issue,
+        });
+      }
+    }
+  }
+
+  const sorted = [...items].sort(compareQueueItems);
+  const columnKeys = ["ready", "queue", "running", "action", "review", "closed"];
+  const columns = {};
+  for (const key of columnKeys) {
+    columns[key] = sorted.filter((item) => item.column === key);
+  }
+  const beadItems = sorted.filter((item) => Boolean(item.beadId));
+  const beadColumns = {
+    backlog: beadItems.filter((item) => item.beadColumn === "backlog"),
+    ready: beadItems.filter((item) => item.beadColumn === "ready"),
+    in_progress: beadItems.filter((item) => item.beadColumn === "in_progress"),
+    blocked: beadItems.filter((item) => item.beadColumn === "blocked"),
+    closed: beadItems.filter((item) => item.beadColumn === "closed"),
+  };
+
+  // Environments merge by name; capacity is summed across projects and the
+  // per-project split stays available for tooltips.
+  const envsByName = new Map();
+  for (const result of results) {
+    for (const env of result.queue?.envs || []) {
+      if (!env?.name) continue;
+      const counts = {
+        maxRunning: env.maxRunning ?? 0,
+        runningWorkSteps: env.runningWorkSteps ?? 0,
+      };
+      const existing = envsByName.get(env.name);
+      if (!existing) {
+        envsByName.set(env.name, {
+          ...env,
+          byProject: { [result.projectId]: counts },
+        });
+      } else {
+        existing.runningWorkSteps += counts.runningWorkSteps;
+        existing.maxRunning = Math.max(existing.maxRunning || 0, counts.maxRunning || 0);
+        existing.byProject[result.projectId] = counts;
+      }
+    }
+  }
+  const envs = [...envsByName.values()];
+
+  const formulasSeen = new Set();
+  const formulas = [];
+  for (const result of results) {
+    for (const formula of result.queue?.formulas || []) {
+      const name = typeof formula === "string" ? formula : formula?.name;
+      if (!name || formulasSeen.has(name)) continue;
+      formulasSeen.add(name);
+      formulas.push(formula);
+    }
+  }
+
+  const tagProject = (result, payload) => ({
+    ...payload,
+    projectId: result.projectId,
+    projectName: result.projectName,
+    projectColor: result.color,
+  });
+  const events = [];
+  const mirrorIntegrations = [];
+  const intakePreview = [];
+  for (const result of results) {
+    for (const ev of result.queue?.events || []) events.push(tagProject(result, ev));
+    for (const mi of result.queue?.mirrorIntegrations || []) {
+      mirrorIntegrations.push(tagProject(result, mi));
+    }
+    for (const plan of result.queue?.intakePreview || []) {
+      intakePreview.push(tagProject(result, plan));
+    }
+  }
+  events.sort((a, b) => eventSortMs(b) - eventSortMs(a));
+  mirrorIntegrations.sort((a, b) => eventSortMs(b) - eventSortMs(a));
+
+  const runnerPerProject = results.map((result) => {
+    const runner = result.runner || result.queue?.runner || {};
+    return {
+      projectId: result.projectId,
+      projectName: result.projectName,
+      color: result.color,
+      active: Boolean(runner.active ?? runner.lock_held),
+      lockHeld: Boolean(runner.lock_held),
+      pid: runner.pid ?? null,
+      mode: runner.mode || "",
+      db: runner.db || result.projectCtx?.db || "",
+      logPath: runner.log_path || "",
+      error: result.error,
+    };
+  });
+  const activeCount = runnerPerProject.filter((entry) => entry.active).length;
+  const activeRunner = runnerPerProject.find((entry) => entry.active) || null;
+  const runner =
+    results.length > 1
+      ? {
+          active: activeCount > 0,
+          lock_held: runnerPerProject.some((entry) => entry.lockHeld),
+          activeCount,
+          total: runnerPerProject.length,
+          perProject: runnerPerProject,
+          db: activeRunner?.db || runnerPerProject[0]?.db || "",
+          pid: activeRunner?.pid ?? null,
+          mode: activeRunner?.mode || "",
+          log_path: activeRunner?.logPath || "",
+        }
+      : firstRunner(results[0]);
+
+  const generatedAt =
+    results
+      .map((result) => result.queue?.generatedAt)
+      .filter(Boolean)
+      .sort()
+      .pop() || null;
+  const errors = results.map((result) => result.error).filter(Boolean);
+  const bdErrors = results
+    .map((result) =>
+      result.queue?.bdError ? `${result.projectName}: ${result.queue.bdError}` : null,
+    )
+    .filter(Boolean);
+  const mirror =
+    results
+      .map((result) => result.queue?.mirror)
+      .find((value) => value && Object.keys(value).length > 0) || {};
+
+  return {
+    items: sorted,
+    itemsById: itemsByRaw,
+    columns,
+    beadColumns,
+    epics,
+    envs,
+    envsByName,
+    defaultEnv: results.map((result) => result.queue?.defaultEnv).find(Boolean) || "local",
+    formulas,
+    mirror,
+    mirrorIntegrations,
+    events,
+    intakePreview,
+    bdAvailable: results.some((result) => Boolean(result.queue?.bdAvailable)),
+    bdError: bdErrors.length > 0 ? bdErrors.join(" · ") : null,
+    runner,
+    paths: {},
+    generatedAt,
+    projects,
+    panelMode: results.length > 1 ? PANEL_MODE_MULTI : PANEL_MODE_SINGLE,
+    error:
+      errors.length > 0 && results.every((result) => !result.queue) ? errors.join(" | ") : null,
+    spacesCount: Array.isArray(herdrLive?.spaces) ? herdrLive.spaces.length : 0,
+    panesCount: Array.isArray(herdrLive?.panes) ? herdrLive.panes.length : 0,
+  };
+}
+
+function firstRunner(result) {
+  if (!result) return { lock_path: "", lock_held: false, active: false };
+  if (result.runner) return result.runner;
+  return result.queue?.runner || { lock_path: "", lock_held: false, active: false };
 }
