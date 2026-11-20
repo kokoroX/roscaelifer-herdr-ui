@@ -950,6 +950,8 @@ export class InspectorController {
                   name: item.beadId || item.taskId || item.title,
                   folder: worktree,
                   machine: resolvedMachine,
+                  envSpace: item.sessionInfo?.envSpace ?? null,
+                  projectRepo: item.projectCtx?.repo ?? null,
                 }),
                 { icon: "folder" },
               ),

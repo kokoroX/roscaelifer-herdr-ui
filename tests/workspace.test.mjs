@@ -4,10 +4,19 @@ import { registerHooks } from "node:module";
 
 // `store.js` imports `herdr`, which only exists inside the Herdr UI runtime.
 // Mock it so project config + queue merging can be exercised under plain node.
+// `board.js` additionally imports the GPUI element builders, which only exist
+// inside the runtime too, so those are stubbed as well: the pure helpers under
+// test never call them.
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "herdr") {
       return { url: "herdr:mock", shortCircuit: true };
+    }
+    if (specifier === "gpui-kit") {
+      return { url: "gpui-kit:mock", shortCircuit: true };
+    }
+    if (specifier === "gpui-base") {
+      return { url: "gpui-base:mock", shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
@@ -25,6 +34,49 @@ registerHooks({
           export const spaces = () => mock().spaces?.() ?? [];
           export const readTextFile = async (...args) =>
             mock().readTextFile ? mock().readTextFile(...args) : null;
+          export const run = (...args) => mock().run?.(...args) ?? null;
+          export const notify = (...args) => mock().notify?.(...args) ?? null;
+          export const agents = () => mock().agents?.() ?? [];
+          export const terminals = () => mock().terminals?.() ?? [];
+          export const settings = () => mock().settings?.() ?? {};
+          export const theme = () => mock().theme?.() ?? {};
+        `,
+        shortCircuit: true,
+      };
+    }
+    if (url === "gpui-kit:mock") {
+      return {
+        format: "module",
+        source: `
+          function stub() { return {}; }
+          stub.new = () => ({ on() {}, value: () => "", set_value() {}, focus() {} });
+          export const div = stub;
+          export const svg = stub;
+          export const list = stub;
+        `,
+        shortCircuit: true,
+      };
+    }
+    if (url === "gpui-base:mock") {
+      return {
+        format: "module",
+        source: `
+          function stub() { return {}; }
+          stub.new = () => ({ on() {}, value: () => "", set_value() {}, focus() {} });
+          export const v_flex = stub;
+          export const h_flex = stub;
+          export const Checkbox = stub;
+          export const InputState = stub;
+          export const Input = stub;
+          export const Button = stub;
+          export const Switch = stub;
+          export const Tabs = stub;
+          export const Tab = stub;
+          export const Progress = stub;
+          export const ProgressTrack = stub;
+          export const ProgressIndicator = stub;
+          export const ScrollHandle = stub;
+          export const Scrollbar = stub;
         `,
         shortCircuit: true,
       };
@@ -34,6 +86,9 @@ registerHooks({
 });
 
 const store = await import("../mods/roscaelifer-queue/store.js");
+const actionsMod = await import("../mods/roscaelifer-queue/actions.js");
+const boardMod = await import("../mods/roscaelifer-queue/board.js");
+const depsMod = await import("../mods/roscaelifer-queue/deps.js");
 
 function withHerdrMock(mock, fn) {
   globalThis.__roscaeliferHerdrMock = mock;
@@ -442,4 +497,287 @@ test("mergeNormalizedQueues accepts raw snapshots and namespaces them too", () =
   assert.equal(merged.items[0].id, "gamma::rsc-9");
   assert.equal(merged.items[0].beadId, "rsc-9");
   assert.equal(merged.items[0].projectName, "Gamma");
+});
+
+function makeActionsClient() {
+  return actionsMod.createActions({
+    getCtx: () => null,
+    getRunner: () => null,
+    onBusyChange: () => {},
+    onRefresh: async () => {},
+  });
+}
+
+test("resolveWorktreeOwnerSpace matches envSpace by id, machine-prefixed id and name", () => {
+  const local = { id: "space-local", name: "Local Space", folder: "/repos/alpha", machine: "" };
+  const remote = { id: "m1/space-remote", name: "remote-env", folder: "/repos/beta", machine: "m1" };
+  const spaces = [local, remote];
+
+  assert.equal(actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "space-local" }), local);
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "space-local", machine: "" }),
+    local,
+  );
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "space-remote", machine: "m1" }),
+    remote,
+  );
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "m1/space-remote", machine: "m1" }),
+    remote,
+  );
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "remote-env", machine: "m1" }),
+    remote,
+  );
+  // An envSpace from another machine must not match.
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({ spaces, envSpace: "space-local", machine: "m1" }),
+    null,
+  );
+  assert.equal(actionsMod.resolveWorktreeOwnerSpace({ spaces }), null);
+});
+
+test("resolveWorktreeOwnerSpace takes the deepest project folder and skips container dirs", () => {
+  const homeDir = "/Users/tester";
+  const repo = { id: "space-repo", name: "Repo", folder: "/Users/tester/work/roscaelifer/", machine: "" };
+  const workRoot = { id: "space-work", name: "Work", folder: "/Users/tester/work", machine: "" };
+  const spaces = [workRoot, repo];
+
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({
+      spaces,
+      projectRepo: "/Users/tester/work/roscaelifer",
+      homeDir,
+    }),
+    repo,
+  );
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({
+      spaces,
+      projectRepo: "/Users/tester/work/roscaelifer/.worktrees/wt-1",
+      homeDir,
+    }),
+    repo,
+  );
+  // Prefix must land on a real path segment boundary.
+  assert.equal(
+    actionsMod.resolveWorktreeOwnerSpace({
+      spaces: [{ id: "space-x", name: "X", folder: "/Users/tester/work/rosc", machine: "" }],
+      projectRepo: "/Users/tester/work/roscaelifer",
+      homeDir,
+    }),
+    null,
+  );
+  // Container directories never own a worktree.
+  const containers = [
+    "/",
+    "/tmp",
+    "/private/tmp",
+    "/Users",
+    "/home",
+    homeDir,
+    `${homeDir}/code`,
+    `${homeDir}/work`,
+    `${homeDir}/worktrees`,
+  ];
+  for (const folder of containers) {
+    const container = { id: `space-${folder}`, name: folder, folder, machine: "" };
+    assert.equal(
+      actionsMod.resolveWorktreeOwnerSpace({
+        spaces: [container],
+        projectRepo: `${homeDir}/work/roscaelifer`,
+        homeDir,
+      }),
+      null,
+      `expected ${folder} not to own a worktree`,
+    );
+  }
+});
+
+test("openWorktree selects the owning space and opens a tab there", async () => {
+  const runs = [];
+  const owner = { id: "space-repo", name: "Repo", folder: "/Users/tester/work/roscaelifer", machine: "" };
+  await withHerdrMock(
+    {
+      spaces: () => [owner],
+      home: () => "/Users/tester",
+      run: (...args) => runs.push(args),
+    },
+    async () => {
+      const actions = makeActionsClient();
+      actions.openWorktree({
+        name: "rsc-1",
+        folder: "/Users/tester/work/roscaelifer/.worktrees/wt-1",
+        projectRepo: "/Users/tester/work/roscaelifer",
+      });
+    },
+  );
+
+  assert.deepEqual(runs, [
+    ["space.select", { id: "space-repo" }],
+    [
+      "tab.new",
+      {
+        space: "space-repo",
+        folder: "/Users/tester/work/roscaelifer/.worktrees/wt-1",
+        name: "rsc-1",
+      },
+    ],
+  ]);
+  assert.equal(runs.some(([action]) => action === "space.new"), false);
+});
+
+test("openWorktree matches remote spaces by machine", async () => {
+  const runs = [];
+  const local = { id: "space-local", name: "Repo", folder: "/repos/alpha", machine: "" };
+  const remote = { id: "m1/space-remote", name: "Repo Remote", folder: "/repos/alpha", machine: "m1" };
+  await withHerdrMock(
+    {
+      spaces: () => [local, remote],
+      home: () => "/Users/tester",
+      run: (...args) => runs.push(args),
+    },
+    async () => {
+      const actions = makeActionsClient();
+      actions.openWorktree({ folder: "/repos/alpha/wt", machine: "m1", projectRepo: "/repos/alpha" });
+    },
+  );
+
+  assert.deepEqual(runs, [
+    ["space.select", { id: "m1/space-remote" }],
+    ["tab.new", { space: "m1/space-remote", folder: "/repos/alpha/wt" }],
+  ]);
+});
+
+test("openWorktree falls back to space.new when no owning space matches", async () => {
+  const runs = [];
+  const containerOnly = { id: "space-work", name: "Work", folder: "/Users/tester/work", machine: "" };
+  await withHerdrMock(
+    {
+      spaces: () => [containerOnly],
+      home: () => "/Users/tester",
+      run: (...args) => runs.push(args),
+    },
+    async () => {
+      const actions = makeActionsClient();
+      actions.openWorktree({
+        name: "rsc-2",
+        folder: "/tmp/wt-2",
+        machine: "",
+        projectRepo: "/elsewhere/repo",
+      });
+      actions.openWorktree({ folder: "/tmp/wt-3" });
+    },
+  );
+
+  assert.deepEqual(runs, [
+    ["space.new", { folder: "/tmp/wt-2", name: "rsc-2" }],
+    ["space.new", { folder: "/tmp/wt-3" }],
+  ]);
+});
+
+test("shouldVirtualizeColumn always virtualizes closed and only long active columns", () => {
+  const { shouldVirtualizeColumn, VIRTUALIZE_COLUMN_THRESHOLD } = boardMod;
+  assert.equal(VIRTUALIZE_COLUMN_THRESHOLD, 20);
+
+  // `closed` is unbounded, so it is virtualized even when empty.
+  assert.equal(shouldVirtualizeColumn("closed", 0), true);
+  assert.equal(shouldVirtualizeColumn("closed", 3), true);
+  assert.equal(shouldVirtualizeColumn("closed", 5000), true);
+
+  // Active columns keep their inline action buttons until they get long.
+  for (const key of [
+    "backlog",
+    "ready",
+    "queue",
+    "running",
+    "in_progress",
+    "blocked",
+    "action",
+    "review",
+  ]) {
+    assert.equal(shouldVirtualizeColumn(key, 0), false, key);
+    assert.equal(shouldVirtualizeColumn(key, 20), false, key);
+    assert.equal(shouldVirtualizeColumn(key, 21), true, key);
+    assert.equal(shouldVirtualizeColumn(key, 94), true, key);
+  }
+});
+
+test("BoardController.scrollBy keeps fractional offsets but only notifies on integer moves", () => {
+  const scrollBy = boardMod.BoardController.prototype.scrollBy;
+  const notifies = [];
+  const cx = { notify: () => notifies.push("notify") };
+  const board = Object.assign(Object.create(boardMod.BoardController.prototype), {
+    scrollX: 10,
+    viewportW: 100,
+    contentW: 500,
+    _minContentW: 0,
+  });
+
+  // 10 -> 9.6 renders at the same integer offset, so no rebuild.
+  scrollBy.call(board, 0.4, cx);
+  assert.equal(board.scrollX, 9.6);
+  assert.deepEqual(notifies, []);
+
+  // 9.6 -> 9.2 crosses into the next pixel.
+  scrollBy.call(board, 0.4, cx);
+  assert.equal(board.scrollX, 9.2);
+  assert.equal(Math.round(board.scrollX), 9);
+  assert.deepEqual(notifies, ["notify"]);
+
+  // Clamped at the left edge: no change, no notify.
+  board.scrollX = 0;
+  scrollBy.call(board, 12, cx);
+  assert.equal(board.scrollX, 0);
+  assert.deepEqual(notifies, ["notify"]);
+
+  // Clamped at the right edge.
+  board.scrollX = 395;
+  notifies.length = 0;
+  scrollBy.call(board, -12, cx);
+  assert.equal(board.scrollX, 400);
+  assert.deepEqual(notifies, ["notify"]);
+});
+
+test("DepsController.scrollWavesBy keeps fractional offsets but only notifies on integer moves", () => {
+  const scrollWavesBy = depsMod.DepsController.prototype.scrollWavesBy;
+  const notifies = [];
+  const cx = { notify: () => notifies.push("notify") };
+  const deps = Object.assign(Object.create(depsMod.DepsController.prototype), {
+    wavesScrollX: 10,
+    wavesViewportW: 100,
+    wavesContentW: 500,
+    _minWavesContentW: 0,
+  });
+
+  scrollWavesBy.call(deps, 0.4, cx);
+  assert.equal(deps.wavesScrollX, 9.6);
+  assert.deepEqual(notifies, []);
+
+  scrollWavesBy.call(deps, 0.4, cx);
+  assert.equal(Math.round(deps.wavesScrollX), 9);
+  assert.deepEqual(notifies, ["notify"]);
+});
+
+test("findEventItem resolves events through an O(1) project-scoped index", () => {
+  const proto = depsMod.DepsController.prototype;
+  const items = [
+    makeItem("alpha::rsc-1", { id: "alpha::rsc-1", taskId: "7", projectId: "alpha" }),
+    makeItem("beta::rsc-1", { id: "beta::rsc-1", taskId: "7", projectId: "beta" }),
+    makeItem("alpha::rsc-9", { id: "alpha::rsc-9", beadId: "rsc-9", projectId: "alpha" }),
+  ];
+  const index = proto.buildEventItemIndex.call({}, items);
+
+  assert.equal(proto.findEventItem.call({}, index, "7", "alpha").id, "alpha::rsc-1");
+  assert.equal(proto.findEventItem.call({}, index, "7", "beta").id, "beta::rsc-1");
+  // bead ids and raw ids both resolve.
+  assert.equal(proto.findEventItem.call({}, index, "rsc-9", "alpha").id, "alpha::rsc-9");
+  // A task from another project never links to a same-numbered item.
+  assert.equal(proto.findEventItem.call({}, index, "7", "gamma"), null);
+  // Without a project tag the first match wins.
+  assert.equal(proto.findEventItem.call({}, index, "7", null).id, "alpha::rsc-1");
+  // Unknown or empty task ids link to nothing.
+  assert.equal(proto.findEventItem.call({}, index, "404", "alpha"), null);
+  assert.equal(proto.findEventItem.call({}, index, "", "alpha"), null);
 });

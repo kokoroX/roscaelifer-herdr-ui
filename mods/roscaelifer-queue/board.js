@@ -13,7 +13,6 @@ import {
   ProgressIndicator,
   ScrollHandle,
   Scrollbar,
-  TextView,
 } from "gpui-base";
 import { settings, theme, notify } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
@@ -124,6 +123,18 @@ function actionReasonBadge(reason, t) {
   }
 }
 
+/** Columns with more than this many cards are rendered as a virtual list. */
+export const VIRTUALIZE_COLUMN_THRESHOLD = 20;
+
+/**
+ * A column is virtualized when it is the unbounded `closed` lane or when it
+ * holds more cards than the threshold. Small columns keep the inline action
+ * buttons that a virtual list's row renderer cannot own.
+ */
+export function shouldVirtualizeColumn(colKey, itemCount) {
+  return colKey === "closed" || itemCount > VIRTUALIZE_COLUMN_THRESHOLD;
+}
+
 function chip(text, color, bg, borderColor = null) {
   return div()
     .px(6)
@@ -135,15 +146,6 @@ function chip(text, color, bg, borderColor = null) {
     .text_color(color)
     .whitespace_nowrap()
     .child(text);
-}
-
-function escapeHtml(text) {
-  return String(text ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/\n/g, "<br/>");
 }
 
 function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, onClick }) {
@@ -289,10 +291,11 @@ export class BoardController {
       query: null,
       columns: null,
       visibleAll: null,
-      closedItemsByKey: null,
+      itemsByKeyByCol: null,
     };
     // The active columns and the horizontal row keep their scroll position by
-    // name; `closed` is a virtual `list()` and owns its own.
+    // name; a virtualized column (`closed`, or any past the threshold) is a
+    // virtual `list()` and owns its own.
     this.colScrolls = {
       backlog: ScrollHandle.new(),
       ready: ScrollHandle.new(),
@@ -329,11 +332,14 @@ export class BoardController {
     return changed;
   }
 
+  // `scrollX` stays fractional so wheel deltas accumulate smoothly; only a
+  // change of the rendered integer offset is worth a full view-tree rebuild.
   scrollBy(rawDx, cx) {
-    const next = Math.max(0, Math.min(this.scrollX - rawDx, this.maxScrollX()));
-    if (next === this.scrollX) return;
+    const prev = this.scrollX;
+    const next = Math.max(0, Math.min(prev - rawDx, this.maxScrollX()));
+    if (next === prev) return;
     this.scrollX = next;
-    cx?.notify();
+    if (Math.round(next) !== Math.round(prev)) cx?.notify();
   }
 
   handleOuterScrollWheel(e, cx) {
@@ -783,13 +789,10 @@ export class BoardController {
           ),
       )
       .child(
-        interactive
-          ? TextView.html(`card-title-${item.id}`, `<span>${escapeHtml(item.title || "")}</span>`).selectable(true)
-          : div()
-              .text_size(12.5)
-              .font_medium()
-              .text_color(t.foreground)
-              .child(item.title),
+        // A plain div: the card title is rebuilt for every visible row, and a
+        // selectable TextView there is what made long columns scroll badly.
+        // The Inspector still renders the title selectable.
+        div().text_size(12.5).font_medium().text_color(t.foreground).child(item.title),
       )
       .child(
         h_flex()
@@ -1151,11 +1154,12 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  // `closed` can hold thousands of beads, so it is a virtual list: only what is
-  // on screen is laid out. A row may register no handlers of its own, which is
-  // why the card inside it is drawn display-only and the press is answered by
-  // `on_item_click` on the list (the Inspector carries the real actions).
-  renderClosedColumnBody(col, listItems, { selectedId, onSelectItem, itemsByKey }, t) {
+  // `closed` (and any column past `VIRTUALIZE_COLUMN_THRESHOLD` cards) is a
+  // virtual list: only what is on screen is laid out. A row may register no
+  // handlers of its own, which is why the card inside it is drawn display-only
+  // and the press is answered by `on_item_click` on the list (the Inspector
+  // carries the real actions).
+  renderVirtualizedColumnBody(col, listItems, { selectedId, onSelectItem, itemsByKey }, t) {
     if (listItems.length === 0) {
       return div()
         .flex_1()
@@ -1239,8 +1243,11 @@ export class BoardController {
       columns[col.key] = listItems;
       visibleAll.push(...listItems);
     }
-    const closedItemsByKey = new Map(
-      (columns.closed || []).map((item) => [String(item.id), item]),
+    const itemsByKeyByCol = new Map(
+      Object.entries(columns).map(([key, list]) => [
+        key,
+        new Map(list.map((item) => [String(item.id), item])),
+      ]),
     );
     this._filterCache = {
       queue,
@@ -1253,7 +1260,7 @@ export class BoardController {
       mode: this.mode,
       columns,
       visibleAll,
-      closedItemsByKey,
+      itemsByKeyByCol,
     };
     return this._filterCache;
   }
@@ -1261,7 +1268,7 @@ export class BoardController {
   render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter }, cx) {
     void cx;
     const t = theme();
-    const { columns: cols, visibleAll, closedItemsByKey } = this.getFilteredColumns(queue, {
+    const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
       showWip,
       showEphemeral,
       projectFilter,
@@ -1271,6 +1278,7 @@ export class BoardController {
     const colViews = boardColumns.map((col) => {
       const listItems = cols[col.key] || [];
       const accent = columnAccent(col.key, t);
+      const virtual = shouldVirtualizeColumn(col.key, listItems.length);
 
       return v_flex()
         .id(`col-${col.key}`)
@@ -1310,8 +1318,17 @@ export class BoardController {
             ),
         )
         .child(
-          col.key === "closed"
-            ? this.renderClosedColumnBody(col, listItems, { selectedId, onSelectItem, itemsByKey: closedItemsByKey }, t)
+          virtual
+            ? this.renderVirtualizedColumnBody(
+                col,
+                listItems,
+                {
+                  selectedId,
+                  onSelectItem,
+                  itemsByKey: itemsByKeyByCol.get(col.key) ?? new Map(),
+                },
+                t,
+              )
             : this.renderActiveColumnBody(
                 col,
                 listItems,
@@ -1365,7 +1382,7 @@ export class BoardController {
               .min_h(0)
               .w_full()
               .min_w(minContentW)
-              .ml(-this.scrollX)
+              .ml(-Math.round(this.scrollX))
               .p(10)
               .gap(10)
               .on_size_change((size, sizeCx) => {

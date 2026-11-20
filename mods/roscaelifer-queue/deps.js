@@ -1,4 +1,4 @@
-import { div } from "gpui-kit";
+import { div, list } from "gpui-kit";
 import {
   v_flex,
   h_flex,
@@ -16,6 +16,9 @@ import { createColumnScrollLock } from "./scroll-lock.js";
 import { renderProjectFilterPills } from "./board.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
+
+/** Event streams longer than this become a virtual list. */
+const EVENT_VIRTUALIZE_THRESHOLD = 30;
 
 function statusColor(status, t) {
   switch (String(status ?? "").toLowerCase()) {
@@ -312,6 +315,20 @@ export class DepsController {
       projectFilter: null,
       data: null,
     };
+    // Multi-project waves recompute a `computeWaves` per project section; the
+    // section list is cached so a horizontal scroll frame reuses it.
+    this._groupedWaveCache = {
+      queue: null,
+      projects: null,
+      selectedEpicId: null,
+      showClosedInWaves: null,
+      showWip: null,
+      showEphemeral: null,
+      projectFilter: null,
+      chainFocusId: null,
+      selectedId: undefined,
+      data: null,
+    };
   }
 
   maxWavesScrollX(contentW = Math.max(this.wavesContentW, this._minWavesContentW || 0)) {
@@ -325,11 +342,14 @@ export class DepsController {
     return changed;
   }
 
+  // `wavesScrollX` stays fractional so wheel deltas accumulate smoothly; only
+  // a change of the rendered integer offset is worth a full view-tree rebuild.
   scrollWavesBy(rawDx, cx) {
-    const next = Math.max(0, Math.min(this.wavesScrollX - rawDx, this.maxWavesScrollX()));
-    if (next === this.wavesScrollX) return;
+    const prev = this.wavesScrollX;
+    const next = Math.max(0, Math.min(prev - rawDx, this.maxWavesScrollX()));
+    if (next === prev) return;
     this.wavesScrollX = next;
-    cx?.notify();
+    if (Math.round(next) !== Math.round(prev)) cx?.notify();
   }
 
   getSidebarStats(queue, epics, items, projectFilter = "all") {
@@ -895,8 +915,26 @@ export class DepsController {
       );
   }
 
-  /** Multi-project deps graph: one section per project, so blocks DAGs never mix. */
-  renderGroupedWaves(t, { epics, groups, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral }) {
+  /**
+   * Topological lanes for every project section, cached by the inputs that
+   * define them. Scrolling horizontally only changes `wavesScrollX`, so the
+   * cache turns those frames back into a pure re-layout.
+   */
+  getGroupedWaveSections(queue, epics, groups, projects, { showWip, showEphemeral, projectFilter, selectedId }) {
+    const cached = this._groupedWaveCache;
+    if (
+      cached.queue === queue &&
+      cached.projects === projects &&
+      cached.selectedEpicId === this.selectedEpicId &&
+      cached.showClosedInWaves === this.showClosedInWaves &&
+      cached.showWip === showWip &&
+      cached.showEphemeral === showEphemeral &&
+      cached.projectFilter === projectFilter &&
+      cached.chainFocusId === this.chainFocusId &&
+      cached.selectedId === selectedId
+    ) {
+      return cached.data;
+    }
     const selectedEpic = this.selectedEpicId
       ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
       : null;
@@ -918,8 +956,37 @@ export class DepsController {
         downstream: chain.downstream,
       };
     });
-    const totalNodes = sections.reduce((sum, section) => sum + section.scopedItems.length, 0);
-    const totalWaves = sections.reduce((sum, section) => sum + section.waves.length, 0);
+    const data = {
+      sections,
+      totalNodes: sections.reduce((sum, section) => sum + section.scopedItems.length, 0),
+      totalWaves: sections.reduce((sum, section) => sum + section.waves.length, 0),
+    };
+    this._groupedWaveCache = {
+      queue,
+      projects,
+      selectedEpicId: this.selectedEpicId,
+      showClosedInWaves: this.showClosedInWaves,
+      showWip,
+      showEphemeral,
+      projectFilter,
+      chainFocusId: this.chainFocusId,
+      selectedId,
+      data,
+    };
+    return data;
+  }
+
+  /** Multi-project deps graph: one section per project, so blocks DAGs never mix. */
+  renderGroupedWaves(t, { queue, epics, groups, projects, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral, projectFilter = "all" }) {
+    const selectedEpic = this.selectedEpicId
+      ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
+      : null;
+    const { sections, totalNodes, totalWaves } = this.getGroupedWaveSections(queue, epics, groups, projects, {
+      showWip,
+      showEphemeral,
+      projectFilter,
+      selectedId,
+    });
 
     return v_flex()
       .id("deps-waves-pane")
@@ -1070,14 +1137,17 @@ export class DepsController {
     const groups = this.projectGroups(projects, items, projectFilter);
     if (groups.length > 1) {
       return this.renderGroupedWaves(t, {
+        queue,
         epics,
         groups,
+        projects,
         onSelectItem,
         selectedId,
         monoFont,
         showWip,
         showEphemeral,
         onToggleShowEphemeral,
+        projectFilter,
       });
     }
     const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showWip, showEphemeral, projectFilter });
@@ -1215,7 +1285,7 @@ export class DepsController {
                   .min_h(0)
                   .w_full()
                   .min_w(minContentW)
-                  .ml(-this.wavesScrollX)
+                  .ml(-Math.round(this.wavesScrollX))
                   .on_size_change((size, sizeCx) => {
                     const zoom = settings()?.zoom || 1;
                     this.wavesContentW = size.width / zoom;
@@ -1388,6 +1458,11 @@ export class DepsController {
       const hay = `${ev.task_id ?? ""} ${ev.step_id ?? ""} ${ev.from ?? ""} ${ev.to ?? ""} ${ev.kind ?? ""} ${ev.detail ?? ""} ${ev.message ?? ""}`.toLowerCase();
       return hay.includes(q);
     });
+    const eventIndex = this.buildEventItemIndex(queue?.items ?? []);
+    const linkedItems = filteredEvents.map((ev) =>
+      this.findEventItem(eventIndex, ev.task_id ?? ev.TaskID ?? "", ev.projectId),
+    );
+    const virtualizeEvents = filteredEvents.length > EVENT_VIRTUALIZE_THRESHOLD;
 
     return v_flex()
       .id("mirror-events-root")
@@ -1453,60 +1528,115 @@ export class DepsController {
               .flex_1()
               .min_h(0)
               .child(
-                v_flex()
-                  .id("mirror-events-scroll")
-                  .track_scroll(this.eventsScroll)
-                  .size_full()
-                  .overflow_y_scroll()
-                  .p(8)
-                  .gap(4)
-                  .when(filteredEvents.length === 0, (el) =>
-                    el.child(div().p(12).text_size(12).text_color(t.dim).child("No matching events.")),
-                  )
-                  .children(
-                    filteredEvents.map((ev, idx) => {
-                      const taskId = ev.task_id ?? ev.TaskID ?? "";
-                      const stepId = ev.step_id ?? ev.StepID ?? "";
-                      const from = ev.from ?? ev.From ?? "";
-                      const to = ev.to ?? ev.To ?? "";
-                      const kind =
-                        ev.kind ??
-                        ev.Kind ??
-                        (from && to ? `${from} -> ${to}` : to || from || "event");
-                      const statusKey = ev.kind ?? ev.Kind ?? to ?? from ?? "event";
-                      const detail = ev.detail ?? ev.Detail ?? ev.message ?? "";
-                      const linkedItem =
-                        (queue?.items ?? []).find(
-                          (it) =>
-                            (!ev.projectId || it.projectId === ev.projectId) &&
-                            (it.taskId === taskId || it.id === taskId || it.rawId === taskId || it.beadId === taskId),
-                        ) ?? null;
-
-                      return h_flex()
-                        .id(`global-ev-${ev.projectId || "p"}-${ev.id ?? idx}`)
-                        .flex_none()
-                        .min_h(28)
-                        .px(10)
-                        .py(5)
-                        .gap(10)
-                        .items_center()
-                        .rounded(6)
-                        .when(Boolean(linkedItem), (el) =>
-                          el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => onSelectItem?.(linkedItem, cx)),
-                        )
-                        .when(Boolean(ev.projectName), (el) =>
-                          el.child(pill(t, ev.projectName, ev.projectColor || t.accent)),
-                        )
-                        .child(div().w(115).flex_none().font_family(monoFont).text_size(11).text_color(t.dim).child(formatTimestamp(ev.created_at ?? ev.CreatedAt)))
-                        .child(div().w(120).flex_none().truncate().font_family(monoFont).text_size(11).text_color(t.accent).child(taskId || "-"))
-                        .child(div().w(95).flex_none().truncate().font_family(monoFont).text_size(11).text_color(t.muted).child(stepId || "-"))
-                        .child(div().w(135).flex_none().child(pill(t, kind, statusColor(statusKey, t))))
-                        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(String(detail || "")));
-                    }),
-                  ),
+                virtualizeEvents
+                  ? list(
+                      "mirror-events-scroll",
+                      filteredEvents.length,
+                      (i) => String(i),
+                      (i, rowCx) => {
+                        void rowCx;
+                        return div()
+                          .w_full()
+                          .px(8)
+                          .pt(i === 0 ? 8 : 0)
+                          .pb(4)
+                          .child(
+                            this.renderEventRow(
+                              t,
+                              filteredEvents[i],
+                              linkedItems[i],
+                              i,
+                              monoFont,
+                              { interactive: false },
+                            ),
+                          );
+                      },
+                    )
+                      .size_full()
+                      .on_item_click((key, clickCx) => {
+                        const target = linkedItems[Number(key)];
+                        if (target) onSelectItem?.(target, clickCx);
+                      })
+                  : v_flex()
+                      .id("mirror-events-scroll")
+                      .track_scroll(this.eventsScroll)
+                      .size_full()
+                      .overflow_y_scroll()
+                      .p(8)
+                      .gap(4)
+                      .when(filteredEvents.length === 0, (el) =>
+                        el.child(div().p(12).text_size(12).text_color(t.dim).child("No matching events.")),
+                      )
+                      .children(
+                        filteredEvents.map((ev, idx) =>
+                          this.renderEventRow(t, ev, linkedItems[idx], idx, monoFont, { onSelectItem }),
+                        ),
+                      ),
               )
               .child(Scrollbar.vertical("mirror-events-scroll").absolute().inset_0()),
           ),
       );
+  }
+
+  /**
+   * O(1) event → item lookup. Each event row used to run
+   * `queue.items.find(...)` over 1,800+ merged items, which is what made the
+   * long event stream expensive to scroll.
+   */
+  buildEventItemIndex(items = []) {
+    const byProjectAndKey = new Map();
+    const byKey = new Map();
+    for (const it of items) {
+      for (const raw of [it.taskId, it.id, it.rawId, it.beadId]) {
+        if (raw === undefined || raw === null || raw === "") continue;
+        const key = String(raw);
+        const composite = `${it.projectId ?? ""}\u0000${key}`;
+        if (!byProjectAndKey.has(composite)) byProjectAndKey.set(composite, it);
+        if (!byKey.has(key)) byKey.set(key, it);
+      }
+    }
+    return { byProjectAndKey, byKey };
+  }
+
+  findEventItem(index, taskId, projectId) {
+    if (taskId === undefined || taskId === null || taskId === "") return null;
+    const key = String(taskId);
+    if (projectId) return index.byProjectAndKey.get(`${projectId}\u0000${key}`) ?? null;
+    return index.byKey.get(key) ?? null;
+  }
+
+  renderEventRow(t, ev, linkedItem, idx, monoFont, { interactive = true, onSelectItem = null } = {}) {
+    const taskId = ev.task_id ?? ev.TaskID ?? "";
+    const stepId = ev.step_id ?? ev.StepID ?? "";
+    const from = ev.from ?? ev.From ?? "";
+    const to = ev.to ?? ev.To ?? "";
+    const kind =
+      ev.kind ?? ev.Kind ?? (from && to ? `${from} -> ${to}` : to || from || "event");
+    const statusKey = ev.kind ?? ev.Kind ?? to ?? from ?? "event";
+    const detail = ev.detail ?? ev.Detail ?? ev.message ?? "";
+
+    return h_flex()
+      .when(interactive, (el) => el.id(`global-ev-${ev.projectId || "p"}-${ev.id ?? idx}`))
+      .flex_none()
+      .min_h(28)
+      .px(10)
+      .py(5)
+      .gap(10)
+      .items_center()
+      .rounded(6)
+      .when(interactive && Boolean(linkedItem), (el) =>
+        el
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => onSelectItem?.(linkedItem, cx)),
+      )
+      .when(Boolean(ev.projectName), (el) =>
+        el.child(pill(t, ev.projectName, ev.projectColor || t.accent)),
+      )
+      .child(div().w(115).flex_none().font_family(monoFont).text_size(11).text_color(t.dim).child(formatTimestamp(ev.created_at ?? ev.CreatedAt)))
+      .child(div().w(120).flex_none().truncate().font_family(monoFont).text_size(11).text_color(t.accent).child(taskId || "-"))
+      .child(div().w(95).flex_none().truncate().font_family(monoFont).text_size(11).text_color(t.muted).child(stepId || "-"))
+      .child(div().w(135).flex_none().child(pill(t, kind, statusColor(statusKey, t))))
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(String(detail || "")));
   }
 }

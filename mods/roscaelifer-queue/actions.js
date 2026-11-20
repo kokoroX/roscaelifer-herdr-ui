@@ -188,6 +188,81 @@ async function ensureWorkerFormulaPath(ctx, formulaName) {
   return targetPath;
 }
 
+function stripTrailingSlash(p) {
+  const s = String(p ?? "").trim();
+  if (!s) return "";
+  const trimmed = s.replace(/\/+$/, "");
+  return trimmed || "/";
+}
+
+const WORKTREE_CONTAINER_DIRS = ["/", "/tmp", "/private/tmp", "/Users", "/home"];
+
+/**
+ * Picks the Space that owns a worktree folder, so "Open Worktree" can open a
+ * tab inside the project's existing Space instead of creating a new permanent
+ * Space every time.
+ *
+ * Order: envSpace hint first, then the deepest non-container folder ancestor of
+ * `projectRepo`. Returns null when nothing matches.
+ */
+export function resolveWorktreeOwnerSpace({ spaces: spaceList, envSpace, projectRepo, machine, homeDir } = {}) {
+  const candidates = (Array.isArray(spaceList) ? spaceList : []).filter(
+    (s) => s && typeof s === "object",
+  );
+  const machineVal = String(machine ?? "").trim();
+  const scoped = candidates.filter((s) => (machineVal ? s.machine === machineVal : !s.machine));
+
+  const envVal = String(envSpace ?? "").trim();
+  if (envVal) {
+    const owner = scoped.find(
+      (s) =>
+        s.id === envVal ||
+        (machineVal && s.id === `${machineVal}/${envVal}`) ||
+        s.name === envVal,
+    );
+    if (owner) return owner;
+  }
+
+  const repo = stripTrailingSlash(projectRepo);
+  if (!repo) return null;
+
+  let homeVal = "";
+  const explicitHome = String(homeDir ?? "").trim();
+  if (explicitHome) {
+    homeVal = stripTrailingSlash(explicitHome);
+  } else {
+    try {
+      homeVal = stripTrailingSlash(home());
+    } catch {
+      homeVal = "";
+    }
+  }
+  const containers = new Set(
+    [
+      ...WORKTREE_CONTAINER_DIRS,
+      homeVal,
+      homeVal && `${homeVal}/code`,
+      homeVal && `${homeVal}/work`,
+      homeVal && `${homeVal}/worktrees`,
+    ]
+      .filter(Boolean)
+      .map((p) => (p === "/" ? p : stripTrailingSlash(p))),
+  );
+
+  let owner = null;
+  let ownerDepth = -1;
+  for (const s of scoped) {
+    const folder = stripTrailingSlash(s.folder);
+    if (!folder || containers.has(folder)) continue;
+    if (repo !== folder && !repo.startsWith(`${folder}/`)) continue;
+    if (folder.length > ownerDepth) {
+      owner = s;
+      ownerDepth = folder.length;
+    }
+  }
+  return owner;
+}
+
 function formatError(err) {
   if (!err) return "Unknown error";
   if (typeof err === "string") return err;
@@ -883,11 +958,31 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
       run("terminal.keep", { terminal: hcAddress });
     },
 
-    openWorktree({ name, folder, machine } = {}) {
+    openWorktree({ name, folder, machine, envSpace, projectRepo } = {}) {
       if (!folder) return;
       const args = { folder };
       if (name) args.name = name;
       if (machine) args.machine = machine;
+
+      let liveSpaces = [];
+      try {
+        liveSpaces = spaces() || [];
+      } catch {
+        liveSpaces = [];
+      }
+      const owner = resolveWorktreeOwnerSpace({
+        spaces: liveSpaces,
+        envSpace: envSpace ?? null,
+        projectRepo: projectRepo ?? null,
+        machine: machine ?? null,
+      });
+
+      if (owner?.id) {
+        run("space.select", { id: owner.id });
+        run("tab.new", { space: owner.id, folder, ...(name ? { name } : {}) });
+        return;
+      }
+
       run("space.new", args);
     },
   };
