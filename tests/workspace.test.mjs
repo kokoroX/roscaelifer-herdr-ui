@@ -760,6 +760,93 @@ test("DepsController.scrollWavesBy keeps fractional offsets but only notifies on
   assert.deepEqual(notifies, ["notify"]);
 });
 
+test("BoardController.maxScrollX and scrollBy refuse unmeasured viewports and clamp to _minContentW", () => {
+  const { maxScrollX, clampScrollX, scrollBy } = boardMod.BoardController.prototype;
+  const notifies = [];
+  const cx = { notify: () => notifies.push("notify") };
+  const board = Object.assign(Object.create(boardMod.BoardController.prototype), {
+    scrollX: 0,
+    viewportW: 0,
+    contentW: 1560,
+    _minContentW: 1560,
+  });
+
+  // Unmeasured viewport must not scroll past 0 into blank space.
+  assert.equal(maxScrollX.call(board), 0);
+  scrollBy.call(board, -200, cx);
+  assert.equal(board.scrollX, 0);
+  assert.deepEqual(notifies, []);
+
+  // Measured viewport strictly clamps to _minContentW even if contentW is stale/larger.
+  board.viewportW = 1000;
+  board.contentW = 2400;
+  board._minContentW = 1560;
+  assert.equal(maxScrollX.call(board), 560);
+  scrollBy.call(board, -9999, cx);
+  assert.equal(board.scrollX, 560);
+  assert.deepEqual(notifies, ["notify"]);
+
+  // Viewport wider than content allows zero horizontal scroll.
+  board.viewportW = 1600;
+  assert.equal(maxScrollX.call(board), 0);
+  assert.equal(clampScrollX.call(board), true);
+  assert.equal(board.scrollX, 0);
+
+  // Non-finite wheel deltas are ignored.
+  board.viewportW = 1000;
+  notifies.length = 0;
+  scrollBy.call(board, Number.NaN, cx);
+  assert.equal(board.scrollX, 0);
+  assert.deepEqual(notifies, []);
+});
+
+test("DepsController.maxWavesScrollX and scrollWavesBy refuse unmeasured viewports and clamp to _minWavesContentW", () => {
+  const { maxWavesScrollX, clampWavesScrollX, scrollWavesBy } = depsMod.DepsController.prototype;
+  const notifies = [];
+  const cx = { notify: () => notifies.push("notify") };
+  const deps = Object.assign(Object.create(depsMod.DepsController.prototype), {
+    wavesScrollX: 0,
+    wavesViewportW: 0,
+    wavesContentW: 1170,
+    _minWavesContentW: 1170,
+  });
+
+  // Unmeasured viewport must not scroll past 0.
+  assert.equal(maxWavesScrollX.call(deps), 0);
+  scrollWavesBy.call(deps, -150, cx);
+  assert.equal(deps.wavesScrollX, 0);
+  assert.deepEqual(notifies, []);
+
+  // Measured viewport clamps strictly to _minWavesContentW even if wavesContentW is stale/larger.
+  deps.wavesViewportW = 800;
+  deps.wavesContentW = 2000;
+  deps._minWavesContentW = 1170;
+  assert.equal(maxWavesScrollX.call(deps), 370);
+  scrollWavesBy.call(deps, -5000, cx);
+  assert.equal(deps.wavesScrollX, 370);
+  assert.deepEqual(notifies, ["notify"]);
+
+  // Viewport wider than waves or empty waves (0) clamps back to 0.
+  deps.wavesViewportW = 1200;
+  assert.equal(maxWavesScrollX.call(deps), 0);
+  assert.equal(clampWavesScrollX.call(deps), true);
+  assert.equal(deps.wavesScrollX, 0);
+
+  deps.wavesViewportW = 800;
+  deps.wavesScrollX = 200;
+  deps.wavesContentW = 0;
+  deps._minWavesContentW = 0;
+  assert.equal(maxWavesScrollX.call(deps), 0);
+  assert.equal(clampWavesScrollX.call(deps), true);
+  assert.equal(deps.wavesScrollX, 0);
+
+  // Non-finite wheel deltas are ignored.
+  notifies.length = 0;
+  scrollWavesBy.call(deps, Number.NaN, cx);
+  assert.equal(deps.wavesScrollX, 0);
+  assert.deepEqual(notifies, []);
+});
+
 test("findEventItem resolves events through an O(1) project-scoped index", () => {
   const proto = depsMod.DepsController.prototype;
   const items = [

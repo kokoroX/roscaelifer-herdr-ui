@@ -424,6 +424,7 @@ export class BoardController {
       review: ScrollHandle.new(),
     };
     this.scrollX = 0;
+    this._viewportRawW = 0;
     this.viewportW = 0;
     this.contentW = 0;
     this._minContentW = 0;
@@ -438,11 +439,12 @@ export class BoardController {
     void cx;
   }
 
-  maxScrollX(contentW = Math.max(this.contentW, this._minContentW || 0)) {
+  maxScrollX(contentW = this._minContentW > 0 ? this._minContentW : this.contentW) {
+    if (!(this.viewportW > 0)) return 0;
     return Math.max(0, contentW - this.viewportW);
   }
 
-  clampScrollX(contentW = Math.max(this.contentW, this._minContentW || 0)) {
+  clampScrollX(contentW = this._minContentW > 0 ? this._minContentW : this.contentW) {
     const next = Math.max(0, Math.min(this.scrollX, this.maxScrollX(contentW)));
     const changed = next !== this.scrollX;
     this.scrollX = next;
@@ -452,6 +454,7 @@ export class BoardController {
   // `scrollX` stays fractional so wheel deltas accumulate smoothly; only a
   // change of the rendered integer offset is worth a full view-tree rebuild.
   scrollBy(rawDx, cx) {
+    if (!Number.isFinite(rawDx)) return;
     const prev = this.scrollX;
     const next = Math.max(0, Math.min(prev - rawDx, this.maxScrollX()));
     if (next === prev) return;
@@ -1138,7 +1141,7 @@ export class BoardController {
       })
       .child(
         v_flex()
-          .id(`col-scroll-${col.key}`)
+          .id(`col-scroll-${this.mode}-${col.key}`)
           .track_scroll(this.colScrolls[col.key])
           .size_full()
           .overflow_y_scroll()
@@ -1162,12 +1165,12 @@ export class BoardController {
       )
       .child(
         div()
-          .id(`col-wheel-guard-${col.key}`)
+          .id(`col-wheel-guard-${this.mode}-${col.key}`)
           .absolute()
           .inset_0()
           .on_scroll_wheel(this._handleColumnScrollWheel),
       )
-      .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
+      .child(Scrollbar.vertical(`col-scroll-${this.mode}-${col.key}`).absolute().inset_0());
   }
 
   // `closed` (and any column past `VIRTUALIZE_COLUMN_THRESHOLD` cards) is a
@@ -1200,7 +1203,7 @@ export class BoardController {
       })
       .child(
         list(
-          `col-scroll-${col.key}`,
+          `col-scroll-${this.mode}-${col.key}`,
           listItems.length,
           (i) => String(listItems[i].id),
           (i) => {
@@ -1221,12 +1224,12 @@ export class BoardController {
       )
       .child(
         div()
-          .id(`col-wheel-guard-${col.key}`)
+          .id(`col-wheel-guard-${this.mode}-${col.key}`)
           .absolute()
           .inset_0()
           .on_scroll_wheel(this._handleColumnScrollWheel),
       )
-      .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
+      .child(Scrollbar.vertical(`col-scroll-${this.mode}-${col.key}`).absolute().inset_0());
   }
 
   getFilteredColumns(queue, { showEphemeral = true, projectFilter = "all" } = {}) {
@@ -1292,7 +1295,7 @@ export class BoardController {
       const virtual = shouldVirtualizeColumn(col.key, listItems.length);
 
       return v_flex()
-        .id(`col-${col.key}`)
+        .id(`col-${this.mode}-${col.key}`)
         .flex_1()
         .min_w(300)
         .h_full()
@@ -1301,6 +1304,7 @@ export class BoardController {
         .bg(t.canvas || t.chrome)
         .border_1()
         .border_color(t.border)
+        .overflow_hidden()
         .child(
           h_flex()
             .h(36)
@@ -1351,8 +1355,12 @@ export class BoardController {
 
     this._lastVisible = visibleAll;
     const minContentW = boardColumns.length * 300 + (boardColumns.length - 1) * 10 + 20;
+    const zoom = Number(settings()?.zoom) || 1;
+    if (this._viewportRawW > 0) this.viewportW = this._viewportRawW / zoom;
     this._minContentW = minContentW;
+    this.contentW = minContentW;
     this.clampScrollX(minContentW);
+    const trackW = this.viewportW > 0 ? Math.max(this.viewportW, minContentW) : minContentW;
 
     return v_flex()
       .size_full()
@@ -1375,32 +1383,28 @@ export class BoardController {
       )
       .child(
         div()
-          .id("kanban-cols")
+          .id(`kanban-cols-${this.mode}`)
           .flex_1()
           .min_h(0)
           .w_full()
           .overflow_hidden()
           .on_size_change((size, sizeCx) => {
-            const zoom = settings()?.zoom || 1;
-            this.viewportW = size.width / zoom;
+            const curZoom = Number(settings()?.zoom) || 1;
+            this._viewportRawW = size.width;
+            this.viewportW = size.width / curZoom;
             if (this.clampScrollX()) sizeCx?.notify();
           })
           .on_scroll_wheel((e, scrollCx) => this.handleOuterScrollWheel(e, scrollCx))
           .child(
             h_flex()
-              .id("kanban-cols-track")
+              .id(`kanban-cols-track-${this.mode}`)
               .h_full()
               .min_h(0)
-              .w_full()
-              .min_w(minContentW)
+              .when(this.viewportW > 0, (el) => el.w(trackW))
+              .when(!(this.viewportW > 0), (el) => el.w_full().min_w(minContentW))
               .ml(-Math.round(this.scrollX))
               .p(10)
               .gap(10)
-              .on_size_change((size, sizeCx) => {
-                const zoom = settings()?.zoom || 1;
-                this.contentW = size.width / zoom;
-                if (this.clampScrollX()) sizeCx?.notify();
-              })
               .children(colViews),
           ),
       );

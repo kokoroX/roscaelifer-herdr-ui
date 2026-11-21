@@ -270,6 +270,7 @@ export class DepsController {
     this.epicsScroll = ScrollHandle.new();
     this.eventsScroll = ScrollHandle.new();
     this.wavesScrollX = 0;
+    this._wavesViewportRawW = 0;
     this.wavesViewportW = 0;
     this.wavesContentW = 0;
     this._minWavesContentW = 0;
@@ -331,11 +332,12 @@ export class DepsController {
     };
   }
 
-  maxWavesScrollX(contentW = Math.max(this.wavesContentW, this._minWavesContentW || 0)) {
+  maxWavesScrollX(contentW = this._minWavesContentW > 0 ? this._minWavesContentW : this.wavesContentW) {
+    if (!(this.wavesViewportW > 0)) return 0;
     return Math.max(0, contentW - this.wavesViewportW);
   }
 
-  clampWavesScrollX(contentW = Math.max(this.wavesContentW, this._minWavesContentW || 0)) {
+  clampWavesScrollX(contentW = this._minWavesContentW > 0 ? this._minWavesContentW : this.wavesContentW) {
     const next = Math.max(0, Math.min(this.wavesScrollX, this.maxWavesScrollX(contentW)));
     const changed = next !== this.wavesScrollX;
     this.wavesScrollX = next;
@@ -345,6 +347,7 @@ export class DepsController {
   // `wavesScrollX` stays fractional so wheel deltas accumulate smoothly; only
   // a change of the rendered integer offset is worth a full view-tree rebuild.
   scrollWavesBy(rawDx, cx) {
+    if (!Number.isFinite(rawDx)) return;
     const prev = this.wavesScrollX;
     const next = Math.max(0, Math.min(prev - rawDx, this.maxWavesScrollX()));
     if (next === prev) return;
@@ -1029,7 +1032,7 @@ export class DepsController {
           .min_h(0)
           .child(
             v_flex()
-              .id("deps-waves-scroll")
+              .id("deps-grouped-waves-scroll")
               .size_full()
               .overflow_y_scroll()
               .p(10)
@@ -1122,7 +1125,7 @@ export class DepsController {
                 ),
               ),
           )
-          .child(Scrollbar.vertical("deps-waves-scroll").absolute().inset_0()),
+          .child(Scrollbar.vertical("deps-grouped-waves-scroll").absolute().inset_0()),
       );
   }
 
@@ -1144,8 +1147,12 @@ export class DepsController {
     }
     const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showEphemeral, projectFilter });
     const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
+    const zoom = Number(settings()?.zoom) || 1;
+    if (this._wavesViewportRawW > 0) this.wavesViewportW = this._wavesViewportRawW / zoom;
     this._minWavesContentW = minContentW;
+    this.wavesContentW = minContentW;
     this.clampWavesScrollX(minContentW);
+    const trackW = this.wavesViewportW > 0 ? Math.max(this.wavesViewportW, minContentW) : minContentW;
     const activeChainId = this.chainFocusId || (scopedItems.some((it) => (it.beadId || it.id) === selectedId) ? selectedId : null);
     const { upstream, downstream } = collectChain(activeChainId, blockersOf, unlocksOf);
 
@@ -1265,8 +1272,9 @@ export class DepsController {
               .size_full()
               .overflow_hidden()
               .on_size_change((size, sizeCx) => {
-                const zoom = settings()?.zoom || 1;
-                this.wavesViewportW = size.width / zoom;
+                const curZoom = Number(settings()?.zoom) || 1;
+                this._wavesViewportRawW = size.width;
+                this.wavesViewportW = size.width / curZoom;
                 if (this.clampWavesScrollX()) sizeCx?.notify();
               })
               .on_scroll_wheel((e, scrollCx) => this.handleWavesOuterScrollWheel(e, scrollCx))
@@ -1275,14 +1283,9 @@ export class DepsController {
                   .id("deps-waves-track")
                   .h_full()
                   .min_h(0)
-                  .w_full()
-                  .min_w(minContentW)
+                  .when(this.wavesViewportW > 0, (el) => el.w(trackW))
+                  .when(!(this.wavesViewportW > 0), (el) => el.w_full().min_w(minContentW))
                   .ml(-Math.round(this.wavesScrollX))
-                  .on_size_change((size, sizeCx) => {
-                    const zoom = settings()?.zoom || 1;
-                    this.wavesContentW = size.width / zoom;
-                    if (this.clampWavesScrollX()) sizeCx?.notify();
-                  })
                   .p(10)
                   .gap(10)
                   .items_start()
