@@ -58,12 +58,9 @@ const FALLBACK_POLL_MS = 10000;
 const LOCAL_WATCH_POLL_MS = 30000;
 const DETAIL_CACHE_TTL_MS = 20000;
 const DETAIL_CACHE_MAX = 50;
-const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v2";
 const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v2";
 const COUNT_CLOSED_STATS_KEY = "roscaelifer.countClosedStats.v1";
 const ACTIVE_TAB_KEY = "roscaelifer.activeTab.v1";
-const CLOSED_LIMIT_OPTIONS = [50, 500, 5000, "all"];
-const DEFAULT_CLOSED_LIMIT = "all";
 
 function herdrLiveFingerprint(agentList, termList, spaceList, paneList) {
   const aSig = (agentList || []).map((a) => `${a?.address || ""}:${a?.status || ""}`).join("|");
@@ -205,12 +202,6 @@ export default class RoscaeliferQueue extends View {
     this.isDialog = false;
     this.handle = cx.focus_handle();
     this.tab = validTab(safeStorageGet(ACTIVE_TAB_KEY, "queue"));
-    const storedClosedLimit = safeStorageGet(CLOSED_LIMIT_KEY, DEFAULT_CLOSED_LIMIT);
-    this.closedLimit =
-      storedClosedLimit === "all" ||
-      (Number.isInteger(storedClosedLimit) && CLOSED_LIMIT_OPTIONS.includes(storedClosedLimit))
-        ? storedClosedLimit
-        : DEFAULT_CLOSED_LIMIT;
     const storedShowEphemeral = safeStorageGet(SHOW_EPHEMERAL_KEY, true);
     this.showEphemeral =
       storedShowEphemeral === null || storedShowEphemeral === undefined
@@ -452,15 +443,6 @@ export default class RoscaeliferQueue extends View {
       }
     }
     this.watchHandles.clear();
-  }
-
-  setClosedLimit(nextLimit, cx) {
-    if (!CLOSED_LIMIT_OPTIONS.includes(nextLimit)) return;
-    if (nextLimit === this.closedLimit) return;
-    this.closedLimit = nextLimit;
-    safeStorageSet(CLOSED_LIMIT_KEY, nextLimit);
-    cx?.notify?.();
-    this.refresh(cx, { forceContext: false, preempt: true });
   }
 
   setShowEphemeral(next, cx) {
@@ -749,7 +731,6 @@ export default class RoscaeliferQueue extends View {
         const runner = await this.ensureRunner();
         if (seq !== this.refreshSeq) return;
         const snap = await fetchSnapshot(this.ctx, runner, {
-          closedLimit: this.closedLimit,
           includeEphemeral: this.showEphemeral,
           onRunnerResolved: (freshRunner) => {
             if (seq === this.refreshSeq) this.runner = freshRunner;
@@ -877,7 +858,6 @@ export default class RoscaeliferQueue extends View {
       (entry) => !onlyProjectIds || onlyProjectIds.has(entry.projectId),
     );
     const fetchOpts = {
-      closedLimit: this.closedLimit,
       includeEphemeral: this.showEphemeral,
     };
     const settled = await Promise.allSettled(
@@ -1731,9 +1711,6 @@ export default class RoscaeliferQueue extends View {
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
                       actions: this.actions,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
-                      closedLimit: this.closedLimit,
-                      onChangeClosedLimit: (nextLimit, clickCx) =>
-                        this.setClosedLimit(nextLimit, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
@@ -1757,9 +1734,6 @@ export default class RoscaeliferQueue extends View {
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
                       actions: this.actions,
                       onOpenDialog: (type, extra) => this.openDialog(type, extra),
-                      closedLimit: this.closedLimit,
-                      onChangeClosedLimit: (nextLimit, clickCx) =>
-                        this.setClosedLimit(nextLimit, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),

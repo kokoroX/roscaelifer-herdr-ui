@@ -188,7 +188,7 @@ test("DepsController.scopeItems toggles ephemeral items via showEphemeral", () =
   );
 });
 
-test("fetchSnapshot passes --include-ephemeral only when includeEphemeral is true", async () => {
+test("fetchSnapshot defaults closedLimit to all and passes --include-ephemeral only when includeEphemeral is true", async () => {
   const calls = [];
   const ctx = {
     repo: "/repos/demo",
@@ -203,6 +203,10 @@ test("fetchSnapshot passes --include-ephemeral only when includeEphemeral is tru
     supportsIncludeEphemeral: true,
     supportsAllClosed: true,
   };
+  const legacyRunner = {
+    ...runner,
+    supportsAllClosed: false,
+  };
 
   await withHerdrMock(
     {
@@ -214,10 +218,18 @@ test("fetchSnapshot passes --include-ephemeral only when includeEphemeral is tru
     async () => {
       await store.fetchSnapshot(ctx, runner, { bd: true, includeEphemeral: false });
       await store.fetchSnapshot(ctx, runner, { bd: true, includeEphemeral: true });
+      await store.fetchSnapshot(ctx, legacyRunner, { bd: true, includeEphemeral: false });
     },
   );
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(calls[0].args.includes("--include-ephemeral"), false);
+  assert.equal(calls[0].args.includes("--all-closed"), true);
   assert.equal(calls[1].args.includes("--include-ephemeral"), true);
+  assert.equal(calls[1].args.includes("--all-closed"), true);
+  assert.equal(calls[2].args.includes("--all-closed"), false);
+  assert.deepEqual(calls[2].args.slice(calls[2].args.indexOf("--closed-limit"), calls[2].args.indexOf("--closed-limit") + 2), [
+    "--closed-limit",
+    "50000",
+  ]);
 });

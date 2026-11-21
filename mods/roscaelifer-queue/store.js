@@ -1401,14 +1401,15 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
     if (ctx?.bdDir) args.push("--bd-dir", ctx.bdDir);
   }
   if (opts.eventsLimit) args.push("--events-limit", String(opts.eventsLimit));
-  if (opts.closedLimit === "all") {
+  const closedLimit = opts.closedLimit ?? "all";
+  if (closedLimit === "all") {
     if (resolved?.supportsAllClosed) {
       args.push("--all-closed");
     } else {
       args.push("--closed-limit", "50000");
     }
-  } else if (Number.isInteger(opts.closedLimit) && opts.closedLimit > 0) {
-    args.push("--closed-limit", String(opts.closedLimit));
+  } else if (Number.isInteger(closedLimit) && closedLimit > 0) {
+    args.push("--closed-limit", String(closedLimit));
   }
 
   let res;

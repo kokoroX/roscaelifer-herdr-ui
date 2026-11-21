@@ -34,13 +34,6 @@ const BEADS_COLUMNS = [
   { key: "closed", label: "Closed", emptyText: "No closed beads" },
 ];
 
-const CLOSED_LIMIT_OPTIONS = [
-  { value: 50, label: "50" },
-  { value: 500, label: "500" },
-  { value: 5000, label: "5k" },
-  { value: "all", label: "All" },
-];
-
 function segmentTabs(id, t) {
   return Tabs.new(id)
     .flex()
@@ -949,7 +942,7 @@ export class BoardController {
     return true;
   }
 
-  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
+  renderFilterBar(queue, t, { showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
     this.syncEnvFilter(queue);
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
@@ -1107,28 +1100,6 @@ export class BoardController {
                       .text_color(showEphemeral ? t.foreground : t.muted)
                       .child("Ephemeral"),
                   ),
-              )
-              .child(div().w(1).h(16).bg(t.border).mx(2))
-              .child(div().text_size(11).text_color(t.dim).child("Closed"))
-              .child(
-                segmentTabs("board-closed-limit-tabs", t).children(
-                  CLOSED_LIMIT_OPTIONS.map((opt) =>
-                    segmentTab(
-                      `closed-limit-${opt.value}`,
-                      opt.label,
-                      closedLimit === opt.value,
-                      null,
-                      (clickCx) => {
-                        if (onChangeClosedLimit) {
-                          onChangeClosedLimit(opt.value, clickCx);
-                        } else {
-                          clickCx?.notify();
-                        }
-                      },
-                      t,
-                    ),
-                  ),
-                ),
               ),
           )
           .child(
@@ -1321,7 +1292,7 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
@@ -1401,7 +1372,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
+      .child(this.renderFilterBar(queue, t, { showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()
