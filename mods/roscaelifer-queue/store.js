@@ -174,6 +174,8 @@ function slimIssueForCache(issue) {
     close_reason: _closeReason,
     ...rest
   } = issue;
+  // `summary` is intentionally kept: it is short and the inspector drawer
+  // needs it even when the lightweight list cache drops the long text fields.
   return rest;
 }
 
@@ -1776,6 +1778,8 @@ function normalizeSteps(rawSteps, envObj, lookup) {
             link: attempt.effective_link || attempt.link || "",
             lastAgentStatus: attempt.last_agent_status || "",
             hasReply: Boolean(attempt.has_reply),
+            hasSummary: Boolean(attempt.has_summary ?? attempt.hasSummary),
+            summary: typeof attempt.summary === "string" ? attempt.summary : "",
           }
         : null,
       hcAddress,
@@ -2031,6 +2035,12 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       sessionStep?.agentStatus || resolveLiveStatus(liveAgent, liveTerminal);
 
     const attempt = currentStep?.currentAttempt || null;
+    const stepSummary =
+      steps
+        .map((step) => step.currentAttempt?.summary)
+        .find((value) => typeof value === "string" && value.trim()) || "";
+    const taskSummary =
+      typeof task?.summary === "string" && task.summary.trim() ? task.summary : stepSummary;
     const worktree =
       attempt?.worktree ||
       taskPendingCleanups[0]?.worktree ||
@@ -2146,6 +2156,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       description: issue?.description || "",
       acceptanceCriteria: issue?.acceptance_criteria || "",
       notes: issue?.notes || "",
+      summary: taskSummary,
       closeReason: issue?.close_reason || "",
       priority: issue ? issue.priority ?? 2 : null,
       issueType: issue?.issue_type || "task",

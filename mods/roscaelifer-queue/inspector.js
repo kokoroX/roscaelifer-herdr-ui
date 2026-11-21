@@ -33,6 +33,61 @@ function formatTimestamp(iso) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+const AUTO_NOTE_END_MARKER = "roscaelifer: ---- 自动 note 结束 ----";
+
+function isAutoNoteMachineHeader(line) {
+  const text = String(line ?? "");
+  if (text.startsWith("  detail: ")) return true;
+  return /^\s*(?:roscaelifer: |actor: |step )/.test(text);
+}
+
+/**
+ * Cleans up the machine-written prefix/suffix that roscaelifer appends to bead
+ * notes before it reaches `TextView.markdown`.
+ *
+ * - A trailing auto-note end marker is dropped entirely (no pointless machine
+ *   footer at the bottom of the drawer).
+ * - A marker that still has human/next-round content after it becomes a real
+ *   Markdown horizontal rule so the two records stay visually separated.
+ * - Adjacent machine header lines (`roscaelifer:`, `actor:`, `step `,
+ *   `  detail:`) get CommonMark hard breaks so `task` / `actor` / `step` do not
+ *   collapse into one run-on paragraph.
+ */
+export function formatBeadNotesForDisplay(notes) {
+  if (typeof notes !== "string" || !notes.trim()) return "";
+  const lines = notes.replace(/\r\n?/g, "\n").split("\n");
+  const isBlank = (line) => !String(line ?? "").trim();
+  const out = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === AUTO_NOTE_END_MARKER) {
+      let next = i + 1;
+      while (next < lines.length && (isBlank(lines[next]) || lines[next].trim() === AUTO_NOTE_END_MARKER)) next += 1;
+      if (next >= lines.length) {
+        // Marker is the last meaningful line: drop it and any blank padding.
+        while (out.length > 0 && isBlank(out[out.length - 1])) out.pop();
+        continue;
+      }
+      // Human review notes or a later retry record follow: keep them separated.
+      while (out.length > 0 && isBlank(out[out.length - 1])) out.pop();
+      out.push("", "---", "");
+      i = next - 1;
+      continue;
+    }
+    out.push(line);
+  }
+
+  for (let i = 0; i < out.length - 1; i += 1) {
+    const line = out[i];
+    if (isBlank(line) || !isAutoNoteMachineHeader(line)) continue;
+    if (isBlank(out[i + 1])) continue;
+    if (!/ {2}$/.test(line)) out[i] = `${line.replace(/\s+$/, "")}  `;
+  }
+
+  return out.join("\n").replace(/^\n+|\n+$/g, "");
+}
+
 function escapeHtml(text) {
   return String(text ?? "")
     .replace(/&/g, "&amp;")
@@ -286,6 +341,10 @@ export class InspectorController {
     const acText = beadDetail?.acceptance_criteria || item.acceptanceCriteria || item.issue?.acceptance_criteria || "";
     const notesText = beadDetail?.notes || item.notes || item.issue?.notes || "";
     const closeReason = beadDetail?.close_reason || item.closeReason || item.issue?.close_reason || "";
+    const displayNotes = formatBeadNotesForDisplay(notesText);
+    const taskSummary = String(detail?.summary ?? taskDetail?.summary ?? item.summary ?? "").trim();
+    const notesHasStructuredSummary = String(notesText).includes("**处理简介**");
+    const showTaskSummary = Boolean(taskSummary) && !notesHasStructuredSummary;
     const busy = actions?.isBusy ? actions.isBusy() : false;
     const routeCtx = item?.projectCtx || ctx || null;
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
@@ -607,6 +666,25 @@ export class InspectorController {
                       .child("Loading bead details…"),
                   ),
               )
+              // Task-level structured processing summary (when notes do not already embed one)
+              .when(showTaskSummary, (el) =>
+                el.child(
+                  v_flex()
+                    .gap(4)
+                    .child(sectionHeader(t, "Summary"))
+                    .child(
+                      div()
+                        .p(10)
+                        .rounded(8)
+                        .bg(alpha(t.accent, "14"))
+                        .border_1()
+                        .border_color(alpha(t.accent, "55"))
+                        .text_size(12.5)
+                        .text_color(t.foreground)
+                        .child(TextView.markdown(`insp-summary-${item.id}`, taskSummary).selectable(true)),
+                    ),
+                ),
+              )
               // Body / Description
               .when(Boolean(bodyText.trim()), (el) =>
                 el.child(
@@ -671,7 +749,7 @@ export class InspectorController {
                 el.child(this.renderLiveTerminal(t, { item, hcAddress, worktree, resolvedMachine, actions, monoFont })),
               )
               // Notes / Close reason
-              .when(Boolean(notesText.trim() || closeReason.trim()), (el) =>
+              .when(Boolean(displayNotes.trim() || closeReason.trim()), (el) =>
                 el.child(
                   v_flex()
                     .gap(6)
@@ -689,7 +767,7 @@ export class InspectorController {
                           .child(selectableText(`insp-close-reason-${item.id}`, `Close reason: ${closeReason}`)),
                       ),
                     )
-                    .when(Boolean(notesText.trim()), (c) =>
+                    .when(Boolean(displayNotes.trim()), (c) =>
                       c.child(
                         div()
                           .p(10)
@@ -699,7 +777,7 @@ export class InspectorController {
                           .border_color(t.border)
                           .text_size(12)
                           .text_color(t.foreground)
-                          .child(TextView.markdown(`insp-notes-${item.id}`, notesText).selectable(true)),
+                          .child(TextView.markdown(`insp-notes-${item.id}`, displayNotes).selectable(true)),
                       ),
                     ),
                 ),
@@ -729,6 +807,7 @@ export class InspectorController {
           const runningElapsed = s.status === "running" && runningSince ? formatElapsed(runningSince) : "";
           const curHandle = cur?.hc_address || cur?.hcAddress || cur?.thread_id || cur?.threadId;
           const curModel = formatDispatchModel(cur?.provider, cur?.model);
+          const curSummary = String(cur?.summary ?? "").trim();
           const stepCol = statusColor(s.status, t);
           const isExpanded = this.expandedStep === stepId;
 
@@ -819,6 +898,25 @@ export class InspectorController {
                   ),
               ),
             )
+            .when(Boolean(curSummary), (el) =>
+              el.child(
+                v_flex()
+                  .gap(2)
+                  .pt(2)
+                  .child(div().text_size(10.5).font_semibold().text_color(t.dim).child("SUMMARY"))
+                  .child(
+                    div()
+                      .p(7)
+                      .rounded(6)
+                      .bg(alpha(t.accent, "12"))
+                      .border_1()
+                      .border_color(alpha(t.accent, "44"))
+                      .text_size(11.5)
+                      .text_color(t.foreground)
+                      .child(TextView.markdown(`insp-step-summary-${itemId}-${stepId}`, curSummary).selectable(true)),
+                  ),
+              ),
+            )
             .when(Boolean(s.detail), (el) =>
               el.child(
                 div()
@@ -894,6 +992,28 @@ export class InspectorController {
                             div()
                               .text_color(t.ansi1)
                               .child(selectableText(`insp-att-${itemId}-${stepId}-${ai}-error`, String(a.error))),
+                          ),
+                        )
+                        .when(Boolean(a.summary && String(a.summary).trim()), (c) =>
+                          c.child(
+                            div()
+                              .pt(2)
+                              .child(
+                                div()
+                                  .p(6)
+                                  .rounded(5)
+                                  .bg(alpha(t.accent, "12"))
+                                  .border_1()
+                                  .border_color(alpha(t.accent, "44"))
+                                  .text_size(11)
+                                  .text_color(t.foreground)
+                                  .child(
+                                    TextView.markdown(
+                                      `insp-att-${itemId}-${stepId}-${ai}-summary`,
+                                      String(a.summary),
+                                    ).selectable(true),
+                                  ),
+                              ),
                           ),
                         )
                         .when(Boolean(a.reply && String(a.reply).trim()), (c) =>
