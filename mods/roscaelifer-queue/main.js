@@ -61,6 +61,7 @@ const DETAIL_CACHE_MAX = 50;
 const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v2";
 const SHOW_WIP_KEY = "roscaelifer.showWip.v1";
 const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v1";
+const COUNT_CLOSED_STATS_KEY = "roscaelifer.countClosedStats.v1";
 const ACTIVE_TAB_KEY = "roscaelifer.activeTab.v1";
 const CLOSED_LIMIT_OPTIONS = [50, 500, 5000, "all"];
 const DEFAULT_CLOSED_LIMIT = "all";
@@ -215,6 +216,11 @@ export default class RoscaeliferQueue extends View {
     this.showWip =
       storedShowWip === null || storedShowWip === undefined ? true : Boolean(storedShowWip);
     this.showEphemeral = Boolean(safeStorageGet(SHOW_EPHEMERAL_KEY, false));
+    const storedCountClosedStats = safeStorageGet(COUNT_CLOSED_STATS_KEY, true);
+    this.countClosedStats =
+      storedCountClosedStats === null || storedCountClosedStats === undefined
+        ? true
+        : Boolean(storedCountClosedStats);
     this.ctx = null;
     this.runner = null;
     this.snapshot = null;
@@ -474,6 +480,14 @@ export default class RoscaeliferQueue extends View {
     this.detailCache.clear();
     cx?.notify?.();
     this.refresh(cx, { forceContext: false, preempt: true });
+  }
+
+  setCountClosedStats(next, cx) {
+    const value = Boolean(next);
+    if (value === this.countClosedStats) return;
+    this.countClosedStats = value;
+    safeStorageSet(COUNT_CLOSED_STATS_KEY, value);
+    cx?.notify?.();
   }
 
   async ensureRunner() {
@@ -1739,6 +1753,9 @@ export default class RoscaeliferQueue extends View {
                       projects: queue.projects || [],
                       projectFilter: this.projectFilter,
                       onSelectProjectFilter: (next) => this.setProjectFilter(next),
+                      countClosedStats: this.countClosedStats,
+                      onToggleCountClosedStats: (next, clickCx) =>
+                        this.setCountClosedStats(next, clickCx),
                     },
                     cx,
                   ),
@@ -1764,6 +1781,9 @@ export default class RoscaeliferQueue extends View {
                       projects: queue.projects || [],
                       projectFilter: this.projectFilter,
                       onSelectProjectFilter: (next) => this.setProjectFilter(next),
+                      countClosedStats: this.countClosedStats,
+                      onToggleCountClosedStats: (next, clickCx) =>
+                        this.setCountClosedStats(next, clickCx),
                     },
                     cx,
                   ),
@@ -1785,6 +1805,9 @@ export default class RoscaeliferQueue extends View {
                       projects: queue.projects || [],
                       projectFilter: this.projectFilter,
                       onSelectProjectFilter: (next) => this.setProjectFilter(next),
+                      countClosedStats: this.countClosedStats,
+                      onToggleCountClosedStats: (next, clickCx) =>
+                        this.setCountClosedStats(next, clickCx),
                     },
                     cx,
                   ),

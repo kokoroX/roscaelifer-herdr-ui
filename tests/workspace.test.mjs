@@ -781,3 +781,71 @@ test("findEventItem resolves events through an O(1) project-scoped index", () =>
   assert.equal(proto.findEventItem.call({}, index, "404", "alpha"), null);
   assert.equal(proto.findEventItem.call({}, index, "", "alpha"), null);
 });
+
+test("isClosedQueueItem treats closed column and fallback closed statuses accurately", () => {
+  const { isClosedQueueItem } = store;
+
+  assert.equal(isClosedQueueItem({ column: "closed", bdStatus: "closed" }), true);
+  assert.equal(isClosedQueueItem({ beadId: null, taskStatus: "done", column: "closed" }), true);
+  // Pre-closed beads awaiting review or still running stay active/open.
+  assert.equal(isClosedQueueItem({ bdStatus: "closed", column: "review" }), false);
+  assert.equal(isClosedQueueItem({ bdStatus: "closed", column: "running" }), false);
+  assert.equal(isClosedQueueItem({ column: "ready", bdStatus: "open" }), false);
+  assert.equal(isClosedQueueItem({ column: "queue", bdStatus: "open" }), false);
+  assert.equal(isClosedQueueItem({ column: "action", taskStatus: "failed" }), false);
+  // Fallback when column is absent.
+  assert.equal(isClosedQueueItem({ bdStatus: "closed" }), true);
+  assert.equal(isClosedQueueItem({ status: "closed" }), true);
+  assert.equal(isClosedQueueItem({ status: "open" }), false);
+  assert.equal(isClosedQueueItem(null), false);
+});
+
+test("mergeNormalizedQueues computes openItemCount and closedItemCount per project", () => {
+  const merged = store.mergeNormalizedQueues([
+    {
+      projectId: "alpha",
+      projectName: "Alpha",
+      queue: makeQueue("alpha", [
+        makeItem("rsc-1", { column: "ready", bdStatus: "open" }),
+        makeItem("rsc-2", { column: "running", bdStatus: "in_progress" }),
+        makeItem("rsc-3", { column: "review", bdStatus: "closed" }),
+        makeItem("rsc-4", { column: "closed", beadColumn: "closed", bdStatus: "closed" }),
+        makeItem("task:99", { beadId: null, column: "closed", taskStatus: "done", bdStatus: null }),
+      ]),
+    },
+    {
+      status: "rejected",
+      reason: new Error("down"),
+      projectId: "beta",
+      projectName: "Beta",
+    },
+  ]);
+
+  const alpha = merged.projects.find((p) => p.id === "alpha");
+  assert.equal(alpha.itemCount, 5);
+  assert.equal(alpha.openItemCount, 3);
+  assert.equal(alpha.closedItemCount, 2);
+
+  const beta = merged.projects.find((p) => p.id === "beta");
+  assert.equal(beta.itemCount, 0);
+  assert.equal(beta.openItemCount, 0);
+  assert.equal(beta.closedItemCount, 0);
+});
+
+test("projectDisplayCount and totalProjectsDisplayCount toggle closed stats exclusion", () => {
+  const { projectDisplayCount, totalProjectsDisplayCount } = boardMod;
+  const projects = [
+    { id: "a", itemCount: 185, openItemCount: 12, closedItemCount: 173 },
+    { id: "b", itemCount: 170, openItemCount: 5, closedItemCount: 165 },
+    { id: "c", itemCount: 20 },
+  ];
+
+  assert.equal(projectDisplayCount(projects[0], { excludeClosedStats: false }), 185);
+  assert.equal(projectDisplayCount(projects[0], { excludeClosedStats: true }), 12);
+  // Falls back to itemCount when openItemCount is absent.
+  assert.equal(projectDisplayCount(projects[2], { excludeClosedStats: true }), 20);
+  assert.equal(projectDisplayCount(null, { excludeClosedStats: true }), null);
+
+  assert.equal(totalProjectsDisplayCount(projects, { excludeClosedStats: false }), 375);
+  assert.equal(totalProjectsDisplayCount(projects, { excludeClosedStats: true }), 37);
+});

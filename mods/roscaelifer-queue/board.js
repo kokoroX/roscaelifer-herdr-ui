@@ -176,8 +176,35 @@ function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, on
     .child(label);
 }
 
-function projectPill(t, project, active, onClick) {
+export function projectDisplayCount(project, { excludeClosedStats = false } = {}) {
+  if (!project || typeof project !== "object") return null;
+  if (excludeClosedStats && Number.isFinite(project.openItemCount)) {
+    return project.openItemCount;
+  }
+  return Number.isFinite(project.itemCount) ? project.itemCount : null;
+}
+
+export function totalProjectsDisplayCount(projects = [], { excludeClosedStats = false } = {}) {
+  if (!Array.isArray(projects)) return 0;
+  return projects.reduce((sum, project) => {
+    const count = projectDisplayCount(project, { excludeClosedStats });
+    return sum + (Number.isFinite(count) ? count : 0);
+  }, 0);
+}
+
+function projectPill(t, project, active, onClick, { excludeClosedStats = false } = {}) {
   const hasError = Boolean(project.error);
+  const displayCount = projectDisplayCount(project, { excludeClosedStats });
+  const openCount = Number.isFinite(project.openItemCount) ? project.openItemCount : null;
+  const closedCount = Number.isFinite(project.closedItemCount) ? project.closedItemCount : null;
+  const countTip = !Number.isFinite(displayCount)
+    ? ""
+    : excludeClosedStats && closedCount !== null
+      ? `${displayCount} active (${closedCount} closed excluded)`
+      : !excludeClosedStats && openCount !== null && closedCount !== null
+        ? `${displayCount} items (${openCount} active · ${closedCount} closed)`
+        : `${displayCount} items`;
+
   return div()
     .id(`project-filter-${project.id}`)
     .h(22)
@@ -193,7 +220,7 @@ function projectPill(t, project, active, onClick) {
     .tooltip(
       [
         project.name || project.id,
-        Number.isFinite(project.itemCount) ? `${project.itemCount} items` : "",
+        countTip,
         hasError ? `error: ${project.error}` : "",
       ]
         .filter(Boolean)
@@ -212,8 +239,8 @@ function projectPill(t, project, active, onClick) {
         .when(active, (el) => el.font_medium())
         .child(project.name || project.id),
     )
-    .when(Number.isFinite(project.itemCount), (el) =>
-      el.child(div().text_size(10.5).text_color(t.dim).child(String(project.itemCount))),
+    .when(Number.isFinite(displayCount), (el) =>
+      el.child(div().text_size(10.5).text_color(t.dim).child(String(displayCount))),
     )
     .when(hasError, (el) =>
       el.child(
@@ -232,31 +259,101 @@ function projectPill(t, project, active, onClick) {
 /** Shared `All Projects` + per-project filter pills for board and deps views. */
 export function renderProjectFilterPills(
   t,
-  { projects = [], projectFilter = "all", onSelectProjectFilter, idPrefix = "project" } = {},
+  {
+    projects = [],
+    projectFilter = "all",
+    onSelectProjectFilter,
+    countClosedStats = true,
+    onToggleCountClosedStats,
+    idPrefix = "project",
+  } = {},
 ) {
   if (!Array.isArray(projects) || projects.length < 2) return null;
+  const excludeClosedStats = !countClosedStats;
+  const totalCount = totalProjectsDisplayCount(projects, { excludeClosedStats });
+  const totalOpen = projects.reduce(
+    (sum, project) => sum + (Number.isFinite(project?.openItemCount) ? project.openItemCount : 0),
+    0,
+  );
+  const totalClosed = projects.reduce(
+    (sum, project) => sum + (Number.isFinite(project?.closedItemCount) ? project.closedItemCount : 0),
+    0,
+  );
+  const hasBreakdown = projects.some(
+    (project) => Number.isFinite(project?.openItemCount) && Number.isFinite(project?.closedItemCount),
+  );
+  const allProjectsTooltip = hasBreakdown
+    ? excludeClosedStats
+      ? `${totalCount} active across ${projects.length} projects (${totalClosed} closed excluded)`
+      : `${totalCount} items across ${projects.length} projects (${totalOpen} active · ${totalClosed} closed)`
+    : `${totalCount} items across ${projects.length} projects`;
+
   return h_flex()
     .gap(6)
+    .flex_wrap()
     .items_center()
     .child(
-      segmentTabs(`board-project-tabs-${idPrefix}`, t).child(
-        segmentTab(
-          `all-project-tab-${idPrefix}`,
-          "All Projects",
-          projectFilter === "all",
-          String(projects.reduce((sum, project) => sum + (project.itemCount || 0), 0)),
-          () => onSelectProjectFilter?.("all"),
-          t,
+      segmentTabs(`board-project-tabs-${idPrefix}`, t)
+        .tooltip(allProjectsTooltip)
+        .child(
+          segmentTab(
+            `all-project-tab-${idPrefix}`,
+            "All Projects",
+            projectFilter === "all",
+            String(totalCount),
+            () => onSelectProjectFilter?.("all"),
+            t,
+          ),
         ),
-      ),
     )
     .child(
       segmentTabs(`board-project-list-${idPrefix}`, t).children(
         projects.map((project) =>
-          projectPill(t, project, projectFilter === project.id, () =>
-            onSelectProjectFilter?.(projectFilter === project.id ? "all" : project.id),
+          projectPill(
+            t,
+            project,
+            projectFilter === project.id,
+            () => onSelectProjectFilter?.(projectFilter === project.id ? "all" : project.id),
+            { excludeClosedStats },
           ),
         ),
+      ),
+    )
+    .when(typeof onToggleCountClosedStats === "function", (el) =>
+      el.child(
+        Switch.new(`project-count-closed-${idPrefix}`)
+          .checked(countClosedStats)
+          .on_change((_checked, clickCx) => {
+            onToggleCountClosedStats?.(!countClosedStats, clickCx);
+          })
+          .tooltip(
+            countClosedStats
+              ? "Project badges include closed items. Turn off to exclude closed items from project counts without hiding the Closed column."
+              : "Project badges exclude closed items. Turn on to include closed items in project counts.",
+          )
+          .flex()
+          .items_center()
+          .gap(7)
+          .cursor_pointer()
+          .child(
+            h_flex()
+              .w(28)
+              .h(16)
+              .p(2)
+              .rounded(8)
+              .items_center()
+              .bg(countClosedStats ? t.accent : t.border)
+              .when(countClosedStats, (sw) => sw.justify_end())
+              .when(!countClosedStats, (sw) => sw.justify_start())
+              .child(div().size(12).rounded(6).bg(countClosedStats ? t.accent_foreground : t.muted)),
+          )
+          .child(
+            div()
+              .text_size(11.5)
+              .whitespace_nowrap()
+              .text_color(countClosedStats ? t.foreground : t.muted)
+              .child("Count closed"),
+          ),
       ),
     );
 }
@@ -873,7 +970,7 @@ export class BoardController {
     return true;
   }
 
-  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter } = {}) {
+  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
     this.syncEnvFilter(queue);
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
@@ -894,220 +991,231 @@ export class BoardController {
       return tip ? tab.tooltip(tip) : tab;
     };
 
-    return h_flex()
+    return v_flex()
       .flex_none()
       .px(12)
       .py(8)
-      .gap(8)
-      .items_center()
+      .gap(6)
       .border_b(1)
       .border_color(t.border)
       .bg(t.chrome)
-      .child(
-        h_flex()
-          .flex_1()
-          .min_w(0)
-          .gap(6)
-          .flex_wrap()
-          .items_center()
-          .when(multiProject, (el) =>
-            el.child(
+      .when(multiProject, (el) =>
+        el.child(
+          h_flex()
+            .w_full()
+            .items_center()
+            .child(
               renderProjectFilterPills(t, {
                 projects,
                 projectFilter,
                 onSelectProjectFilter,
+                countClosedStats,
+                onToggleCountClosedStats,
                 idPrefix: "board",
               }),
             ),
-          )
-          .when(multiProject, (el) => el.child(div().w(1).h(16).bg(t.border).mx(2)))
-          .child(
-            segmentTabs("board-env-tabs", t)
-              .child(envTab("env-tab-all", "All Envs", this.envFilter === "all", null, () => {
-                this.envFilter = "all";
-              }))
-              .children(
-                envs.map((env) => {
-                  const scoped =
-                    projectFilter !== "all" && env.byProject?.[projectFilter]
-                      ? env.byProject[projectFilter]
-                      : env;
-                  const cap =
-                    scoped.maxRunning > 0
-                      ? `${scoped.runningWorkSteps}/${scoped.maxRunning}`
-                      : scoped.runningWorkSteps > 0
-                        ? `${scoped.runningWorkSteps}`
-                        : null;
-                  return envTab(
-                    `env-tab-${env.name}`,
-                    env.name,
-                    this.envFilter === env.name,
-                    cap,
-                    () => {
-                      this.envFilter = env.name;
-                    },
-                  );
-                }),
-              ),
-          )
-          .child(div().w(1).h(16).bg(t.border).mx(2))
-          .when(this.mode === "roscaelifer", (el) =>
-            el.child(
-              h_flex()
-                .gap(7)
-                .items_center()
-                .child(
-                  Switch.new("filter-queued")
-                    .checked(this.onlyQueued)
-                    .on_change((checked, cx) => {
-                      this.onlyQueued = Boolean(checked);
-                      cx.notify();
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(7)
-                    .cursor_pointer()
-                    .child(
-                      h_flex()
-                        .w(28)
-                        .h(16)
-                        .p(2)
-                        .rounded(8)
-                        .items_center()
-                        .bg(this.onlyQueued ? t.accent : t.border)
-                        .when(this.onlyQueued, (el) => el.justify_end())
-                        .when(!this.onlyQueued, (el) => el.justify_start())
-                        .child(
-                          div()
-                            .size(12)
-                            .rounded(6)
-                            .bg(this.onlyQueued ? t.accent_foreground : t.muted),
-                        ),
-                    )
-                    .child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(this.onlyQueued ? t.foreground : t.muted)
-                        .child("Queued only"),
-                    ),
-                ),
-            ),
-          )
-          .child(
-            Switch.new("filter-wip")
-              .checked(showWip)
-              .on_change((_checked, clickCx) => {
-                onToggleShowWip?.(!showWip, clickCx);
-              })
-              .flex()
-              .items_center()
-              .gap(7)
-              .cursor_pointer()
-              .child(
-                h_flex()
-                  .w(28)
-                  .h(16)
-                  .p(2)
-                  .rounded(8)
-                  .items_center()
-                  .bg(showWip ? t.working || t.accent : t.border)
-                  .when(showWip, (el) => el.justify_end())
-                  .when(!showWip, (el) => el.justify_start())
-                  .child(div().size(12).rounded(6).bg(showWip ? t.accent_foreground : t.muted)),
-              )
-              .child(
-                div()
-                  .text_size(11.5)
-                  .text_color(showWip ? t.foreground : t.muted)
-                  .child("WIP"),
-              ),
-          )
-          .child(
-            Switch.new("filter-ephemeral")
-              .checked(showEphemeral)
-              .on_change((checked, clickCx) => {
-                onToggleShowEphemeral?.(!showEphemeral, clickCx);
-              })
-              .flex()
-              .items_center()
-              .gap(7)
-              .cursor_pointer()
-              .child(
-                h_flex()
-                  .w(28)
-                  .h(16)
-                  .p(2)
-                  .rounded(8)
-                  .items_center()
-                  .bg(showEphemeral ? t.accent : t.border)
-                  .when(showEphemeral, (el) => el.justify_end())
-                  .when(!showEphemeral, (el) => el.justify_start())
-                  .child(div().size(12).rounded(6).bg(showEphemeral ? t.accent_foreground : t.muted)),
-              )
-              .child(
-                div()
-                  .text_size(11.5)
-                  .text_color(showEphemeral ? t.foreground : t.muted)
-                  .child("Ephemeral"),
-              ),
-          )
-          .child(div().w(1).h(16).bg(t.border).mx(2))
-          .child(div().text_size(11).text_color(t.dim).child("Closed"))
-          .child(
-            segmentTabs("board-closed-limit-tabs", t).children(
-              CLOSED_LIMIT_OPTIONS.map((opt) =>
-                segmentTab(
-                  `closed-limit-${opt.value}`,
-                  opt.label,
-                  closedLimit === opt.value,
-                  null,
-                  (clickCx) => {
-                    if (onChangeClosedLimit) {
-                      onChangeClosedLimit(opt.value, clickCx);
-                    } else {
-                      clickCx?.notify();
-                    }
-                  },
-                  t,
-                ),
-              ),
-            ),
-          ),
+        ),
       )
       .child(
         h_flex()
-          .w(240)
-          .h(28)
-          .px(8)
-          .gap(6)
+          .w_full()
+          .gap(8)
           .items_center()
-          .rounded(6)
-          .border_1()
-          .border_color(this.searchFocused ? t.accent : t.input)
-          .bg(t.background)
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .child(svg("mods/roscaelifer-queue/icons/search.svg").size(13).flex_none().text_color(t.dim))
           .child(
-            div()
+            h_flex()
               .flex_1()
               .min_w(0)
-              .child(Input.new(this.searchInput).h(24).text_size(12).text_color(t.foreground)),
+              .gap(6)
+              .flex_wrap()
+              .items_center()
+              .child(
+                segmentTabs("board-env-tabs", t)
+                  .child(envTab("env-tab-all", "All Envs", this.envFilter === "all", null, () => {
+                    this.envFilter = "all";
+                  }))
+                  .children(
+                    envs.map((env) => {
+                      const scoped =
+                        projectFilter !== "all" && env.byProject?.[projectFilter]
+                          ? env.byProject[projectFilter]
+                          : env;
+                      const cap =
+                        scoped.maxRunning > 0
+                          ? `${scoped.runningWorkSteps}/${scoped.maxRunning}`
+                          : scoped.runningWorkSteps > 0
+                            ? `${scoped.runningWorkSteps}`
+                            : null;
+                      return envTab(
+                        `env-tab-${env.name}`,
+                        env.name,
+                        this.envFilter === env.name,
+                        cap,
+                        () => {
+                          this.envFilter = env.name;
+                        },
+                      );
+                    }),
+                  ),
+              )
+              .child(div().w(1).h(16).bg(t.border).mx(2))
+              .when(this.mode === "roscaelifer", (el) =>
+                el.child(
+                  h_flex()
+                    .gap(7)
+                    .items_center()
+                    .child(
+                      Switch.new("filter-queued")
+                        .checked(this.onlyQueued)
+                        .on_change((checked, cx) => {
+                          this.onlyQueued = Boolean(checked);
+                          cx.notify();
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(7)
+                        .cursor_pointer()
+                        .child(
+                          h_flex()
+                            .w(28)
+                            .h(16)
+                            .p(2)
+                            .rounded(8)
+                            .items_center()
+                            .bg(this.onlyQueued ? t.accent : t.border)
+                            .when(this.onlyQueued, (el) => el.justify_end())
+                            .when(!this.onlyQueued, (el) => el.justify_start())
+                            .child(
+                              div()
+                                .size(12)
+                                .rounded(6)
+                                .bg(this.onlyQueued ? t.accent_foreground : t.muted),
+                            ),
+                        )
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .text_color(this.onlyQueued ? t.foreground : t.muted)
+                            .child("Queued only"),
+                        ),
+                    ),
+                ),
+              )
+              .child(
+                Switch.new("filter-wip")
+                  .checked(showWip)
+                  .on_change((_checked, clickCx) => {
+                    onToggleShowWip?.(!showWip, clickCx);
+                  })
+                  .flex()
+                  .items_center()
+                  .gap(7)
+                  .cursor_pointer()
+                  .child(
+                    h_flex()
+                      .w(28)
+                      .h(16)
+                      .p(2)
+                      .rounded(8)
+                      .items_center()
+                      .bg(showWip ? t.working || t.accent : t.border)
+                      .when(showWip, (el) => el.justify_end())
+                      .when(!showWip, (el) => el.justify_start())
+                      .child(div().size(12).rounded(6).bg(showWip ? t.accent_foreground : t.muted)),
+                  )
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(showWip ? t.foreground : t.muted)
+                      .child("WIP"),
+                  ),
+              )
+              .child(
+                Switch.new("filter-ephemeral")
+                  .checked(showEphemeral)
+                  .on_change((checked, clickCx) => {
+                    onToggleShowEphemeral?.(!showEphemeral, clickCx);
+                  })
+                  .flex()
+                  .items_center()
+                  .gap(7)
+                  .cursor_pointer()
+                  .child(
+                    h_flex()
+                      .w(28)
+                      .h(16)
+                      .p(2)
+                      .rounded(8)
+                      .items_center()
+                      .bg(showEphemeral ? t.accent : t.border)
+                      .when(showEphemeral, (el) => el.justify_end())
+                      .when(!showEphemeral, (el) => el.justify_start())
+                      .child(div().size(12).rounded(6).bg(showEphemeral ? t.accent_foreground : t.muted)),
+                  )
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(showEphemeral ? t.foreground : t.muted)
+                      .child("Ephemeral"),
+                  ),
+              )
+              .child(div().w(1).h(16).bg(t.border).mx(2))
+              .child(div().text_size(11).text_color(t.dim).child("Closed"))
+              .child(
+                segmentTabs("board-closed-limit-tabs", t).children(
+                  CLOSED_LIMIT_OPTIONS.map((opt) =>
+                    segmentTab(
+                      `closed-limit-${opt.value}`,
+                      opt.label,
+                      closedLimit === opt.value,
+                      null,
+                      (clickCx) => {
+                        if (onChangeClosedLimit) {
+                          onChangeClosedLimit(opt.value, clickCx);
+                        } else {
+                          clickCx?.notify();
+                        }
+                      },
+                      t,
+                    ),
+                  ),
+                ),
+              ),
           )
-          .when(Boolean(this.query), (el) =>
-            el.child(
-              div()
-                .id("clear-search")
-                .p(2)
-                .cursor_pointer()
-                .text_color(t.dim)
-                .hover((s) => s.text_color(t.foreground))
-                .on_click((_e, cx) => {
-                  this.query = "";
-                  this.searchInput.set_value("");
-                  cx.notify();
-                })
-                .child(svg("mods/roscaelifer-queue/icons/close.svg").size(12)),
-            ),
+          .child(
+            h_flex()
+              .w(240)
+              .h(28)
+              .px(8)
+              .gap(6)
+              .items_center()
+              .rounded(6)
+              .border_1()
+              .border_color(this.searchFocused ? t.accent : t.input)
+              .bg(t.background)
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .child(svg("mods/roscaelifer-queue/icons/search.svg").size(13).flex_none().text_color(t.dim))
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .child(Input.new(this.searchInput).h(24).text_size(12).text_color(t.foreground)),
+              )
+              .when(Boolean(this.query), (el) =>
+                el.child(
+                  div()
+                    .id("clear-search")
+                    .p(2)
+                    .cursor_pointer()
+                    .text_color(t.dim)
+                    .hover((s) => s.text_color(t.foreground))
+                    .on_click((_e, cx) => {
+                      this.query = "";
+                      this.searchInput.set_value("");
+                      cx.notify();
+                    })
+                    .child(svg("mods/roscaelifer-queue/icons/close.svg").size(12)),
+                ),
+              ),
           ),
       );
   }
@@ -1265,7 +1373,7 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
@@ -1346,7 +1454,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter }))
+      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

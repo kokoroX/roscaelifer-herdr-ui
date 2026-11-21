@@ -430,7 +430,7 @@ export class DepsController {
     return data;
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const multi = Array.isArray(projects) && projects.length > 1;
@@ -448,6 +448,8 @@ export class DepsController {
           projects,
           projectFilter,
           onSelectProjectFilter,
+          countClosedStats,
+          onToggleCountClosedStats,
           idPrefix: "deps",
         })
       : null;

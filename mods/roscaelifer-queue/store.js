@@ -2350,24 +2350,40 @@ function normalizeProjectResult(entry, index, herdrLive) {
  * `projectResults` accepts either plain entries (`{ projectId, projectName,
  * projectCtx, queue | snapshot, error }`) or Promise.allSettled results.
  */
+export function isClosedQueueItem(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.column === "closed") return true;
+  return !item.column && (item.bdStatus === "closed" || item.status === "closed");
+}
+
 export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
   const results = (Array.isArray(projectResults) ? projectResults : []).map((entry, index) =>
     normalizeProjectResult(entry, index, herdrLive),
   );
 
-  const projects = results.map((result) => ({
-    id: result.projectId,
-    name: result.projectName,
-    color: result.color,
-    ctx: result.projectCtx,
-    runner:
-      result.runner ||
-      result.queue?.runner || { lock_path: "", lock_held: false, active: false },
-    envs: Array.isArray(result.envs) ? result.envs : [],
-    formulas: Array.isArray(result.formulas) ? result.formulas : [],
-    error: result.error,
-    itemCount: result.queue?.items?.length ?? 0,
-  }));
+  const projects = results.map((result) => {
+    const projectItems = Array.isArray(result.queue?.items) ? result.queue.items : [];
+    const closedItemCount = projectItems.reduce(
+      (sum, item) => sum + (isClosedQueueItem(item) ? 1 : 0),
+      0,
+    );
+    const openItemCount = projectItems.length - closedItemCount;
+    return {
+      id: result.projectId,
+      name: result.projectName,
+      color: result.color,
+      ctx: result.projectCtx,
+      runner:
+        result.runner ||
+        result.queue?.runner || { lock_path: "", lock_held: false, active: false },
+      envs: Array.isArray(result.envs) ? result.envs : [],
+      formulas: Array.isArray(result.formulas) ? result.formulas : [],
+      error: result.error,
+      itemCount: projectItems.length,
+      openItemCount,
+      closedItemCount,
+    };
+  });
 
   const items = [];
   const itemsByRaw = new Map();
