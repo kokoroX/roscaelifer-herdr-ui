@@ -1111,7 +1111,7 @@ export class DialogController {
     );
     const modeNote =
       this.hasBd === true
-        ? "Creates an ephemeral WIP bead (roscaelifer, wip, formula) and ensures the runner."
+        ? "Creates an ephemeral bead (roscaelifer, formula) and ensures the runner."
         : this.hasBd === false
           ? "No .beads directory — creates a standalone roscaelifer WIP task and ensures the runner."
           : "Detecting project .beads / standalone WIP mode…";

@@ -383,7 +383,6 @@ export class BoardController {
       queue: null,
       envFilter: null,
       onlyQueued: null,
-      showWip: null,
       showEphemeral: null,
       query: null,
       columns: null,
@@ -458,15 +457,11 @@ export class BoardController {
     return this._lastVisible;
   }
 
-  matchesFilter(item, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
+  matchesFilter(item, { showEphemeral = true, projectFilter = "all" } = {}) {
     if (projectFilter && projectFilter !== "all" && item.projectId && item.projectId !== projectFilter) {
       return false;
     }
-    if (item.isWip) {
-      if (!showWip && !(showEphemeral && item.ephemeral)) {
-        return false;
-      }
-    } else if (item.ephemeral && !showEphemeral) {
+    if (item.ephemeral && !showEphemeral) {
       return false;
     }
     if (this.envFilter !== "all" && item.env !== this.envFilter) {
@@ -826,23 +821,7 @@ export class BoardController {
         h_flex()
           .items_center()
           .gap(6)
-          .when(Boolean(item.isWip), (el) =>
-            el.child(
-              div()
-                .px(6)
-                .py(1)
-                .rounded(5)
-                .bg((t.working || t.accent) + "28")
-                .border_1()
-                .border_color((t.working || t.accent) + "88")
-                .text_size(10.5)
-                .font_semibold()
-                .text_color(t.working || t.accent)
-                .whitespace_nowrap()
-                .child("WIP"),
-            ),
-          )
-          .when(Boolean(item.ephemeral && !item.isWip), (el) =>
+          .when(Boolean(item.ephemeral), (el) =>
             el.child(chip("ephemeral", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
           )
           .when(Boolean(pStyle), (el) =>
@@ -970,7 +949,7 @@ export class BoardController {
     return true;
   }
 
-  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
+  renderFilterBar(queue, t, { closedLimit = "all", onChangeClosedLimit, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
     this.syncEnvFilter(queue);
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
@@ -1099,35 +1078,6 @@ export class BoardController {
                         ),
                     ),
                 ),
-              )
-              .child(
-                Switch.new("filter-wip")
-                  .checked(showWip)
-                  .on_change((_checked, clickCx) => {
-                    onToggleShowWip?.(!showWip, clickCx);
-                  })
-                  .flex()
-                  .items_center()
-                  .gap(7)
-                  .cursor_pointer()
-                  .child(
-                    h_flex()
-                      .w(28)
-                      .h(16)
-                      .p(2)
-                      .rounded(8)
-                      .items_center()
-                      .bg(showWip ? t.working || t.accent : t.border)
-                      .when(showWip, (el) => el.justify_end())
-                      .when(!showWip, (el) => el.justify_start())
-                      .child(div().size(12).rounded(6).bg(showWip ? t.accent_foreground : t.muted)),
-                  )
-                  .child(
-                    div()
-                      .text_size(11.5)
-                      .text_color(showWip ? t.foreground : t.muted)
-                      .child("WIP"),
-                  ),
               )
               .child(
                 Switch.new("filter-ephemeral")
@@ -1321,7 +1271,7 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${col.key}`).absolute().inset_0());
   }
 
-  getFilteredColumns(queue, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
+  getFilteredColumns(queue, { showEphemeral = true, projectFilter = "all" } = {}) {
     this.syncEnvFilter(queue);
     const query = this.query.trim();
     const cached = this._filterCache;
@@ -1329,7 +1279,6 @@ export class BoardController {
       cached.queue === queue &&
       cached.envFilter === this.envFilter &&
       cached.onlyQueued === this.onlyQueued &&
-      cached.showWip === showWip &&
       cached.showEphemeral === showEphemeral &&
       cached.projectFilter === projectFilter &&
       cached.query === query &&
@@ -1346,7 +1295,7 @@ export class BoardController {
     const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
     for (const col of boardColumns) {
       const listItems = (cols[col.key] || []).filter((item) =>
-        this.matchesFilter(item, { showWip, showEphemeral, projectFilter }),
+        this.matchesFilter(item, { showEphemeral, projectFilter }),
       );
       columns[col.key] = listItems;
       visibleAll.push(...listItems);
@@ -1361,7 +1310,6 @@ export class BoardController {
       queue,
       envFilter: this.envFilter,
       onlyQueued: this.onlyQueued,
-      showWip,
       showEphemeral,
       projectFilter,
       query,
@@ -1373,11 +1321,10 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showWip = true, onToggleShowWip, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, closedLimit = "all", onChangeClosedLimit, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
-      showWip,
       showEphemeral,
       projectFilter,
     });
@@ -1454,7 +1401,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showWip, onToggleShowWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
+      .child(this.renderFilterBar(queue, t, { closedLimit, onChangeClosedLimit, showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

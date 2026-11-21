@@ -734,7 +734,7 @@ export function createActions({ getCtx, getRunner, onBusyChange, onRefresh } = {
         async () => {
           const bdActive = await hasLiveBeadsDir(ctx);
           if (bdActive) {
-            const labels = ["roscaelifer", "wip", `formula:${formulaName}`];
+            const labels = ["roscaelifer", `formula:${formulaName}`];
             if (envVal) labels.push(`env:${envVal}`);
             const metadata = {};
             if (projectVal) metadata["roscaelifer.project"] = projectVal;

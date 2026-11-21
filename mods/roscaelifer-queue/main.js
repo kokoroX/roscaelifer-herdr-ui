@@ -59,8 +59,7 @@ const LOCAL_WATCH_POLL_MS = 30000;
 const DETAIL_CACHE_TTL_MS = 20000;
 const DETAIL_CACHE_MAX = 50;
 const CLOSED_LIMIT_KEY = "roscaelifer.closedLimit.v2";
-const SHOW_WIP_KEY = "roscaelifer.showWip.v1";
-const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v1";
+const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v2";
 const COUNT_CLOSED_STATS_KEY = "roscaelifer.countClosedStats.v1";
 const ACTIVE_TAB_KEY = "roscaelifer.activeTab.v1";
 const CLOSED_LIMIT_OPTIONS = [50, 500, 5000, "all"];
@@ -212,10 +211,11 @@ export default class RoscaeliferQueue extends View {
       (Number.isInteger(storedClosedLimit) && CLOSED_LIMIT_OPTIONS.includes(storedClosedLimit))
         ? storedClosedLimit
         : DEFAULT_CLOSED_LIMIT;
-    const storedShowWip = safeStorageGet(SHOW_WIP_KEY, true);
-    this.showWip =
-      storedShowWip === null || storedShowWip === undefined ? true : Boolean(storedShowWip);
-    this.showEphemeral = Boolean(safeStorageGet(SHOW_EPHEMERAL_KEY, false));
+    const storedShowEphemeral = safeStorageGet(SHOW_EPHEMERAL_KEY, true);
+    this.showEphemeral =
+      storedShowEphemeral === null || storedShowEphemeral === undefined
+        ? true
+        : Boolean(storedShowEphemeral);
     const storedCountClosedStats = safeStorageGet(COUNT_CLOSED_STATS_KEY, true);
     this.countClosedStats =
       storedCountClosedStats === null || storedCountClosedStats === undefined
@@ -459,15 +459,6 @@ export default class RoscaeliferQueue extends View {
     if (nextLimit === this.closedLimit) return;
     this.closedLimit = nextLimit;
     safeStorageSet(CLOSED_LIMIT_KEY, nextLimit);
-    cx?.notify?.();
-    this.refresh(cx, { forceContext: false, preempt: true });
-  }
-
-  setShowWip(next, cx) {
-    const value = Boolean(next);
-    if (value === this.showWip) return;
-    this.showWip = value;
-    safeStorageSet(SHOW_WIP_KEY, value);
     cx?.notify?.();
     this.refresh(cx, { forceContext: false, preempt: true });
   }
@@ -760,7 +751,6 @@ export default class RoscaeliferQueue extends View {
         const snap = await fetchSnapshot(this.ctx, runner, {
           closedLimit: this.closedLimit,
           includeEphemeral: this.showEphemeral,
-          includeWip: this.showWip,
           onRunnerResolved: (freshRunner) => {
             if (seq === this.refreshSeq) this.runner = freshRunner;
           },
@@ -889,7 +879,6 @@ export default class RoscaeliferQueue extends View {
     const fetchOpts = {
       closedLimit: this.closedLimit,
       includeEphemeral: this.showEphemeral,
-      includeWip: this.showWip,
     };
     const settled = await Promise.allSettled(
       targets.map(async (entry) => {
@@ -998,7 +987,7 @@ export default class RoscaeliferQueue extends View {
   }
 
   detailCacheKey(item) {
-    const includeEphemeral = Boolean(this.showEphemeral || item?.ephemeral || item?.isWip);
+    const includeEphemeral = Boolean(this.showEphemeral || item?.ephemeral);
     const itemCtx = item?.projectCtx || this.ctx;
     return `${contextKey(itemCtx)}|ephemeral:${includeEphemeral ? "1" : "0"}|${item?.taskId || ""}|${item?.beadId || ""}`;
   }
@@ -1072,7 +1061,7 @@ export default class RoscaeliferQueue extends View {
         taskId ? fetchTaskDetail(itemCtx, runner, taskId) : Promise.resolve(null),
         beadId
           ? fetchBeadDetail(itemCtx, runner, beadId, {
-              includeEphemeral: Boolean(this.showEphemeral || item?.ephemeral || item?.isWip),
+              includeEphemeral: Boolean(this.showEphemeral || item?.ephemeral),
             })
           : Promise.resolve(null),
       ]);
@@ -1745,8 +1734,6 @@ export default class RoscaeliferQueue extends View {
                       closedLimit: this.closedLimit,
                       onChangeClosedLimit: (nextLimit, clickCx) =>
                         this.setClosedLimit(nextLimit, clickCx),
-                      showWip: this.showWip,
-                      onToggleShowWip: (next, clickCx) => this.setShowWip(next, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
@@ -1773,8 +1760,6 @@ export default class RoscaeliferQueue extends View {
                       closedLimit: this.closedLimit,
                       onChangeClosedLimit: (nextLimit, clickCx) =>
                         this.setClosedLimit(nextLimit, clickCx),
-                      showWip: this.showWip,
-                      onToggleShowWip: (next, clickCx) => this.setShowWip(next, clickCx),
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),
@@ -1797,7 +1782,6 @@ export default class RoscaeliferQueue extends View {
                       snapshot: this.snapshot,
                       mode: this.tab,
                       selectedId: this.selectedId,
-                      showWip: this.showWip,
                       showEphemeral: this.showEphemeral,
                       onToggleShowEphemeral: (next, clickCx) =>
                         this.setShowEphemeral(next, clickCx),

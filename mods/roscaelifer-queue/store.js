@@ -1388,7 +1388,7 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   if (resolved?.supportsBrief) args.push("--brief");
   if (
     bdActive &&
-    (opts.includeEphemeral || opts.includeWip !== false) &&
+    opts.includeEphemeral &&
     resolved?.supportsIncludeEphemeral
   ) {
     args.push("--include-ephemeral");
@@ -1887,9 +1887,9 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       intakePlan?.formula ||
       formulaLabel ||
       null;
-    const isWip =
-      hasWipLabel ||
-      (!issue && typeof formula === "string" && formula.startsWith("worker-"));
+    const isStandaloneWip =
+      !issue && typeof formula === "string" && formula.startsWith("worker-");
+    const ephemeral = Boolean(issue?.ephemeral || hasWipLabel || isStandaloneWip);
     const project =
       task?.project ||
       intakePlan?.project ||
@@ -2052,7 +2052,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       beadId,
       taskId,
       title: issue?.title || task?.title || id,
-      ephemeral: Boolean(issue?.ephemeral),
+      ephemeral,
       body: issue?.description || task?.body || "",
       description: issue?.description || "",
       acceptanceCriteria: issue?.acceptance_criteria || "",
@@ -2095,7 +2095,6 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       intakePlan,
       isReady,
       isOptedIn,
-      isWip,
       needsReview,
       hasFailedLabel,
       hasRunningStep,
@@ -2114,7 +2113,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       item.env,
       item.branch,
       ...item.labels,
-      item.isWip ? "wip" : "",
+      item.ephemeral ? "ephemeral wip" : "",
       item.formula,
       item.project,
       item.assignee,

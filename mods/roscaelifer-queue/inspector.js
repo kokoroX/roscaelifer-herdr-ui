@@ -464,8 +464,7 @@ export class InspectorController {
                     ),
                   )
                   .when(Boolean(prioLabel), (el) => el.child(badge(t, prioLabel, item.priority <= 1 ? t.ansi1 : t.muted)))
-                  .when(Boolean(item.isWip), (el) => el.child(badge(t, "WIP", t.accent, true)))
-                  .when(Boolean((item.ephemeral || beadDetail?.ephemeral) && !item.isWip), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
+                  .when(Boolean(item.ephemeral || beadDetail?.ephemeral), (el) => el.child(badge(t, "ephemeral", t.ansi3 || t.accent)))
                   .child(badge(t, statusText, statusCol))
                   .when(Boolean(item.agentStatus), (el) => el.child(badge(t, `agent:${item.agentStatus}`, statusColor(item.agentStatus, t))))
                   .when(Boolean(item.sessionInfo?.spaceName || item.sessionInfo?.tabName), (el) => el.child(badge(t, [item.sessionInfo.spaceName, item.sessionInfo.tabName].filter(Boolean).join(" · "), t.accent))),

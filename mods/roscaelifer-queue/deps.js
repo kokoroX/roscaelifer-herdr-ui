@@ -312,6 +312,7 @@ export class DepsController {
       queue: null,
       selectedEpicId: null,
       showClosedInWaves: null,
+      showEphemeral: null,
       projectFilter: null,
       data: null,
     };
@@ -322,7 +323,6 @@ export class DepsController {
       projects: null,
       selectedEpicId: null,
       showClosedInWaves: null,
-      showWip: null,
       showEphemeral: null,
       projectFilter: null,
       chainFocusId: null,
@@ -380,13 +380,12 @@ export class DepsController {
     return stats;
   }
 
-  getWaveData(queue, epics, items, { showWip = true, showEphemeral = false, projectFilter = "all" } = {}) {
+  getWaveData(queue, epics, items, { showEphemeral = true, projectFilter = "all" } = {}) {
     const cached = this._waveCache;
     if (
       cached.queue === queue &&
       cached.selectedEpicId === this.selectedEpicId &&
       cached.showClosedInWaves === this.showClosedInWaves &&
-      cached.showWip === showWip &&
       cached.showEphemeral === showEphemeral &&
       cached.projectFilter === projectFilter
     ) {
@@ -400,9 +399,7 @@ export class DepsController {
       : null;
     const scopedItems = items.filter((it) => {
       if (it.issueType === "epic") return false;
-      if (it.isWip) {
-        if (!showWip && !(showEphemeral && it.ephemeral)) return false;
-      } else if (it.ephemeral && !showEphemeral) {
+      if (it.ephemeral && !showEphemeral) {
         return false;
       }
       if (this.selectedEpicId) {
@@ -422,7 +419,6 @@ export class DepsController {
       queue,
       selectedEpicId: this.selectedEpicId,
       showClosedInWaves: this.showClosedInWaves,
-      showWip,
       showEphemeral,
       projectFilter,
       data,
@@ -430,7 +426,7 @@ export class DepsController {
     return data;
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const multi = Array.isArray(projects) && projects.length > 1;
@@ -473,7 +469,7 @@ export class DepsController {
           .min_h(0)
           .gap(8)
           .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats, projects, projectFilter }))
-          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral, projects, projectFilter })),
+          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, projects, projectFilter })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -722,16 +718,14 @@ export class DepsController {
     }));
   }
 
-  scopeItems(items, epics, selectedEpic, { showWip = true, showEphemeral = false } = {}) {
+  scopeItems(items, epics, selectedEpic, { showEphemeral = true } = {}) {
     void epics;
     const epicChildIds = selectedEpic
       ? new Set((selectedEpic.children ?? []).map((child) => child.id || child.beadId).filter(Boolean))
       : null;
     return items.filter((it) => {
       if (it.issueType === "epic") return false;
-      if (it.isWip) {
-        if (!showWip && !(showEphemeral && it.ephemeral)) return false;
-      } else if (it.ephemeral && !showEphemeral) {
+      if (it.ephemeral && !showEphemeral) {
         return false;
       }
       if (selectedEpic) {
@@ -798,8 +792,7 @@ export class DepsController {
               .gap(5)
               .child(div().text_size(11).font_family(monoFont).text_color(it.projectColor || t.accent).child(it.rawId || id))
               .when(Boolean(it.projectName), (el) => el.child(pill(t, it.projectName, it.projectColor || t.accent)))
-              .when(Boolean(it.isWip), (el) => el.child(pill(t, "WIP", t.working || t.accent)))
-              .when(Boolean(it.ephemeral && !it.isWip), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
+              .when(Boolean(it.ephemeral), (el) => el.child(pill(t, "ephemeral", t.ansi3 || t.accent)))
               .when(it.priority !== undefined && it.priority !== null, (el) =>
                 el.child(pill(t, `P${it.priority}`, it.priority <= 1 ? t.ansi1 : t.muted)),
               ),
@@ -922,14 +915,13 @@ export class DepsController {
    * define them. Scrolling horizontally only changes `wavesScrollX`, so the
    * cache turns those frames back into a pure re-layout.
    */
-  getGroupedWaveSections(queue, epics, groups, projects, { showWip, showEphemeral, projectFilter, selectedId }) {
+  getGroupedWaveSections(queue, epics, groups, projects, { showEphemeral, projectFilter, selectedId }) {
     const cached = this._groupedWaveCache;
     if (
       cached.queue === queue &&
       cached.projects === projects &&
       cached.selectedEpicId === this.selectedEpicId &&
       cached.showClosedInWaves === this.showClosedInWaves &&
-      cached.showWip === showWip &&
       cached.showEphemeral === showEphemeral &&
       cached.projectFilter === projectFilter &&
       cached.chainFocusId === this.chainFocusId &&
@@ -941,7 +933,7 @@ export class DepsController {
       ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
       : null;
     const sections = groups.map((group) => {
-      const scopedItems = this.scopeItems(group.items, epics, selectedEpic, { showWip, showEphemeral });
+      const scopedItems = this.scopeItems(group.items, epics, selectedEpic, { showEphemeral });
       const graph = computeWaves(scopedItems);
       const activeChainId =
         this.chainFocusId ||
@@ -968,7 +960,6 @@ export class DepsController {
       projects,
       selectedEpicId: this.selectedEpicId,
       showClosedInWaves: this.showClosedInWaves,
-      showWip,
       showEphemeral,
       projectFilter,
       chainFocusId: this.chainFocusId,
@@ -979,12 +970,11 @@ export class DepsController {
   }
 
   /** Multi-project deps graph: one section per project, so blocks DAGs never mix. */
-  renderGroupedWaves(t, { queue, epics, groups, projects, onSelectItem, selectedId, monoFont, showWip, showEphemeral, onToggleShowEphemeral, projectFilter = "all" }) {
+  renderGroupedWaves(t, { queue, epics, groups, projects, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, projectFilter = "all" }) {
     const selectedEpic = this.selectedEpicId
       ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
       : null;
     const { sections, totalNodes, totalWaves } = this.getGroupedWaveSections(queue, epics, groups, projects, {
-      showWip,
       showEphemeral,
       projectFilter,
       selectedId,
@@ -1135,7 +1125,7 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showWip = true, showEphemeral = false, onToggleShowEphemeral, projects = [], projectFilter = "all" }) {
+  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all" }) {
     const groups = this.projectGroups(projects, items, projectFilter);
     if (groups.length > 1) {
       return this.renderGroupedWaves(t, {
@@ -1146,13 +1136,12 @@ export class DepsController {
         onSelectItem,
         selectedId,
         monoFont,
-        showWip,
         showEphemeral,
         onToggleShowEphemeral,
         projectFilter,
       });
     }
-    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showWip, showEphemeral, projectFilter });
+    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showEphemeral, projectFilter });
     const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
     this._minWavesContentW = minContentW;
     this.clampWavesScrollX(minContentW);
