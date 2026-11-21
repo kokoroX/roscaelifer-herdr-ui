@@ -849,3 +849,117 @@ test("projectDisplayCount and totalProjectsDisplayCount toggle closed stats excl
   assert.equal(totalProjectsDisplayCount(projects, { excludeClosedStats: false }), 375);
   assert.equal(totalProjectsDisplayCount(projects, { excludeClosedStats: true }), 37);
 });
+
+test("normalizeQueue resolves dispatch model from attempt, vars, metadata, and static formula steps while ignoring templates", () => {
+  const queue = store.normalizeQueue({
+    config: {
+      default_env: "local",
+      envs: [{ name: "local", kind: "local" }],
+      formulas: [
+        {
+          name: "static-formula",
+          vars: { provider: "pi", model: "formula-var-model" },
+          steps: [
+            { id: "work", kind: "work", provider: "claude-worker", model: "group/strong" },
+          ],
+        },
+        {
+          name: "templated-formula",
+          vars: { provider: "pi-worker", model: "group/cheap" },
+          steps: [
+            { id: "work", kind: "work", provider: "{{.Vars.provider}}", model: "{{.Vars.model}}" },
+          ],
+        },
+      ],
+    },
+    tasks: [
+      {
+        id: "t-attempt",
+        title: "Attempt model wins",
+        bead_id: "rsc-1",
+        formula_name: "static-formula",
+        status: "active",
+        vars: { provider: "var-prov", model: "var-model" },
+        steps: [
+          {
+            step_id: "work",
+            kind: "work",
+            status: "running",
+            current_attempt: {
+              n: 1,
+              status: "running",
+              thread_id: "herdr:local:t1",
+              provider: "pi-worker",
+              model: "group/cheap",
+            },
+          },
+        ],
+      },
+      {
+        id: "t-vars",
+        title: "Task vars fallback",
+        bead_id: "rsc-2",
+        formula_name: "templated-formula",
+        status: "active",
+        vars: { provider: "claude-worker", model: "group/standard" },
+        steps: [
+          { step_id: "work", kind: "work", status: "pending" },
+        ],
+      },
+      {
+        id: "t-template-skip",
+        title: "Ignores unrendered template and falls back to formula vars",
+        formula_name: "templated-formula",
+        status: "active",
+        vars: {},
+        steps: [
+          { step_id: "work", kind: "work", status: "running" },
+        ],
+      },
+    ],
+    bd: {
+      available: true,
+      ready_ids: ["rsc-3"],
+      issues: [
+        { id: "rsc-1", title: "Issue 1", status: "in_progress", labels: ["roscaelifer"] },
+        { id: "rsc-2", title: "Issue 2", status: "open", labels: ["roscaelifer"] },
+        {
+          id: "rsc-3",
+          title: "Metadata fallback",
+          status: "open",
+          labels: ["roscaelifer", "formula:static-formula"],
+          metadata: {
+            "roscaelifer.var.provider": "pi-worker",
+            "roscaelifer.var.model": "group/fast",
+          },
+        },
+        {
+          id: "rsc-4",
+          title: "Static formula step fallback",
+          status: "open",
+          labels: ["roscaelifer", "formula:static-formula"],
+        },
+      ],
+    },
+  });
+
+  const byId = new Map(queue.items.map((item) => [item.id, item]));
+  const i1 = byId.get("rsc-1");
+  assert.equal(i1.dispatchProvider, "pi-worker");
+  assert.equal(i1.dispatchModel, "group/cheap");
+  assert.equal(i1.dispatchModelLabel, "pi-worker · group/cheap");
+  assert.equal(i1.currentStep.currentAttempt.provider, "pi-worker");
+  assert.equal(i1.currentStep.currentAttempt.model, "group/cheap");
+
+  const i2 = byId.get("rsc-2");
+  assert.equal(i2.dispatchModelLabel, "claude-worker · group/standard");
+
+  const i3 = byId.get("rsc-3");
+  assert.equal(i3.dispatchModelLabel, "pi-worker · group/fast");
+
+  const i4 = byId.get("rsc-4");
+  assert.equal(i4.dispatchModelLabel, "claude-worker · group/strong");
+
+  const i5 = byId.get("task:t-template-skip");
+  assert.equal(i5.dispatchModelLabel, "pi-worker · group/cheap");
+});

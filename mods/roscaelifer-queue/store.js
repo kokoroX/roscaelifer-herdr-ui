@@ -1662,6 +1662,78 @@ function resolveLiveStatus(agent, terminal) {
   return null;
 }
 
+function cleanModelField(val) {
+  const s = typeof val === "string" ? val.trim() : "";
+  if (!s || s.includes("{{")) return "";
+  return s;
+}
+
+export function formatDispatchModel(provider, model) {
+  const p = cleanModelField(provider);
+  const m = cleanModelField(model);
+  if (p && m) return `${p} · ${m}`;
+  return p || m || "";
+}
+
+export function resolveDispatchModel({ steps = [], currentStep = null, task = null, issue = null, formula = null, formulasByName = null } = {}) {
+  const attemptCandidates = [];
+  if (currentStep?.currentAttempt) attemptCandidates.push(currentStep.currentAttempt);
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const att = steps[i]?.currentAttempt || steps[i]?.current_attempt;
+    if (att && att !== currentStep?.currentAttempt) attemptCandidates.push(att);
+  }
+  for (const att of attemptCandidates) {
+    const provider = cleanModelField(att?.provider);
+    const model = cleanModelField(att?.model);
+    if (provider || model) {
+      return { provider, model, label: formatDispatchModel(provider, model) };
+    }
+  }
+
+  const taskVars = task?.vars || {};
+  {
+    const provider = cleanModelField(taskVars.provider);
+    const model = cleanModelField(taskVars.model);
+    if (provider || model) {
+      return { provider, model, label: formatDispatchModel(provider, model) };
+    }
+  }
+
+  const beadMeta = issue?.metadata || {};
+  {
+    const provider = cleanModelField(beadMeta["roscaelifer.var.provider"]);
+    const model = cleanModelField(beadMeta["roscaelifer.var.model"]);
+    if (provider || model) {
+      return { provider, model, label: formatDispatchModel(provider, model) };
+    }
+  }
+
+  const formulaDef = formula && formulasByName ? formulasByName.get(formula) : null;
+  if (formulaDef) {
+    const fSteps = Array.isArray(formulaDef.steps) ? formulaDef.steps : [];
+    const curStepId = currentStep?.stepId || currentStep?.step_id || currentStep?.id || "";
+    const targetFormulaStep =
+      (curStepId && fSteps.find((fs) => fs.id === curStepId)) ||
+      fSteps.find((fs) => (fs.kind || "work") === "work") ||
+      null;
+    if (targetFormulaStep) {
+      const provider = cleanModelField(targetFormulaStep.provider);
+      const model = cleanModelField(targetFormulaStep.model);
+      if (provider || model) {
+        return { provider, model, label: formatDispatchModel(provider, model) };
+      }
+    }
+    const fVars = formulaDef.vars || {};
+    const provider = cleanModelField(fVars.provider);
+    const model = cleanModelField(fVars.model);
+    if (provider || model) {
+      return { provider, model, label: formatDispatchModel(provider, model) };
+    }
+  }
+
+  return { provider: "", model: "", label: "" };
+}
+
 function normalizeSteps(rawSteps, envObj, lookup) {
   const steps = Array.isArray(rawSteps) ? rawSteps : [];
   return steps.map((s) => {
@@ -1697,6 +1769,8 @@ function normalizeSteps(rawSteps, envObj, lookup) {
             hcEnv: attempt.hc_env || "",
             hcAddress,
             marker: attempt.marker || "",
+            provider: attempt.provider || "",
+            model: attempt.model || "",
             worktree: attempt.worktree || "",
             branch: attempt.branch || "",
             link: attempt.effective_link || attempt.link || "",
@@ -1775,6 +1849,10 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
   }
 
   const formulas = Array.isArray(cfg.formulas) ? cfg.formulas : [];
+  const formulasByName = new Map();
+  for (const f of formulas) {
+    if (f?.name) formulasByName.set(f.name, f);
+  }
   const lookup = buildHerdrLookup(agents, terminals, spaces, panes);
 
   const rawTasks = Array.isArray(snap.tasks) ? snap.tasks : [];
@@ -2047,6 +2125,15 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       column = "ready";
     }
 
+    const dispatchModelInfo = resolveDispatchModel({
+      steps,
+      currentStep,
+      task,
+      issue,
+      formula,
+      formulasByName,
+    });
+
     // Also pick up live blocked agent status as informational badge (stays in running unless step paused).
     const item = {
       id,
@@ -2069,6 +2156,9 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       actionReason,
       labels,
       formula,
+      dispatchProvider: dispatchModelInfo.provider,
+      dispatchModel: dispatchModelInfo.model,
+      dispatchModelLabel: dispatchModelInfo.label,
       env: envName,
       envPendingAuto,
       maxRunning: envObj?.maxRunning ?? null,
@@ -2116,6 +2206,8 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       ...item.labels,
       item.ephemeral ? "ephemeral wip" : "",
       item.formula,
+      item.dispatchProvider,
+      item.dispatchModel,
       item.project,
       item.assignee,
       item.parent,

@@ -1,6 +1,7 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Button, TextView, ScrollHandle, Scrollbar } from "gpui-base";
 import { hc, theme, settings, notify } from "herdr";
+import { formatDispatchModel } from "./store.js";
 
 const I = (name) => `mods/roscaelifer-queue/icons/${name}.svg`;
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
@@ -378,7 +379,12 @@ export class InspectorController {
     const taskVars = taskDetail?.vars ?? detail?.vars ?? item.task?.vars ?? {};
     const beadMeta = beadDetail?.metadata ?? item.issue?.metadata ?? {};
     const varCwd = taskVars?.cwd || beadMeta?.["roscaelifer.var.cwd"] || "";
-    const varModel = taskVars?.model || beadMeta?.["roscaelifer.var.model"] || "";
+    const curModelLabel = formatDispatchModel(curAttempt?.provider, curAttempt?.model);
+    const varModelLabel = formatDispatchModel(
+      taskVars?.provider || beadMeta?.["roscaelifer.var.provider"] || "",
+      taskVars?.model || beadMeta?.["roscaelifer.var.model"] || "",
+    );
+    const modelLabel = curModelLabel || item.dispatchModelLabel || varModelLabel;
     const varMcp = taskVars?.mcp_profile || beadMeta?.["roscaelifer.var.mcp_profile"] || "";
 
     const metaRows = [];
@@ -388,7 +394,7 @@ export class InspectorController {
     if (item.project) metaRows.push(["Project", item.project]);
     if (item.projectName) metaRows.push(["Workspace Project", item.projectName]);
     if (varCwd && varCwd !== worktree) metaRows.push(["Cwd", varCwd]);
-    if (varModel) metaRows.push(["Model", varModel]);
+    if (modelLabel) metaRows.push(["Model", modelLabel]);
     if (varMcp) metaRows.push(["MCP Profile", varMcp]);
     if (branch) metaRows.push(["Branch", branch]);
     if (worktree) metaRows.push(["Worktree", worktree]);
@@ -722,6 +728,7 @@ export class InspectorController {
           const runningSince = s.running_since ?? s.runningSince;
           const runningElapsed = s.status === "running" && runningSince ? formatElapsed(runningSince) : "";
           const curHandle = cur?.hc_address || cur?.hcAddress || cur?.thread_id || cur?.threadId;
+          const curModel = formatDispatchModel(cur?.provider, cur?.model);
           const stepCol = statusColor(s.status, t);
           const isExpanded = this.expandedStep === stepId;
 
@@ -782,7 +789,7 @@ export class InspectorController {
                 .when(maxRounds > 0 || rounds > 0, (el) => el.child(`rounds: ${rounds}/${maxRounds}`))
                 .when(dispatchFailures > 0, (el) => el.child(div().text_color(t.ansi1).child(`dispatch failures: ${dispatchFailures}`))),
             )
-            .when(Boolean(cur?.worktree || cur?.branch || curHandle || cur?.link), (el) =>
+            .when(Boolean(cur?.worktree || cur?.branch || curHandle || cur?.link || curModel), (el) =>
               el.child(
                 v_flex()
                   .gap(2)
@@ -790,6 +797,9 @@ export class InspectorController {
                   .text_size(11)
                   .font_family(monoFont)
                   .text_color(t.dim)
+                  .when(Boolean(curModel), (c) =>
+                    c.child(selectableText(`insp-step-meta-${itemId}-${stepId}-model`, `model: ${curModel}`)),
+                  )
                   .when(Boolean(curHandle), (c) =>
                     c.child(selectableText(`insp-step-meta-${itemId}-${stepId}-terminal`, `terminal: ${curHandle}`)),
                   )
@@ -852,6 +862,19 @@ export class InspectorController {
                             .justify_between()
                             .child(div().font_medium().text_color(t.foreground).child(`#${a.n} · ${a.status}`))
                             .child(div().text_color(t.dim).child(formatTimestamp(a.created_at || a.started_at))),
+                        )
+                        .when(Boolean(formatDispatchModel(a.provider, a.model)), (c) =>
+                          c.child(
+                            div()
+                              .font_family(monoFont)
+                              .text_color(t.dim)
+                              .child(
+                                selectableText(
+                                  `insp-att-${itemId}-${stepId}-${ai}-model`,
+                                  `model: ${formatDispatchModel(a.provider, a.model)}`,
+                                ),
+                              ),
+                          ),
                         )
                         .when(Boolean(a.hc_address || a.thread_id), (c) =>
                           c.child(

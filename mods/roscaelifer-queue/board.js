@@ -877,6 +877,9 @@ export class BoardController {
           .when(Boolean(item.env), (el) =>
             el.child(chip(`env:${item.env}`, t.muted, t.raised)),
           )
+          .when(Boolean(item.dispatchModelLabel), (el) =>
+            el.child(chip(item.dispatchModelLabel, t.muted, t.raised, t.border)),
+          )
           .when(this.mode === "beads" && item.bdStatus === "deferred", (el) =>
             el.child(chip("deferred", t.ansi3 || t.accent, (t.ansi3 || t.accent) + "22")),
           )
