@@ -355,7 +355,6 @@ export class BoardController {
   constructor(cx, { mode = "roscaelifer" } = {}) {
     this.mode = mode;
     this.envFilter = "all";
-    this.onlyQueued = false;
     this.query = "";
     this.searchFocused = false;
     this.searchInput = InputState.new({ placeholder: "Search ID, title, label, formula…" });
@@ -375,7 +374,6 @@ export class BoardController {
     this._filterCache = {
       queue: null,
       envFilter: null,
-      onlyQueued: null,
       showEphemeral: null,
       query: null,
       columns: null,
@@ -458,9 +456,6 @@ export class BoardController {
       return false;
     }
     if (this.envFilter !== "all" && item.env !== this.envFilter) {
-      return false;
-    }
-    if (this.mode === "roscaelifer" && this.onlyQueued && item.column === "ready") {
       return false;
     }
     const q = this.query.trim().toLowerCase();
@@ -1030,48 +1025,6 @@ export class BoardController {
                   ),
               )
               .child(div().w(1).h(16).bg(t.border).mx(2))
-              .when(this.mode === "roscaelifer", (el) =>
-                el.child(
-                  h_flex()
-                    .gap(7)
-                    .items_center()
-                    .child(
-                      Switch.new("filter-queued")
-                        .checked(this.onlyQueued)
-                        .on_change((checked, cx) => {
-                          this.onlyQueued = Boolean(checked);
-                          cx.notify();
-                        })
-                        .flex()
-                        .items_center()
-                        .gap(7)
-                        .cursor_pointer()
-                        .child(
-                          h_flex()
-                            .w(28)
-                            .h(16)
-                            .p(2)
-                            .rounded(8)
-                            .items_center()
-                            .bg(this.onlyQueued ? t.accent : t.border)
-                            .when(this.onlyQueued, (el) => el.justify_end())
-                            .when(!this.onlyQueued, (el) => el.justify_start())
-                            .child(
-                              div()
-                                .size(12)
-                                .rounded(6)
-                                .bg(this.onlyQueued ? t.accent_foreground : t.muted),
-                            ),
-                        )
-                        .child(
-                          div()
-                            .text_size(11.5)
-                            .text_color(this.onlyQueued ? t.foreground : t.muted)
-                            .child("Queued only"),
-                        ),
-                    ),
-                ),
-              )
               .child(
                 Switch.new("filter-ephemeral")
                   .checked(showEphemeral)
@@ -1249,7 +1202,6 @@ export class BoardController {
     if (
       cached.queue === queue &&
       cached.envFilter === this.envFilter &&
-      cached.onlyQueued === this.onlyQueued &&
       cached.showEphemeral === showEphemeral &&
       cached.projectFilter === projectFilter &&
       cached.query === query &&
@@ -1280,7 +1232,6 @@ export class BoardController {
     this._filterCache = {
       queue,
       envFilter: this.envFilter,
-      onlyQueued: this.onlyQueued,
       showEphemeral,
       projectFilter,
       query,
