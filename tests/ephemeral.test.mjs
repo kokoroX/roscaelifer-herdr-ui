@@ -152,6 +152,37 @@ test("normalizeQueue sets ephemeral uniformly for ephemeral, legacy wip, and sta
   assert.equal("isWip" in standalone, false);
 });
 
+test("normalizeQueue classifies orphan terminal bead tasks as ephemeral closed or action items", () => {
+  const queue = store.normalizeQueue({
+    config: { default_env: "local", envs: [{ name: "local", kind: "local" }] },
+    tasks: [
+      {
+        id: "t-worker-done",
+        bead_id: "rsc-worker-closed",
+        formula_name: "worker-inplace",
+        status: "done",
+        steps: [],
+      },
+      {
+        id: "t-wisp-cancelled",
+        bead_id: "rsc-wisp-closed",
+        formula_name: "custom-formula",
+        status: "cancelled",
+        steps: [],
+      },
+    ],
+    bd: { available: true, ready_ids: [], issues: [] },
+  });
+
+  const done = queue.itemsById.get("rsc-worker-closed");
+  const cancelled = queue.itemsById.get("rsc-wisp-closed");
+  assert.equal(done.column, "closed");
+  assert.equal(done.ephemeral, true);
+  assert.equal(cancelled.column, "action");
+  assert.equal(cancelled.actionReason, "cancelled");
+  assert.equal(cancelled.ephemeral, true);
+});
+
 test("BoardController.matchesFilter toggles all ephemeral items via showEphemeral", () => {
   const board = new boardMod.BoardController();
   const formal = { id: "rsc-1", ephemeral: false, env: "local", column: "ready", _searchText: "formal" };

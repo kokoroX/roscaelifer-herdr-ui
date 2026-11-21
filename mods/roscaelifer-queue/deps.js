@@ -446,6 +446,7 @@ export class DepsController {
           onSelectProjectFilter,
           countClosedStats,
           onToggleCountClosedStats,
+          showEphemeral,
           idPrefix: "deps",
         })
       : null;

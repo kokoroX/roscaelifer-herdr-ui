@@ -1968,7 +1968,8 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       null;
     const isStandaloneWip =
       !issue && typeof formula === "string" && formula.startsWith("worker-");
-    const ephemeral = Boolean(issue?.ephemeral || hasWipLabel || isStandaloneWip);
+    const isEphemeralWisp = !issue && typeof beadId === "string" && beadId.includes("-wisp-");
+    const ephemeral = Boolean(issue?.ephemeral || hasWipLabel || isStandaloneWip || isEphemeralWisp);
     const project =
       task?.project ||
       intakePlan?.project ||
@@ -2094,7 +2095,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       } else {
         column = "closed";
       }
-    } else if (!beadId && (taskStatus === "done" || taskStatus === "cancelled")) {
+    } else if (!issue && (taskStatus === "done" || taskStatus === "cancelled")) {
       column = taskStatus === "cancelled" ? "action" : "closed";
       if (taskStatus === "cancelled") actionReason = "cancelled";
     } else if (waitingApprovalStep) {
@@ -2455,11 +2456,19 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
 
   const projects = results.map((result) => {
     const projectItems = Array.isArray(result.queue?.items) ? result.queue.items : [];
-    const closedItemCount = projectItems.reduce(
-      (sum, item) => sum + (isClosedQueueItem(item) ? 1 : 0),
-      0,
-    );
-    const openItemCount = projectItems.length - closedItemCount;
+    const countItems = (items) => {
+      const closed = items.reduce(
+        (sum, item) => sum + (isClosedQueueItem(item) ? 1 : 0),
+        0,
+      );
+      return {
+        total: items.length,
+        open: items.length - closed,
+        closed,
+      };
+    };
+    const allStats = countItems(projectItems);
+    const nonEphemeralStats = countItems(projectItems.filter((item) => !item?.ephemeral));
     return {
       id: result.projectId,
       name: result.projectName,
@@ -2471,9 +2480,13 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
       envs: Array.isArray(result.envs) ? result.envs : [],
       formulas: Array.isArray(result.formulas) ? result.formulas : [],
       error: result.error,
-      itemCount: projectItems.length,
-      openItemCount,
-      closedItemCount,
+      // Keep the original fields as the all-items view used by older callers.
+      itemCount: allStats.total,
+      openItemCount: allStats.open,
+      closedItemCount: allStats.closed,
+      nonEphemeralItemCount: nonEphemeralStats.total,
+      nonEphemeralOpenItemCount: nonEphemeralStats.open,
+      nonEphemeralClosedItemCount: nonEphemeralStats.closed,
     };
   });
 

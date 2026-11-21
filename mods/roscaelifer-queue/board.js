@@ -169,27 +169,51 @@ function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, on
     .child(label);
 }
 
-export function projectDisplayCount(project, { excludeClosedStats = false } = {}) {
+function projectDisplayStats(project, { showEphemeral = true } = {}) {
   if (!project || typeof project !== "object") return null;
-  if (excludeClosedStats && Number.isFinite(project.openItemCount)) {
-    return project.openItemCount;
-  }
-  return Number.isFinite(project.itemCount) ? project.itemCount : null;
+  const total = showEphemeral ? project.itemCount : project.nonEphemeralItemCount;
+  const open = showEphemeral ? project.openItemCount : project.nonEphemeralOpenItemCount;
+  const closed = showEphemeral ? project.closedItemCount : project.nonEphemeralClosedItemCount;
+  return {
+    total: Number.isFinite(total) ? total : Number.isFinite(project.itemCount) ? project.itemCount : null,
+    open: Number.isFinite(open) ? open : Number.isFinite(project.openItemCount) ? project.openItemCount : null,
+    closed: Number.isFinite(closed) ? closed : Number.isFinite(project.closedItemCount) ? project.closedItemCount : null,
+  };
 }
 
-export function totalProjectsDisplayCount(projects = [], { excludeClosedStats = false } = {}) {
+export function projectDisplayCount(
+  project,
+  { excludeClosedStats = false, showEphemeral = true } = {},
+) {
+  const stats = projectDisplayStats(project, { showEphemeral });
+  if (!stats) return null;
+  if (excludeClosedStats && Number.isFinite(stats.open)) return stats.open;
+  return stats.total;
+}
+
+export function totalProjectsDisplayCount(
+  projects = [],
+  { excludeClosedStats = false, showEphemeral = true } = {},
+) {
   if (!Array.isArray(projects)) return 0;
   return projects.reduce((sum, project) => {
-    const count = projectDisplayCount(project, { excludeClosedStats });
+    const count = projectDisplayCount(project, { excludeClosedStats, showEphemeral });
     return sum + (Number.isFinite(count) ? count : 0);
   }, 0);
 }
 
-function projectPill(t, project, active, onClick, { excludeClosedStats = false } = {}) {
+function projectPill(
+  t,
+  project,
+  active,
+  onClick,
+  { excludeClosedStats = false, showEphemeral = true } = {},
+) {
   const hasError = Boolean(project.error);
-  const displayCount = projectDisplayCount(project, { excludeClosedStats });
-  const openCount = Number.isFinite(project.openItemCount) ? project.openItemCount : null;
-  const closedCount = Number.isFinite(project.closedItemCount) ? project.closedItemCount : null;
+  const stats = projectDisplayStats(project, { showEphemeral });
+  const displayCount = projectDisplayCount(project, { excludeClosedStats, showEphemeral });
+  const openCount = stats?.open ?? null;
+  const closedCount = stats?.closed ?? null;
   const countTip = !Number.isFinite(displayCount)
     ? ""
     : excludeClosedStats && closedCount !== null
@@ -258,23 +282,29 @@ export function renderProjectFilterPills(
     onSelectProjectFilter,
     countClosedStats = true,
     onToggleCountClosedStats,
+    showEphemeral = true,
     idPrefix = "project",
   } = {},
 ) {
   if (!Array.isArray(projects) || projects.length < 2) return null;
   const excludeClosedStats = !countClosedStats;
-  const totalCount = totalProjectsDisplayCount(projects, { excludeClosedStats });
-  const totalOpen = projects.reduce(
-    (sum, project) => sum + (Number.isFinite(project?.openItemCount) ? project.openItemCount : 0),
-    0,
+  const totalCount = totalProjectsDisplayCount(projects, { excludeClosedStats, showEphemeral });
+  const totals = projects.reduce(
+    (sum, project) => {
+      const stats = projectDisplayStats(project, { showEphemeral });
+      return {
+        open: sum.open + (Number.isFinite(stats?.open) ? stats.open : 0),
+        closed: sum.closed + (Number.isFinite(stats?.closed) ? stats.closed : 0),
+      };
+    },
+    { open: 0, closed: 0 },
   );
-  const totalClosed = projects.reduce(
-    (sum, project) => sum + (Number.isFinite(project?.closedItemCount) ? project.closedItemCount : 0),
-    0,
-  );
-  const hasBreakdown = projects.some(
-    (project) => Number.isFinite(project?.openItemCount) && Number.isFinite(project?.closedItemCount),
-  );
+  const totalOpen = totals.open;
+  const totalClosed = totals.closed;
+  const hasBreakdown = projects.some((project) => {
+    const stats = projectDisplayStats(project, { showEphemeral });
+    return Number.isFinite(stats?.open) && Number.isFinite(stats?.closed);
+  });
   const allProjectsTooltip = hasBreakdown
     ? excludeClosedStats
       ? `${totalCount} active across ${projects.length} projects (${totalClosed} closed excluded)`
@@ -307,7 +337,7 @@ export function renderProjectFilterPills(
             project,
             projectFilter === project.id,
             () => onSelectProjectFilter?.(projectFilter === project.id ? "all" : project.id),
-            { excludeClosedStats },
+            { excludeClosedStats, showEphemeral },
           ),
         ),
       ),
@@ -981,6 +1011,7 @@ export class BoardController {
                 onSelectProjectFilter,
                 countClosedStats,
                 onToggleCountClosedStats,
+                showEphemeral,
                 idPrefix: "board",
               }),
             ),

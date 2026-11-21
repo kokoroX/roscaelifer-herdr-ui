@@ -850,6 +850,79 @@ test("projectDisplayCount and totalProjectsDisplayCount toggle closed stats excl
   assert.equal(totalProjectsDisplayCount(projects, { excludeClosedStats: true }), 37);
 });
 
+test("project display counts combine showEphemeral and countClosedStats consistently", () => {
+  const merged = store.mergeNormalizedQueues([
+    {
+      projectId: "alpha",
+      projectName: "Alpha",
+      queue: makeQueue("alpha", [
+        makeItem("rsc-open", { ephemeral: false, column: "ready", bdStatus: "open" }),
+        makeItem("rsc-ephemeral-closed", {
+          ephemeral: true,
+          column: "closed",
+          beadColumn: "closed",
+          bdStatus: "closed",
+        }),
+      ]),
+    },
+    {
+      projectId: "beta",
+      projectName: "Beta",
+      queue: makeQueue("beta", [
+        makeItem("rsc-only-ephemeral-closed", {
+          ephemeral: true,
+          column: "closed",
+          beadColumn: "closed",
+          bdStatus: "closed",
+        }),
+      ]),
+    },
+  ]);
+
+  const alpha = merged.projects.find((project) => project.id === "alpha");
+  const beta = merged.projects.find((project) => project.id === "beta");
+  assert.deepEqual(
+    [alpha.itemCount, alpha.openItemCount, alpha.closedItemCount],
+    [2, 1, 1],
+  );
+  assert.deepEqual(
+    [alpha.nonEphemeralItemCount, alpha.nonEphemeralOpenItemCount, alpha.nonEphemeralClosedItemCount],
+    [1, 1, 0],
+  );
+  assert.deepEqual(
+    [beta.itemCount, beta.openItemCount, beta.closedItemCount],
+    [1, 0, 1],
+  );
+  assert.deepEqual(
+    [beta.nonEphemeralItemCount, beta.nonEphemeralOpenItemCount, beta.nonEphemeralClosedItemCount],
+    [0, 0, 0],
+  );
+
+  const { projectDisplayCount, totalProjectsDisplayCount } = boardMod;
+  const projects = merged.projects;
+  for (const showEphemeral of [false, true]) {
+    for (const countClosedStats of [false, true]) {
+      const excludeClosedStats = !countClosedStats;
+      const alphaCount = projectDisplayCount(alpha, { showEphemeral, excludeClosedStats });
+      const betaCount = projectDisplayCount(beta, { showEphemeral, excludeClosedStats });
+      const total = totalProjectsDisplayCount(projects, { showEphemeral, excludeClosedStats });
+      if (!countClosedStats) {
+        assert.equal(alphaCount, 1);
+        assert.equal(betaCount, 0);
+        assert.equal(total, 1);
+      } else if (showEphemeral) {
+        assert.equal(alphaCount, 2);
+        assert.equal(betaCount, 1);
+        assert.equal(total, 3);
+      } else {
+        assert.equal(alphaCount, 1);
+        assert.equal(betaCount, 0);
+        assert.equal(total, 1);
+      }
+    }
+  }
+});
+
 test("normalizeQueue resolves dispatch model from attempt, vars, metadata, and static formula steps while ignoring templates", () => {
   const queue = store.normalizeQueue({
     config: {
