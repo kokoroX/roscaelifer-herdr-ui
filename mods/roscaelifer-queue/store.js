@@ -43,6 +43,10 @@ const BEADS_ARTIFACTS = [
 
 const AGENT_RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
 
+export function isDeferredItem(item) {
+  return item?.bdStatus === "deferred" || item?.bdStatus === "backlog" || item?.beadColumn === "backlog";
+}
+
 export function safeStorageGet(key, fallback = null) {
   try {
     const raw = localStorage.getItem(key);
@@ -2217,6 +2221,10 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       item.branch,
       ...item.labels,
       item.ephemeral ? "ephemeral wip" : "",
+      item.bdStatus,
+      item.issueType,
+      item.priority !== null && item.priority !== undefined ? `p${item.priority}` : "",
+      isDeferredItem(item) ? "deferred backlog" : "",
       item.formula,
       item.dispatchProvider,
       item.dispatchModel,
@@ -2480,6 +2488,8 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
     };
     const allStats = countItems(projectItems);
     const nonEphemeralStats = countItems(projectItems.filter((item) => !item?.ephemeral));
+    const nonDeferredStats = countItems(projectItems.filter((item) => !isDeferredItem(item)));
+    const nonEphemeralNonDeferredStats = countItems(projectItems.filter((item) => !item?.ephemeral && !isDeferredItem(item)));
     return {
       id: result.projectId,
       name: result.projectName,
@@ -2498,6 +2508,8 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
       nonEphemeralItemCount: nonEphemeralStats.total,
       nonEphemeralOpenItemCount: nonEphemeralStats.open,
       nonEphemeralClosedItemCount: nonEphemeralStats.closed,
+      nonDeferredStats,
+      nonEphemeralNonDeferredStats,
     };
   });
 

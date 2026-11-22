@@ -59,6 +59,7 @@ const LOCAL_WATCH_POLL_MS = 30000;
 const DETAIL_CACHE_TTL_MS = 20000;
 const DETAIL_CACHE_MAX = 50;
 const SHOW_EPHEMERAL_KEY = "roscaelifer.showEphemeral.v2";
+const SHOW_DEFERRED_KEY = "roscaelifer.showDeferred.v1";
 const COUNT_CLOSED_STATS_KEY = "roscaelifer.countClosedStats.v1";
 const ACTIVE_TAB_KEY = "roscaelifer.activeTab.v1";
 
@@ -207,6 +208,7 @@ export default class RoscaeliferQueue extends View {
       storedShowEphemeral === null || storedShowEphemeral === undefined
         ? true
         : Boolean(storedShowEphemeral);
+    this.showDeferred = Boolean(safeStorageGet(SHOW_DEFERRED_KEY, false));
     const storedCountClosedStats = safeStorageGet(COUNT_CLOSED_STATS_KEY, true);
     this.countClosedStats =
       storedCountClosedStats === null || storedCountClosedStats === undefined
@@ -453,6 +455,14 @@ export default class RoscaeliferQueue extends View {
     this.detailCache.clear();
     cx?.notify?.();
     this.refresh(cx, { forceContext: false, preempt: true });
+  }
+
+  setShowDeferred(next, cx) {
+    const value = Boolean(next);
+    if (value === this.showDeferred) return;
+    this.showDeferred = value;
+    safeStorageSet(SHOW_DEFERRED_KEY, value);
+    cx?.notify?.();
   }
 
   setCountClosedStats(next, cx) {
@@ -1706,6 +1716,8 @@ export default class RoscaeliferQueue extends View {
                 el.child(
                   this.beadsBoard.render(
                     {
+                      showDeferred: this.showDeferred,
+                      onToggleShowDeferred: (next, clickCx) => this.setShowDeferred(next, clickCx),
                       queue,
                       selectedId: this.selectedId,
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
@@ -1729,6 +1741,8 @@ export default class RoscaeliferQueue extends View {
                 el.child(
                   this.board.render(
                     {
+                      showDeferred: this.showDeferred,
+                      onToggleShowDeferred: (next, clickCx) => this.setShowDeferred(next, clickCx),
                       queue,
                       selectedId: this.selectedId,
                       onSelectItem: (item, clickCx) => this.selectItem(item, clickCx),
@@ -1752,6 +1766,8 @@ export default class RoscaeliferQueue extends View {
                 el.child(
                   this.deps.render(
                     {
+                      showDeferred: this.showDeferred,
+                      onToggleShowDeferred: (next, clickCx) => this.setShowDeferred(next, clickCx),
                       queue,
                       snapshot: this.snapshot,
                       mode: this.tab,

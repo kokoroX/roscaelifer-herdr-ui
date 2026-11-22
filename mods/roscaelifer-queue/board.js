@@ -16,6 +16,7 @@ import {
 } from "gpui-base";
 import { settings, theme, notify } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
+import { isDeferredItem } from "./store.js";
 
 const ROSCAELIFER_COLUMNS = [
   { key: "ready", label: "Ready", emptyText: "No ready beads" },
@@ -249,8 +250,12 @@ function miniBtn(id, label, { bg, fg, border, busy = false, disabled = false, on
     .child(label);
 }
 
-function projectDisplayStats(project, { showEphemeral = true } = {}) {
+export function projectDisplayStats(project, { showEphemeral = true, showDeferred = true } = {}) {
   if (!project || typeof project !== "object") return null;
+  if (!showDeferred) {
+    const stats = showEphemeral ? project.nonDeferredStats : project.nonEphemeralNonDeferredStats;
+    if (stats) return stats;
+  }
   const total = showEphemeral ? project.itemCount : project.nonEphemeralItemCount;
   const open = showEphemeral ? project.openItemCount : project.nonEphemeralOpenItemCount;
   const closed = showEphemeral ? project.closedItemCount : project.nonEphemeralClosedItemCount;
@@ -263,9 +268,9 @@ function projectDisplayStats(project, { showEphemeral = true } = {}) {
 
 export function projectDisplayCount(
   project,
-  { excludeClosedStats = false, showEphemeral = true } = {},
+  { excludeClosedStats = false, showEphemeral = true, showDeferred = true } = {},
 ) {
-  const stats = projectDisplayStats(project, { showEphemeral });
+  const stats = projectDisplayStats(project, { showEphemeral, showDeferred });
   if (!stats) return null;
   if (excludeClosedStats && Number.isFinite(stats.open)) return stats.open;
   return stats.total;
@@ -273,11 +278,11 @@ export function projectDisplayCount(
 
 export function totalProjectsDisplayCount(
   projects = [],
-  { excludeClosedStats = false, showEphemeral = true } = {},
+  { excludeClosedStats = false, showEphemeral = true, showDeferred = true } = {},
 ) {
   if (!Array.isArray(projects)) return 0;
   return projects.reduce((sum, project) => {
-    const count = projectDisplayCount(project, { excludeClosedStats, showEphemeral });
+    const count = projectDisplayCount(project, { excludeClosedStats, showEphemeral, showDeferred });
     return sum + (Number.isFinite(count) ? count : 0);
   }, 0);
 }
@@ -287,11 +292,11 @@ function projectPill(
   project,
   active,
   onClick,
-  { excludeClosedStats = false, showEphemeral = true } = {},
+  { excludeClosedStats = false, showEphemeral = true, showDeferred = true } = {},
 ) {
   const hasError = Boolean(project.error);
-  const stats = projectDisplayStats(project, { showEphemeral });
-  const displayCount = projectDisplayCount(project, { excludeClosedStats, showEphemeral });
+  const stats = projectDisplayStats(project, { showEphemeral, showDeferred });
+  const displayCount = projectDisplayCount(project, { excludeClosedStats, showEphemeral, showDeferred });
   const openCount = stats?.open ?? null;
   const closedCount = stats?.closed ?? null;
   const countTip = !Number.isFinite(displayCount)
@@ -363,15 +368,16 @@ export function renderProjectFilterPills(
     countClosedStats = true,
     onToggleCountClosedStats,
     showEphemeral = true,
+    showDeferred = true,
     idPrefix = "project",
   } = {},
 ) {
   if (!Array.isArray(projects) || projects.length < 2) return null;
   const excludeClosedStats = !countClosedStats;
-  const totalCount = totalProjectsDisplayCount(projects, { excludeClosedStats, showEphemeral });
+  const totalCount = totalProjectsDisplayCount(projects, { excludeClosedStats, showEphemeral, showDeferred });
   const totals = projects.reduce(
     (sum, project) => {
-      const stats = projectDisplayStats(project, { showEphemeral });
+      const stats = projectDisplayStats(project, { showEphemeral, showDeferred });
       return {
         open: sum.open + (Number.isFinite(stats?.open) ? stats.open : 0),
         closed: sum.closed + (Number.isFinite(stats?.closed) ? stats.closed : 0),
@@ -382,7 +388,7 @@ export function renderProjectFilterPills(
   const totalOpen = totals.open;
   const totalClosed = totals.closed;
   const hasBreakdown = projects.some((project) => {
-    const stats = projectDisplayStats(project, { showEphemeral });
+    const stats = projectDisplayStats(project, { showEphemeral, showDeferred });
     return Number.isFinite(stats?.open) && Number.isFinite(stats?.closed);
   });
   const allProjectsTooltip = hasBreakdown
@@ -417,7 +423,7 @@ export function renderProjectFilterPills(
             project,
             projectFilter === project.id,
             () => onSelectProjectFilter?.(projectFilter === project.id ? "all" : project.id),
-            { excludeClosedStats, showEphemeral },
+            { excludeClosedStats, showEphemeral, showDeferred },
           ),
         ),
       ),
@@ -465,6 +471,8 @@ export class BoardController {
   constructor(cx, { mode = "roscaelifer" } = {}) {
     this.mode = mode;
     this.envFilter = "all";
+    this.priorityFilters = new Set();
+    this.typeFilters = new Set();
     this.query = "";
     this.searchFocused = false;
     this.searchInput = InputState.new({ placeholder: "Search ID, title, label, formula…" });
@@ -561,13 +569,16 @@ export class BoardController {
     return this._lastVisible;
   }
 
-  matchesFilter(item, { showEphemeral = true, projectFilter = "all" } = {}) {
+  matchesFilter(item, { showEphemeral = true, showDeferred = true, projectFilter = "all" } = {}) {
     if (projectFilter && projectFilter !== "all" && item.projectId && item.projectId !== projectFilter) {
       return false;
     }
     if (item.ephemeral && !showEphemeral) {
       return false;
     }
+    if (!showDeferred && isDeferredItem(item)) return false;
+    if (this.priorityFilters.size && (item.priority === null || item.priority === undefined || !this.priorityFilters.has(Number(item.priority)))) return false;
+    if (this.typeFilters.size && !this.typeFilters.has(String(item.issueType || "").toLowerCase())) return false;
     if (this.envFilter !== "all" && item.env !== this.envFilter) {
       return false;
     }
@@ -1053,8 +1064,30 @@ export class BoardController {
     return true;
   }
 
-  renderFilterBar(queue, t, { showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
+  syncTypeFilter(queue, projectFilter = "all") {
+    let cached = this._typeOptionsCache;
+    if (!cached || cached.queue !== queue || cached.projectFilter !== projectFilter) {
+      const preferred = ["bug", "feature", "task", "chore", "epic", "decision"];
+      const types = new Set((queue?.items || [])
+        .filter((item) => projectFilter === "all" || !item.projectId || item.projectId === projectFilter)
+        .map((item) => String(item.issueType || "").toLowerCase()).filter(Boolean));
+      const options = [...types].sort((a, b) => {
+        const ai = preferred.indexOf(a), bi = preferred.indexOf(b);
+        return (ai < 0 ? preferred.length : ai) - (bi < 0 ? preferred.length : bi) || a.localeCompare(b);
+      });
+      cached = this._typeOptionsCache = { queue, projectFilter, types, options };
+    }
+    for (const type of this.typeFilters) if (!cached.types.has(type)) this.typeFilters.delete(type);
+    return cached.options;
+  }
+
+  renderFilterBar(queue, t, { showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
     this.syncEnvFilter(queue);
+    const types = this.syncTypeFilter(queue, projectFilter);
+    const hiddenDeferred = showDeferred ? 0 : (queue?.items || []).filter((item) =>
+      isDeferredItem(item) && (this.mode !== "beads" || item.beadId) &&
+      (projectFilter === "all" || !item.projectId || item.projectId === projectFilter) &&
+      (this.envFilter === "all" || item.env === this.envFilter) && (showEphemeral || !item.ephemeral)).length;
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
 
@@ -1098,6 +1131,7 @@ export class BoardController {
                 countClosedStats,
                 onToggleCountClosedStats,
                 showEphemeral,
+                showDeferred,
                 idPrefix: "board",
               }),
             ),
@@ -1173,6 +1207,19 @@ export class BoardController {
                       .text_color(showEphemeral ? t.foreground : t.muted)
                       .child("Ephemeral"),
                   ),
+              )
+              .child(
+                Switch.new("filter-deferred")
+                  .checked(showDeferred)
+                  .on_change((_checked, clickCx) => onToggleShowDeferred?.(!showDeferred, clickCx))
+                  .flex().items_center().gap(7).cursor_pointer()
+                  .child(h_flex().w(28).h(16).p(2).rounded(8).items_center()
+                    .bg(showDeferred ? t.accent : t.border)
+                    .when(showDeferred, (el) => el.justify_end())
+                    .when(!showDeferred, (el) => el.justify_start())
+                    .child(div().size(12).rounded(6).bg(showDeferred ? t.accent_foreground : t.muted)))
+                  .child(div().text_size(11.5).text_color(showDeferred ? t.foreground : t.muted)
+                    .child(hiddenDeferred ? `Deferred (${hiddenDeferred})` : "Deferred")),
               ),
           )
           .child(
@@ -1211,6 +1258,33 @@ export class BoardController {
                 ),
               ),
           ),
+      )
+      .child(
+        h_flex().gap(6).items_center().flex_wrap()
+          .child(div().text_size(11).text_color(t.muted).child("Priority"))
+          .child(segmentTabs("priority-tabs", t).flex_wrap()
+            .child(segmentTab("priority-all", "All", this.priorityFilters.size === 0, null, () => this.priorityFilters.clear(), t))
+            .children([0, 1, 2, 3, 4].map((priority) => segmentTab(`priority-${priority}`, `P${priority}`, this.priorityFilters.has(priority), null, () => {
+              if (this.priorityFilters.has(priority)) this.priorityFilters.delete(priority);
+              else this.priorityFilters.add(priority);
+            }, t))))
+          .when(types.length > 0, (el) => el.child(div().w(1).h(16).bg(t.border).mx(2))
+            .child(div().text_size(11).text_color(t.muted).child("Type"))
+            .child(segmentTabs("type-tabs", t).flex_wrap()
+              .child(segmentTab("type-all", "All", this.typeFilters.size === 0, null, () => this.typeFilters.clear(), t))
+              .children(types.map((type) => segmentTab(`type-${type}`, type, this.typeFilters.has(type), null, () => {
+                if (this.typeFilters.has(type)) this.typeFilters.delete(type);
+                else this.typeFilters.add(type);
+              }, t)))))
+          .when(this.envFilter !== "all" || this.priorityFilters.size > 0 || this.typeFilters.size > 0 || Boolean(this.query.trim()), (el) =>
+            el.child(miniBtn("filter-reset", "Reset", { bg: t.raised, fg: t.muted, onClick: (_e, cx) => {
+              this.envFilter = "all";
+              this.priorityFilters.clear();
+              this.typeFilters.clear();
+              this.query = "";
+              this.searchInput.set_value("");
+              cx.notify();
+            } }))),
       );
   }
 
@@ -1315,14 +1389,20 @@ export class BoardController {
       .child(Scrollbar.vertical(`col-scroll-${this.mode}-${col.key}`).absolute().inset_0());
   }
 
-  getFilteredColumns(queue, { showEphemeral = true, projectFilter = "all" } = {}) {
+  getFilteredColumns(queue, { showEphemeral = true, showDeferred = true, projectFilter = "all" } = {}) {
     this.syncEnvFilter(queue);
+    this.syncTypeFilter(queue, projectFilter);
+    const prioritySignature = JSON.stringify([...this.priorityFilters].sort());
+    const typeSignature = JSON.stringify([...this.typeFilters].sort());
     const query = this.query.trim();
     const cached = this._filterCache;
     if (
       cached.queue === queue &&
       cached.envFilter === this.envFilter &&
       cached.showEphemeral === showEphemeral &&
+      cached.showDeferred === showDeferred &&
+      cached.prioritySignature === prioritySignature &&
+      cached.typeSignature === typeSignature &&
       cached.projectFilter === projectFilter &&
       cached.query === query &&
       cached.mode === this.mode
@@ -1335,10 +1415,10 @@ export class BoardController {
       : queue?.columns || { ready: [], queue: [], running: [], action: [], review: [], closed: [] };
     const columns = {};
     const visibleAll = [];
-    const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
+    const boardColumns = this.getBoardColumns(showDeferred);
     for (const col of boardColumns) {
       const listItems = (cols[col.key] || []).filter((item) =>
-        this.matchesFilter(item, { showEphemeral, projectFilter }),
+        this.matchesFilter(item, { showEphemeral, showDeferred, projectFilter }),
       );
       columns[col.key] = listItems;
       visibleAll.push(...listItems);
@@ -1353,6 +1433,9 @@ export class BoardController {
       queue,
       envFilter: this.envFilter,
       showEphemeral,
+      showDeferred,
+      prioritySignature,
+      typeSignature,
       projectFilter,
       query,
       mode: this.mode,
@@ -1363,14 +1446,19 @@ export class BoardController {
     return this._filterCache;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  getBoardColumns(showDeferred = true) {
+    return this.mode === "beads" ? BEADS_COLUMNS.filter((col) => showDeferred || col.key !== "backlog") : ROSCAELIFER_COLUMNS;
+  }
+
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
       showEphemeral,
+      showDeferred,
       projectFilter,
     });
-    const boardColumns = this.mode === "beads" ? BEADS_COLUMNS : ROSCAELIFER_COLUMNS;
+    const boardColumns = this.getBoardColumns(showDeferred);
 
     const colViews = boardColumns.map((col) => {
       const listItems = cols[col.key] || [];
@@ -1476,7 +1564,7 @@ export class BoardController {
     return v_flex()
       .size_full()
       .min_h(0)
-      .child(this.renderFilterBar(queue, t, { showEphemeral, onToggleShowEphemeral, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
+      .child(this.renderFilterBar(queue, t, { showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred, projects, projectFilter, onSelectProjectFilter, countClosedStats, onToggleCountClosedStats }))
       .when(Boolean(queue && !queue.bdAvailable && queue.bdError), (el) =>
         el.child(
           h_flex()

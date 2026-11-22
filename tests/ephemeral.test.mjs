@@ -219,6 +219,78 @@ test("DepsController.scopeItems toggles ephemeral items via showEphemeral", () =
   );
 });
 
+test("deferred detection, board filters, type synchronization and cache invalidation", () => {
+  for (const item of [{ bdStatus: "deferred" }, { bdStatus: "backlog" }, { beadColumn: "backlog" }]) assert.equal(store.isDeferredItem(item), true);
+  assert.equal(store.isDeferredItem(null), false);
+  const board = new boardMod.BoardController();
+  const items = [
+    { id: "a", priority: 0, issueType: "Bug", env: "local", _searchText: "bug p0" },
+    { id: "b", priority: 1, issueType: "TASK", env: "local", bdStatus: "deferred", _searchText: "task p1 deferred" },
+    { id: "c", priority: null, issueType: "bug", env: "local", _searchText: "bug" },
+    { id: "d", priority: 2, issueType: "zebra", env: "remote" },
+  ];
+  const queue = { items, envs: [{ name: "local" }], columns: { ready: items } };
+  assert.deepEqual(board.syncTypeFilter(queue), ["bug", "task", "zebra"]);
+  const hidden = board.getFilteredColumns(queue, { showDeferred: false });
+  assert.deepEqual(hidden.visibleAll.map((i) => i.id), ["a", "c", "d"]);
+  assert.equal(board.getFilteredColumns(queue, { showDeferred: false }), hidden);
+  board.priorityFilters.add(0); board.priorityFilters.add(1);
+  board.typeFilters.add("bug"); board.typeFilters.add("task");
+  assert.deepEqual(board.getFilteredColumns(queue, { showDeferred: true }).visibleAll.map((i) => i.id), ["a", "b"]);
+  assert.equal(board.matchesFilter(items[2]), false);
+  board.envFilter = "local"; board.query = "P1";
+  assert.equal(board.matchesFilter(items[1], { showDeferred: false }), false);
+  assert.equal(board.matchesFilter(items[1], { showDeferred: true }), true);
+  board.syncTypeFilter({ items: [items[0]] });
+  assert.deepEqual([...board.typeFilters], ["bug"]);
+  assert.equal(board.matchesFilter(items[1]), false);
+});
+
+test("beads backlog column follows deferred visibility", () => {
+  const board = new boardMod.BoardController(null, { mode: "beads" });
+  const item = { id: "d", beadId: "d", beadColumn: "backlog", issueType: "task" };
+  const queue = { items: [item], beadColumns: { backlog: [item] } };
+  assert.equal(board.getBoardColumns(false).some((col) => col.key === "backlog"), false);
+  assert.equal(board.getBoardColumns(true).some((col) => col.key === "backlog"), true);
+  assert.equal(board.getFilteredColumns(queue, { showDeferred: false }).visibleAll.length, 0);
+  assert.equal(board.getFilteredColumns(queue, { showDeferred: true }).columns.backlog.length, 1);
+});
+
+test("wave data and grouped wave caches respond to deferred visibility", () => {
+  const deps = new depsMod.DepsController();
+  const items = [{ id: "a", issueType: "task" }, { id: "b", issueType: "task", bdStatus: "deferred", blockedBy: ["a"] }];
+  const queue = { items }; const epics = []; const projects = [{ id: "a" }, { id: "b" }];
+  const groups = [{ id: "a", items }];
+  assert.equal(deps.scopeItems(items, epics, null, { showDeferred: false }).length, 1);
+  const hidden = deps.getWaveData(queue, epics, items, { showDeferred: false });
+  assert.equal(hidden.scopedItems.length, 1);
+  assert.equal(deps.getWaveData(queue, epics, items, { showDeferred: false }), hidden);
+  assert.equal(deps.getWaveData(queue, epics, items, { showDeferred: true }).waves.length, 2);
+  const options = { showEphemeral: true, showDeferred: false, projectFilter: "all" };
+  const grouped = deps.getGroupedWaveSections(queue, epics, groups, projects, options);
+  assert.equal(grouped.totalNodes, 1);
+  assert.equal(deps.getGroupedWaveSections(queue, epics, groups, projects, options), grouped);
+  assert.equal(deps.getGroupedWaveSections(queue, epics, groups, projects, { ...options, showDeferred: true }).totalNodes, 2);
+});
+
+test("project counts combine ephemeral and deferred visibility and search indexes status, type and priority", () => {
+  const snapshot = { config: {}, tasks: [], bd: { available: true, ready_ids: [], issues: [
+    { id: "a", title: "A", status: "open", issue_type: "bug", priority: 1 },
+    { id: "b", title: "B", status: "deferred", issue_type: "task", priority: 0 },
+    { id: "c", title: "C", status: "open", issue_type: "task", ephemeral: true },
+    { id: "d", title: "D", status: "deferred", issue_type: "task", ephemeral: true },
+  ] } };
+  const queue = store.normalizeQueue(snapshot);
+  assert.match(queue.itemsById.get("a")._searchText, /bug/);
+  assert.match(queue.itemsById.get("a")._searchText, /p1/);
+  assert.match(queue.itemsById.get("b")._searchText, /deferred backlog/);
+  const project = store.mergeNormalizedQueues([{ projectId: "a", queue }]).projects[0];
+  for (const [showEphemeral, showDeferred, count] of [[true, true, 4], [false, true, 2], [true, false, 2], [false, false, 1]]) {
+    assert.equal(boardMod.projectDisplayCount(project, { showEphemeral, showDeferred }), count);
+    assert.equal(boardMod.projectDisplayCount(project, { showEphemeral, showDeferred, excludeClosedStats: true }), count);
+  }
+});
+
 test("fetchSnapshot defaults closedLimit to all and passes --include-ephemeral only when includeEphemeral is true", async () => {
   const calls = [];
   const ctx = {

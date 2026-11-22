@@ -14,6 +14,7 @@ import {
 import { settings, theme } from "herdr";
 import { createColumnScrollLock } from "./scroll-lock.js";
 import { renderProjectFilterPills } from "./board.js";
+import { isDeferredItem } from "./store.js";
 
 const alpha = (c, aa) => (typeof c === "string" && c.length === 7 ? c + aa : c);
 
@@ -383,13 +384,14 @@ export class DepsController {
     return stats;
   }
 
-  getWaveData(queue, epics, items, { showEphemeral = true, projectFilter = "all" } = {}) {
+  getWaveData(queue, epics, items, { showEphemeral = true, showDeferred = true, projectFilter = "all" } = {}) {
     const cached = this._waveCache;
     if (
       cached.queue === queue &&
       cached.selectedEpicId === this.selectedEpicId &&
       cached.showClosedInWaves === this.showClosedInWaves &&
       cached.showEphemeral === showEphemeral &&
+      cached.showDeferred === showDeferred &&
       cached.projectFilter === projectFilter
     ) {
       return cached.data;
@@ -405,6 +407,7 @@ export class DepsController {
       if (it.ephemeral && !showEphemeral) {
         return false;
       }
+      if (!showDeferred && isDeferredItem(it)) return false;
       if (this.selectedEpicId) {
         const key = it.beadId || it.id;
         const inEpic =
@@ -423,13 +426,14 @@ export class DepsController {
       selectedEpicId: this.selectedEpicId,
       showClosedInWaves: this.showClosedInWaves,
       showEphemeral,
+      showDeferred,
       projectFilter,
       data,
     };
     return data;
   }
 
-  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  render({ queue, snapshot, mode = "deps", onSelectItem, selectedId, showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
     const t = theme();
     const monoFont = settings()?.font_family ?? "JetBrains Mono";
     const multi = Array.isArray(projects) && projects.length > 1;
@@ -450,6 +454,7 @@ export class DepsController {
           countClosedStats,
           onToggleCountClosedStats,
           showEphemeral,
+          showDeferred,
           idPrefix: "deps",
         })
       : null;
@@ -473,7 +478,7 @@ export class DepsController {
           .min_h(0)
           .gap(8)
           .child(this.renderEpicSidebar(t, { epics, items, monoFont, stats: sidebarStats, projects, projectFilter }))
-          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, projects, projectFilter })),
+          .child(this.renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred, projects, projectFilter })),
       )
       .when(mirrors.length > 0, (el) =>
         el.child(
@@ -722,7 +727,7 @@ export class DepsController {
     }));
   }
 
-  scopeItems(items, epics, selectedEpic, { showEphemeral = true } = {}) {
+  scopeItems(items, epics, selectedEpic, { showEphemeral = true, showDeferred = true } = {}) {
     void epics;
     const epicChildIds = selectedEpic
       ? new Set((selectedEpic.children ?? []).map((child) => child.id || child.beadId).filter(Boolean))
@@ -732,6 +737,7 @@ export class DepsController {
       if (it.ephemeral && !showEphemeral) {
         return false;
       }
+      if (!showDeferred && isDeferredItem(it)) return false;
       if (selectedEpic) {
         const key = it.id || it.beadId;
         const inEpic =
@@ -871,7 +877,7 @@ export class DepsController {
       );
   }
 
-  renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral }) {
+  renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred }) {
     return h_flex()
       .gap(6)
       .items_center()
@@ -892,6 +898,15 @@ export class DepsController {
             onToggleShowEphemeral?.(!showEphemeral, clickCx);
           })
           .child(showEphemeral ? "Showing Ephemeral" : "Show Ephemeral"),
+      )
+      .child(
+        div().id("deps-toggle-deferred").px(8).py(3).rounded(5).border_1()
+          .border_color(showDeferred ? t.accent : t.border)
+          .bg(showDeferred ? alpha(t.accent, "22") : t.raised)
+          .text_size(11).text_color(showDeferred ? t.accent : t.muted)
+          .cursor_pointer().hover((s) => s.bg(t.hover))
+          .on_click((_e, clickCx) => onToggleShowDeferred?.(!showDeferred, clickCx))
+          .child(showDeferred ? "Showing Deferred" : "Show Deferred"),
       )
       .child(
         div()
@@ -919,7 +934,7 @@ export class DepsController {
    * define them. Scrolling horizontally only changes `wavesScrollX`, so the
    * cache turns those frames back into a pure re-layout.
    */
-  getGroupedWaveSections(queue, epics, groups, projects, { showEphemeral, projectFilter, selectedId }) {
+  getGroupedWaveSections(queue, epics, groups, projects, { showEphemeral, showDeferred = true, projectFilter, selectedId }) {
     const cached = this._groupedWaveCache;
     if (
       cached.queue === queue &&
@@ -927,6 +942,7 @@ export class DepsController {
       cached.selectedEpicId === this.selectedEpicId &&
       cached.showClosedInWaves === this.showClosedInWaves &&
       cached.showEphemeral === showEphemeral &&
+      cached.showDeferred === showDeferred &&
       cached.projectFilter === projectFilter &&
       cached.chainFocusId === this.chainFocusId &&
       cached.selectedId === selectedId
@@ -937,7 +953,7 @@ export class DepsController {
       ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
       : null;
     const sections = groups.map((group) => {
-      const scopedItems = this.scopeItems(group.items, epics, selectedEpic, { showEphemeral });
+      const scopedItems = this.scopeItems(group.items, epics, selectedEpic, { showEphemeral, showDeferred });
       const graph = computeWaves(scopedItems);
       const activeChainId =
         this.chainFocusId ||
@@ -965,6 +981,7 @@ export class DepsController {
       selectedEpicId: this.selectedEpicId,
       showClosedInWaves: this.showClosedInWaves,
       showEphemeral,
+      showDeferred,
       projectFilter,
       chainFocusId: this.chainFocusId,
       selectedId,
@@ -974,12 +991,13 @@ export class DepsController {
   }
 
   /** Multi-project deps graph: one section per project, so blocks DAGs never mix. */
-  renderGroupedWaves(t, { queue, epics, groups, projects, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, projectFilter = "all" }) {
+  renderGroupedWaves(t, { queue, epics, groups, projects, onSelectItem, selectedId, monoFont, showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred, projectFilter = "all" }) {
     const selectedEpic = this.selectedEpicId
       ? epics.find((epic) => (epic.id || epic.beadId) === this.selectedEpicId)
       : null;
     const { sections, totalNodes, totalWaves } = this.getGroupedWaveSections(queue, epics, groups, projects, {
       showEphemeral,
+      showDeferred,
       projectFilter,
       selectedId,
     });
@@ -1023,7 +1041,7 @@ export class DepsController {
               )
               .child(div().text_size(11).text_color(t.dim).child(`${totalNodes} nodes · ${totalWaves} waves · ${groups.length} projects`)),
           )
-          .child(this.renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral })),
+          .child(this.renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred })),
       )
       .child(
         div()
@@ -1129,7 +1147,7 @@ export class DepsController {
       );
   }
 
-  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral = true, onToggleShowEphemeral, projects = [], projectFilter = "all" }) {
+  renderWaveGraph(t, { queue, epics, items, onSelectItem, selectedId, monoFont, showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all" }) {
     const groups = this.projectGroups(projects, items, projectFilter);
     if (groups.length > 1) {
       return this.renderGroupedWaves(t, {
@@ -1142,10 +1160,12 @@ export class DepsController {
         monoFont,
         showEphemeral,
         onToggleShowEphemeral,
+        showDeferred,
+        onToggleShowDeferred,
         projectFilter,
       });
     }
-    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showEphemeral, projectFilter });
+    const { selectedEpic, scopedItems, waves, blockersOf, unlocksOf } = this.getWaveData(queue, epics, items, { showEphemeral, showDeferred, projectFilter });
     const minContentW = waves.length > 0 ? waves.length * 280 + (waves.length - 1) * 10 + 20 : 0;
     const zoom = Number(settings()?.zoom) || 1;
     if (this._wavesViewportRawW > 0) this.wavesViewportW = this._wavesViewportRawW / zoom;
@@ -1217,48 +1237,7 @@ export class DepsController {
                 ),
               ),
           )
-          .child(
-            h_flex()
-              .gap(6)
-              .items_center()
-              .child(
-                div()
-                  .id("deps-toggle-ephemeral")
-                  .px(8)
-                  .py(3)
-                  .rounded(5)
-                  .border_1()
-                  .border_color(showEphemeral ? t.accent : t.border)
-                  .bg(showEphemeral ? alpha(t.accent, "22") : t.raised)
-                  .text_size(11)
-                  .text_color(showEphemeral ? t.accent : t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, clickCx) => {
-                    onToggleShowEphemeral?.(!showEphemeral, clickCx);
-                  })
-                  .child(showEphemeral ? "Showing Ephemeral" : "Show Ephemeral"),
-              )
-              .child(
-                div()
-                  .id("deps-toggle-closed")
-                  .px(8)
-                  .py(3)
-                  .rounded(5)
-                  .border_1()
-                  .border_color(this.showClosedInWaves ? t.accent : t.border)
-                  .bg(this.showClosedInWaves ? alpha(t.accent, "22") : t.raised)
-                  .text_size(11)
-                  .text_color(this.showClosedInWaves ? t.accent : t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => {
-                    this.showClosedInWaves = !this.showClosedInWaves;
-                    cx.notify();
-                  })
-                  .child(this.showClosedInWaves ? "Showing Closed" : "Show Closed"),
-              ),
-          )
+          .child(this.renderWaveToggles(t, { showEphemeral, onToggleShowEphemeral, showDeferred, onToggleShowDeferred }))
       )
       // Wave Lanes (horizontal scroll)
       .child(
