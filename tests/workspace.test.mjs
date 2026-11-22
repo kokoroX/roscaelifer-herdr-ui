@@ -1123,3 +1123,122 @@ test("normalizeQueue resolves dispatch model from attempt, vars, metadata, and s
   const i5 = byId.get("task:t-template-skip");
   assert.equal(i5.dispatchModelLabel, "pi-worker · group/cheap");
 });
+
+test("env filter tabs show only running work-step counts and hide zeros", () => {
+  const envs = [
+    {
+      name: "local",
+      maxRunning: 1,
+      runningWorkSteps: 0,
+      byProject: {
+        p1: { maxRunning: 1, runningWorkSteps: 0 },
+        p2: { maxRunning: 2, runningWorkSteps: 0 },
+      },
+    },
+    {
+      name: "roommate",
+      maxRunning: 4,
+      runningWorkSteps: 2,
+      byProject: {
+        p1: { maxRunning: 4, runningWorkSteps: 1 },
+        p2: { maxRunning: 4, runningWorkSteps: 1 },
+      },
+    },
+    {
+      name: "gpu",
+      maxRunning: 2,
+      runningWorkSteps: 1,
+      byProject: {
+        p2: { maxRunning: 2, runningWorkSteps: 1 },
+      },
+    },
+  ];
+
+  // Unselected project: all envs sum running counts only
+  assert.equal(boardMod.formatEnvTabRunningBadge(envs[0], "all"), null);
+  assert.equal(boardMod.formatEnvTabRunningBadge(envs[1], "all"), "2");
+  assert.equal(boardMod.formatEnvTabRunningBadge(envs[2], "all"), "1");
+  assert.equal(boardMod.formatAllEnvsRunningBadge(envs, "all"), "3");
+
+  // All zero running -> All Envs and specific tabs show no badge even with maxRunning > 0
+  const idleEnvs = envs.map((e) => ({ ...e, runningWorkSteps: 0, byProject: undefined }));
+  assert.equal(boardMod.formatEnvTabRunningBadge(idleEnvs[0], "all"), null);
+  assert.equal(boardMod.formatEnvTabRunningBadge(idleEnvs[1], "all"), null);
+  assert.equal(boardMod.formatAllEnvsRunningBadge(idleEnvs, "all"), null);
+
+  // Scoped to project p1: gpu is absent from p1 so it must report 0/null instead of leaking p2
+  assert.deepEqual(boardMod.resolveScopedEnvCounts(envs[2], "p1"), { maxRunning: 0, runningWorkSteps: 0 });
+  assert.equal(boardMod.formatEnvTabRunningBadge(envs[2], "p1"), null);
+  assert.equal(boardMod.formatEnvTabRunningBadge(envs[1], "p1"), "1");
+  assert.equal(boardMod.formatAllEnvsRunningBadge(envs, "p1"), "1");
+});
+
+test("formatRunningLimitMeta summarizes concurrency limits for the Running column header", () => {
+  const cappedEnvs = [
+    {
+      name: "local",
+      maxRunning: 1,
+      runningWorkSteps: 0,
+      byProject: {
+        p1: { maxRunning: 1, runningWorkSteps: 0 },
+        p2: { maxRunning: 1, runningWorkSteps: 0 },
+      },
+    },
+    {
+      name: "roommate",
+      maxRunning: 4,
+      runningWorkSteps: 4,
+      byProject: {
+        p1: { maxRunning: 4, runningWorkSteps: 4 },
+      },
+    },
+  ];
+
+  const allMeta = boardMod.formatRunningLimitMeta(cappedEnvs, { envFilter: "all", projectFilter: "all" });
+  assert.deepEqual(allMeta, {
+    text: "max 5",
+    tooltip: "Concurrency limit · local: 0/1 · roommate: 4/4",
+    atCapacity: false,
+  });
+
+  const roommateMeta = boardMod.formatRunningLimitMeta(cappedEnvs, { envFilter: "roommate", projectFilter: "all" });
+  assert.deepEqual(roommateMeta, {
+    text: "max 4",
+    tooltip: "roommate: 4/4 running",
+    atCapacity: true,
+  });
+
+  const localMeta = boardMod.formatRunningLimitMeta(cappedEnvs, { envFilter: "local", projectFilter: "all" });
+  assert.deepEqual(localMeta, {
+    text: "max 1",
+    tooltip: "local: 0/1 running",
+    atCapacity: false,
+  });
+
+  // Project p2 only has local -> roommate should not be included in All Envs total
+  const p2Meta = boardMod.formatRunningLimitMeta(cappedEnvs, { envFilter: "all", projectFilter: "p2" });
+  assert.deepEqual(p2Meta, {
+    text: "max 1",
+    tooltip: "Concurrency limit · local: 0/1",
+    atCapacity: false,
+  });
+  assert.equal(boardMod.formatRunningLimitMeta(cappedEnvs, { envFilter: "roommate", projectFilter: "p2" }), null);
+
+  // Mixed capped + unlimited envs -> max N+
+  const mixedEnvs = [
+    { name: "local", maxRunning: 1, runningWorkSteps: 1 },
+    { name: "cloud", maxRunning: 0, runningWorkSteps: 2 },
+  ];
+  assert.deepEqual(boardMod.formatRunningLimitMeta(mixedEnvs, { envFilter: "all" }), {
+    text: "max 1+",
+    tooltip: "Concurrency limit · local: 1/1 · cloud: 2 (unlimited)",
+    atCapacity: false,
+  });
+  assert.equal(boardMod.formatRunningLimitMeta(mixedEnvs, { envFilter: "cloud" }), null);
+
+  // All unlimited -> null
+  assert.equal(
+    boardMod.formatRunningLimitMeta([{ name: "local", maxRunning: 0, runningWorkSteps: 3 }], { envFilter: "all" }),
+    null,
+  );
+});

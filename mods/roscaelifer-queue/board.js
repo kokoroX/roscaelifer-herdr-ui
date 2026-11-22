@@ -128,6 +128,86 @@ export function shouldVirtualizeColumn(colKey, itemCount) {
   return colKey === "closed" || itemCount > VIRTUALIZE_COLUMN_THRESHOLD;
 }
 
+/**
+ * Resolves running work-step and capacity counts for an env, scoped to
+ * `projectFilter` when a specific project is selected in multi-project mode.
+ */
+export function resolveScopedEnvCounts(env, projectFilter = "all") {
+  if (projectFilter && projectFilter !== "all" && env?.byProject) {
+    return env.byProject[projectFilter] || { maxRunning: 0, runningWorkSteps: 0 };
+  }
+  return {
+    maxRunning: env?.maxRunning ?? 0,
+    runningWorkSteps: env?.runningWorkSteps ?? 0,
+  };
+}
+
+/** Formats the running-only badge shown on a specific env filter tab. */
+export function formatEnvTabRunningBadge(env, projectFilter = "all") {
+  const { runningWorkSteps } = resolveScopedEnvCounts(env, projectFilter);
+  return runningWorkSteps > 0 ? String(runningWorkSteps) : null;
+}
+
+/** Formats the running-only badge shown on the `All Envs` filter tab. */
+export function formatAllEnvsRunningBadge(envs = [], projectFilter = "all") {
+  const list = Array.isArray(envs) ? envs : [];
+  let total = 0;
+  for (const env of list) {
+    total += resolveScopedEnvCounts(env, projectFilter).runningWorkSteps;
+  }
+  return total > 0 ? String(total) : null;
+}
+
+/**
+ * Summarizes env concurrency limits (`max_running`) for the `Running` column
+ * header according to the active env and project filters.
+ */
+export function formatRunningLimitMeta(envs = [], { envFilter = "all", projectFilter = "all" } = {}) {
+  const list = Array.isArray(envs) ? envs : [];
+  if (envFilter && envFilter !== "all") {
+    const env = list.find((entry) => entry?.name === envFilter);
+    if (!env) return null;
+    const { maxRunning, runningWorkSteps } = resolveScopedEnvCounts(env, projectFilter);
+    if (!(maxRunning > 0)) return null;
+    return {
+      text: `max ${maxRunning}`,
+      tooltip: `${env.name}: ${runningWorkSteps}/${maxRunning} running`,
+      atCapacity: runningWorkSteps >= maxRunning,
+    };
+  }
+
+  const entries = [];
+  for (const env of list) {
+    if (!env?.name) continue;
+    if (projectFilter && projectFilter !== "all" && env.byProject && !env.byProject[projectFilter]) {
+      continue;
+    }
+    const counts = resolveScopedEnvCounts(env, projectFilter);
+    entries.push({ name: env.name, ...counts });
+  }
+
+  const capped = entries.filter((entry) => entry.maxRunning > 0);
+  if (capped.length === 0) return null;
+  const uncapped = entries.filter((entry) => !(entry.maxRunning > 0));
+  const totalMax = capped.reduce((sum, entry) => sum + entry.maxRunning, 0);
+  const totalRunning = capped.reduce((sum, entry) => sum + entry.runningWorkSteps, 0);
+  const hasUncapped = uncapped.length > 0;
+
+  return {
+    text: hasUncapped ? `max ${totalMax}+` : `max ${totalMax}`,
+    tooltip:
+      "Concurrency limit · " +
+      entries
+        .map((entry) =>
+          entry.maxRunning > 0
+            ? `${entry.name}: ${entry.runningWorkSteps}/${entry.maxRunning}`
+            : `${entry.name}: ${entry.runningWorkSteps} (unlimited)`,
+        )
+        .join(" · "),
+    atCapacity: !hasUncapped && totalRunning >= totalMax,
+  };
+}
+
 function chip(text, color, bg, borderColor = null) {
   return div()
     .px(6)
@@ -978,20 +1058,23 @@ export class BoardController {
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
 
-    const envTab = (id, label, active, extra, onClick) => {
+    const envTab = (id, label, active, extra, onClick, envObj = null) => {
       const tab = segmentTab(id, label, active, extra, onClick, t);
-      if (!multiProject) return tab;
-      const env = envs.find((entry) => (typeof entry === "string" ? entry : entry?.name) === label);
-      const split = env?.byProject ? Object.entries(env.byProject) : [];
-      if (split.length === 0) return tab;
-      const tip = split
-        .map(([projectId, counts]) => {
-          const name = projects.find((project) => project.id === projectId)?.name || projectId;
-          const cap = counts.maxRunning > 0 ? `${counts.runningWorkSteps}/${counts.maxRunning}` : `${counts.runningWorkSteps}`;
-          return `${name}: ${cap}`;
-        })
-        .join(" · ");
-      return tip ? tab.tooltip(tip) : tab;
+      if (!envObj) return tab;
+      const split = multiProject && envObj.byProject ? Object.entries(envObj.byProject) : [];
+      if (split.length > 0) {
+        const tip = split
+          .map(([projectId, counts]) => {
+            const name = projects.find((project) => project.id === projectId)?.name || projectId;
+            const cap = counts.maxRunning > 0 ? ` (max ${counts.maxRunning})` : "";
+            return `${name}: ${counts.runningWorkSteps} running${cap}`;
+          })
+          .join(" · ");
+        return tip ? tab.tooltip(tip) : tab;
+      }
+      const scoped = resolveScopedEnvCounts(envObj, projectFilter);
+      const cap = scoped.maxRunning > 0 ? ` (max ${scoped.maxRunning})` : "";
+      return tab.tooltip(`${envObj.name}: ${scoped.runningWorkSteps} running${cap}`);
     };
 
     return v_flex()
@@ -1034,29 +1117,29 @@ export class BoardController {
               .items_center()
               .child(
                 segmentTabs("board-env-tabs", t)
-                  .child(envTab("env-tab-all", "All Envs", this.envFilter === "all", null, () => {
-                    this.envFilter = "all";
-                  }))
+                  .child(
+                    envTab(
+                      "env-tab-all",
+                      "All Envs",
+                      this.envFilter === "all",
+                      formatAllEnvsRunningBadge(envs, projectFilter),
+                      () => {
+                        this.envFilter = "all";
+                      },
+                    ),
+                  )
                   .children(
                     envs.map((env) => {
-                      const scoped =
-                        projectFilter !== "all" && env.byProject?.[projectFilter]
-                          ? env.byProject[projectFilter]
-                          : env;
-                      const cap =
-                        scoped.maxRunning > 0
-                          ? `${scoped.runningWorkSteps}/${scoped.maxRunning}`
-                          : scoped.runningWorkSteps > 0
-                            ? `${scoped.runningWorkSteps}`
-                            : null;
+                      const runningBadge = formatEnvTabRunningBadge(env, projectFilter);
                       return envTab(
                         `env-tab-${env.name}`,
                         env.name,
                         this.envFilter === env.name,
-                        cap,
+                        runningBadge,
                         () => {
                           this.envFilter = env.name;
                         },
+                        env,
                       );
                     }),
                   ),
@@ -1293,6 +1376,13 @@ export class BoardController {
       const listItems = cols[col.key] || [];
       const accent = columnAccent(col.key, t);
       const virtual = shouldVirtualizeColumn(col.key, listItems.length);
+      const runningLimit =
+        this.mode !== "beads" && col.key === "running"
+          ? formatRunningLimitMeta(queue?.envs || [], {
+              envFilter: this.envFilter,
+              projectFilter,
+            })
+          : null;
 
       return v_flex()
         .id(`col-${this.mode}-${col.key}`)
@@ -1322,14 +1412,35 @@ export class BoardController {
                 .child(div().text_size(12).font_semibold().text_color(t.foreground).child(col.label)),
             )
             .child(
-              div()
-                .px(6)
-                .py(1)
-                .rounded(5)
-                .bg(t.raised)
-                .text_size(11)
-                .text_color(t.muted)
-                .child(String(listItems.length)),
+              h_flex()
+                .gap(5)
+                .items_center()
+                .when(Boolean(runningLimit), (el) =>
+                  el.child(
+                    div()
+                      .id(`col-limit-${this.mode}-${col.key}`)
+                      .px(6)
+                      .py(1)
+                      .rounded(5)
+                      .bg(runningLimit.atCapacity ? (t.blocked || t.ansi3) + "22" : t.background)
+                      .border_1()
+                      .border_color(runningLimit.atCapacity ? (t.blocked || t.ansi3) + "55" : t.border)
+                      .text_size(10.5)
+                      .text_color(runningLimit.atCapacity ? (t.blocked || t.ansi3) : t.dim)
+                      .tooltip(runningLimit.tooltip)
+                      .child(runningLimit.text),
+                  ),
+                )
+                .child(
+                  div()
+                    .px(6)
+                    .py(1)
+                    .rounded(5)
+                    .bg(t.raised)
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .child(String(listItems.length)),
+                ),
             ),
         )
         .child(
