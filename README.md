@@ -4,22 +4,47 @@ A Herdr mod (`roscaelifer-queue`) and layout (`roscaelifer.json`) for operating 
 
 ## Install & Verify
 
-Symlink the mod into your Herdr config directory (`~/.config/herdr-app` or `$HERDR_APP_HOME`):
+Install the mod into your Herdr config directory (`~/.config/herdr-app` or `$HERDR_APP_HOME`) by copying it (default; the installed copy is a self-contained snapshot of this checkout):
 
 ```bash
 ./scripts/install-mod.sh
+# or: mise run install
 ```
 
-To also symlink the example workspace layout (`layouts/roscaelifer.json`):
+To also install the example workspace layout (`layouts/roscaelifer.json`):
 
 ```bash
 ./scripts/install-mod.sh --with-layout
+# or: mise run install-with-layout
 ```
+
+For local development, symlink the mod and layout from this checkout instead of copying them:
+
+```bash
+./scripts/install-mod.sh --symlink --with-layout
+# or: mise run install-symlink
+```
+
+Uninstall (removes the installed mod, and the layout when `--with-layout` is given):
+
+```bash
+./scripts/install-mod.sh --uninstall --with-layout
+```
+
+A copied layout is only replaced when it is unchanged, a symlink, or `--force` is passed, so local edits to `roscaelifer.json` are preserved by default. `--force` also allows replacing a `mods/roscaelifer-queue` directory that does not look like a previous install.
 
 Validate the mod with Herdr's static check:
 
 ```bash
 ./scripts/check.sh
+# or: mise run check
+```
+
+Run the Node tests:
+
+```bash
+node --test tests/*.test.mjs
+# or: mise run test
 ```
 
 Select the `roscaelifer` layout in Herdr (`Layout` -> `roscaelifer`) or embed `{ "mod": "roscaelifer-queue", "props": {} }` in any custom layout block.
@@ -126,7 +151,8 @@ When the `roscaelifer-queue` block is focused (outside search input):
 
 - `mods/roscaelifer-queue/` — Herdr mod (`mod.json`, `main.js`, `store.js`, `actions.js`, `board.js`, `inspector.js`, `dialogs.js`, `deps.js`, `icons/*.svg`)
 - `layouts/roscaelifer.json` — Split workspace layout with sidebar, tabs, `roscaelifer-queue`, active terminal pane, collapsible `files`/`changes` stack, and `workspace-status` bar
-- `scripts/install-mod.sh` — Symlinks the mod (and optionally the layout) into `$HERDR_APP_HOME`
+- `scripts/install-mod.sh` — Copies the mod (and optionally the layout) into `$HERDR_APP_HOME`; `--symlink` for local development, `--uninstall` to remove, `--force` to overwrite non-install targets or a locally edited layout
 - `scripts/check.sh` — Runs `herdr-app check` on the installed mod
+- `mise.toml` — `mise run install` / `install-with-layout` / `install-symlink` / `check` / `test` task shortcuts
 - `tests/` — Node tests (`node --test tests/*.test.mjs`) for detection, multi-project config normalization, workspace resolution, and `mergeNormalizedQueues`
 - `RECIPE.md` — Herdr build recipe specification

@@ -78,6 +78,6 @@ Left to right inside a `row` root (`background: "canvas"`, `1px` `"border"` divi
 
 **Done when:**
 
-- `./scripts/install-mod.sh --with-layout` symlinks `mods/roscaelifer-queue` and `layouts/roscaelifer.json` into `~/.config/herdr-app/` with exit code `0`.
+- `./scripts/install-mod.sh --with-layout` copies `mods/roscaelifer-queue` and `layouts/roscaelifer.json` into `~/.config/herdr-app/` with exit code `0`; `--symlink --with-layout` links them from this checkout instead.
 - `./scripts/check.sh` runs `herdr-app check ~/.config/herdr-app/mods/roscaelifer-queue` and exits `0` with `check passed`.
 - Opening Herdr with the `roscaelifer` layout loads the 5-column queue from a `roscaelifer` repo (or shows the repo error banner with working `Configure Project` override when launched outside a repo), selecting a card renders its Markdown description/steps/live terminal tail, switching tabs (`1`/`2`/`3`/`4`) renders `Epics & Deps` waves and `Mirror & Events`, and `New Bead` / `Enqueue` / `Clean Pending` dialogs open and close cleanly.

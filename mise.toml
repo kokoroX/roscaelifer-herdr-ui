@@ -1,0 +1,19 @@
+[tasks.install]
+description = "Copy the mod into $HERDR_APP_HOME (default: ~/.config/herdr-app)"
+run = "./scripts/install-mod.sh"
+
+[tasks.install-with-layout]
+description = "Copy the mod and the roscaelifer layout into $HERDR_APP_HOME"
+run = "./scripts/install-mod.sh --with-layout"
+
+[tasks.install-symlink]
+description = "Symlink the mod and layout from this checkout for local development"
+run = "./scripts/install-mod.sh --symlink --with-layout"
+
+[tasks.check]
+description = "Run herdr-app check against the installed mod"
+run = "./scripts/check.sh"
+
+[tasks.test]
+description = "Run the Node test suite"
+run = "node --test tests/*.test.mjs"
