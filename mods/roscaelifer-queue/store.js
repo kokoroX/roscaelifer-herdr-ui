@@ -2110,8 +2110,11 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
         column = "closed";
       }
     } else if (!issue && (taskStatus === "done" || taskStatus === "cancelled")) {
-      column = taskStatus === "cancelled" ? "action" : "closed";
-      if (taskStatus === "cancelled") actionReason = "cancelled";
+      // A task without a bead has nowhere else to report: both terminal states
+      // belong in Closed. Cancelled items keep `actionReason === null` so they
+      // are not advertised as Needs Action; pending cleanups still surface the
+      // `cleanup (N)` chip and the Clean action in the Closed column.
+      column = "closed";
     } else if (waitingApprovalStep) {
       column = "action";
       actionReason = "waiting_approval";

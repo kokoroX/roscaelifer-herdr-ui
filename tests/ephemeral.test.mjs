@@ -152,7 +152,7 @@ test("normalizeQueue sets ephemeral uniformly for ephemeral, legacy wip, and sta
   assert.equal("isWip" in standalone, false);
 });
 
-test("normalizeQueue classifies orphan terminal bead tasks as ephemeral closed or action items", () => {
+test("normalizeQueue classifies orphan terminal bead tasks as ephemeral closed items", () => {
   const queue = store.normalizeQueue({
     config: { default_env: "local", envs: [{ name: "local", kind: "local" }] },
     tasks: [
@@ -177,10 +177,75 @@ test("normalizeQueue classifies orphan terminal bead tasks as ephemeral closed o
   const done = queue.itemsById.get("rsc-worker-closed");
   const cancelled = queue.itemsById.get("rsc-wisp-closed");
   assert.equal(done.column, "closed");
+  assert.equal(done.actionReason, null);
   assert.equal(done.ephemeral, true);
-  assert.equal(cancelled.column, "action");
-  assert.equal(cancelled.actionReason, "cancelled");
+  // Orphan task for a bead nobody can see: terminal either way, so Closed.
+  assert.equal(cancelled.column, "closed");
+  assert.equal(cancelled.actionReason, null);
   assert.equal(cancelled.ephemeral, true);
+});
+
+test("normalizeQueue sends a beadless cancelled wip task to Closed and keeps cleanup actionable", () => {
+  const queue = store.normalizeQueue({
+    config: { default_env: "local", envs: [{ name: "local", kind: "local" }] },
+    tasks: [
+      {
+        id: "wip-d79903",
+        bead_id: null,
+        title: "Beadless worker",
+        formula_name: "worker-inplace",
+        status: "cancelled",
+        pending_cleanups: [{ worktree: "/tmp/wt", branch: "wip/d79903" }],
+        steps: [],
+      },
+    ],
+    bd: { available: true, ready_ids: [], issues: [] },
+  });
+
+  const item = queue.itemsById.get("task:wip-d79903");
+  assert.equal(item.column, "closed");
+  assert.equal(item.actionReason, null);
+  assert.equal(item.ephemeral, true);
+  assert.equal(item.taskStatus, "cancelled");
+  assert.equal(item.pendingCleanup, true);
+  assert.equal(item.pendingCleanupCount, 1);
+  // The Closed column only renders the Clean action when taskId + pendingCleanup
+  // are present, so a beadless cancelled task must still expose both.
+  assert.equal(item.taskId, "wip-d79903");
+  assert.equal(store.isClosedQueueItem(item), true);
+});
+
+test("normalizeQueue keeps a cancelled task with an open bead under Needs Action", () => {
+  const queue = store.normalizeQueue({
+    config: { default_env: "local", envs: [{ name: "local", kind: "local" }] },
+    tasks: [
+      {
+        id: "t-open-cancelled",
+        bead_id: "rsc-open-cancelled",
+        formula_name: "worker-inplace",
+        status: "cancelled",
+        steps: [],
+      },
+    ],
+    bd: {
+      available: true,
+      ready_ids: [],
+      issues: [
+        {
+          id: "rsc-open-cancelled",
+          title: "Open bead with cancelled task",
+          status: "open",
+          issue_type: "task",
+          labels: [],
+        },
+      ],
+    },
+  });
+
+  const item = queue.itemsById.get("rsc-open-cancelled");
+  assert.equal(item.column, "action");
+  assert.equal(item.actionReason, "cancelled");
+  assert.equal(store.isClosedQueueItem(item), false);
 });
 
 test("BoardController.matchesFilter toggles all ephemeral items via showEphemeral", () => {

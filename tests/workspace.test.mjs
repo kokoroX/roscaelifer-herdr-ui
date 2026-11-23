@@ -874,6 +874,7 @@ test("isClosedQueueItem treats closed column and fallback closed statuses accura
 
   assert.equal(isClosedQueueItem({ column: "closed", bdStatus: "closed" }), true);
   assert.equal(isClosedQueueItem({ beadId: null, taskStatus: "done", column: "closed" }), true);
+  assert.equal(isClosedQueueItem({ beadId: null, taskStatus: "cancelled", column: "closed", actionReason: null }), true);
   // Pre-closed beads awaiting review or still running stay active/open.
   assert.equal(isClosedQueueItem({ bdStatus: "closed", column: "review" }), false);
   assert.equal(isClosedQueueItem({ bdStatus: "closed", column: "running" }), false);

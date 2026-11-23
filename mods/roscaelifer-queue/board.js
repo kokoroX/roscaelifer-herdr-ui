@@ -1035,6 +1035,13 @@ export class BoardController {
           .when(Boolean(reason) && !(this.mode === "beads" && Boolean(actionLink)), (el) =>
             el.child(chip(reason.text, reason.color, reason.color + "22")),
           )
+          // Cancelled tasks live in Closed when they have no bead, so mark them
+          // softly to keep them distinguishable from finished `done` cards
+          // without implying they need action.
+          .when(
+            item.column === "closed" && item.taskStatus === "cancelled" && !reason,
+            (el) => el.child(chip("cancelled", t.muted, t.raised)),
+          )
           .when(item.pendingCleanup, (el) =>
             el.child(
               chip(
