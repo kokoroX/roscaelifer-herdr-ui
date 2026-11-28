@@ -15,6 +15,9 @@ const ACTIVE_PROJECT_KEY = "roscaelifer.activeProject.v1";
 const PROJECTS_CONFIG_VERSION = 1;
 export const PANEL_MODE_SINGLE = "single";
 export const PANEL_MODE_MULTI = "multi";
+export const DEFAULT_CLOSED_LIMIT = 80;
+export const DEFAULT_TERMINAL_TASKS_LIMIT = 80;
+const SNAPSHOT_BASE_CACHE = new WeakMap();
 // Stable per-project accent colors for the multi-project panel. A color is
 // derived from the project id so it never shifts when other projects come or go.
 const PROJECT_COLORS = [
@@ -32,6 +35,19 @@ const SNAPSHOT_CACHE_INDEX_KEY = "roscaelifer.snapshotCacheIndex.v1";
 const MAX_HISTORY = 10;
 const MAX_CACHED_REPOS = 6;
 const MAX_CACHED_SNAPSHOT_CHARS = 512 * 1024;
+// A cached snapshot older than this is dropped on read: showing a days-old board
+// before the live fetch lands is worse than showing a skeleton.
+export const MAX_CACHED_SNAPSHOT_AGE_MS = 24 * 60 * 60 * 1000;
+// Snapshot tasks kept in the cache for the board columns. Terminal tasks are the
+// bulk of a long-lived DB, so they get the same budget as closed issues while
+// active tasks are always preserved.
+const MAX_CACHED_TERMINAL_TASKS = 20;
+const MAX_CACHED_EVENTS = 30;
+const REVIEW_LABEL = "roscaelifer-review";
+const TERMINAL_TASK_STATUSES = new Set(["done", "failed", "cancelled"]);
+const STEP_DROP_FIELDS = ["detail", "prompt", "reply"];
+const ATTEMPT_DROP_FIELDS = ["reply", "output", "detail", "prompt"];
+const ATTEMPT_SUMMARY_MAX_CHARS = 240;
 const BEADS_ARTIFACTS = [
   "metadata.json",
   "dolt",
@@ -183,27 +199,158 @@ function slimIssueForCache(issue) {
   return rest;
 }
 
-function slimSnapshotForCache(snapshot, { maxEvents = null, maxClosed = null } = {}) {
+function slimAttemptForCache(attempt) {
+  if (!attempt || typeof attempt !== "object") return attempt;
+  const out = { ...attempt };
+  for (const field of ATTEMPT_DROP_FIELDS) delete out[field];
+  if (typeof out.summary === "string" && out.summary.length > ATTEMPT_SUMMARY_MAX_CHARS) {
+    out.summary = out.summary.slice(0, ATTEMPT_SUMMARY_MAX_CHARS);
+  }
+  return out;
+}
+
+/**
+ * Drops the long free-text fields of a task (`body`, step `detail`/`prompt`/`reply`
+ * and attempt `reply`/`output`) while keeping every field the board and the status
+ * calculations read. Details are re-fetched on demand via `fetchTaskDetail`.
+ */
+export function slimTaskForCache(task) {
+  if (!task || typeof task !== "object") return task;
+  const out = { ...task };
+  delete out.body;
+  for (const field of ["current_attempt", "attempt"]) {
+    if (out[field] && typeof out[field] === "object") out[field] = slimAttemptForCache(out[field]);
+  }
+  if (Array.isArray(task.steps)) {
+    out.steps = task.steps.map((step) => {
+      if (!step || typeof step !== "object") return step;
+      const slim = { ...step };
+      for (const field of STEP_DROP_FIELDS) delete slim[field];
+      for (const field of ["current_attempt", "attempt"]) {
+        if (slim[field] && typeof slim[field] === "object") slim[field] = slimAttemptForCache(slim[field]);
+      }
+      return slim;
+    });
+  }
+  return out;
+}
+
+function isTerminalTask(task) {
+  return TERMINAL_TASK_STATUSES.has(task?.status);
+}
+
+function issueHasReviewLabel(issue) {
+  return Array.isArray(issue?.labels) && issue.labels.includes(REVIEW_LABEL);
+}
+
+function slimIssuesForCache(issues, maxClosed) {
+  const droppedClosedIssueIds = new Set();
+  // Every bead whose cards must stay on the board even when closed beads are
+  // budgeted: non-closed beads plus review-labelled closed beads.
+  const keptActiveIssueIds = new Set();
+  if (!Array.isArray(issues)) return { issues, droppedClosedIssueIds, keptActiveIssueIds };
+  for (const issue of issues) {
+    if (issue?.status === "closed" && !issueHasReviewLabel(issue)) continue;
+    if (issue?.id) keptActiveIssueIds.add(issue.id);
+  }
+  if (maxClosed === null) {
+    return { issues: issues.map((issue) => slimIssueForCache(issue)), droppedClosedIssueIds, keptActiveIssueIds };
+  }
+  let closedCount = 0;
+  const kept = [];
+  for (const issue of issues) {
+    if (issue?.status !== "closed") {
+      kept.push(slimIssueForCache(issue));
+      continue;
+    }
+    // Review cards live in the board's Review column, so never drop them.
+    if (issueHasReviewLabel(issue)) {
+      kept.push(slimIssueForCache(issue));
+      continue;
+    }
+    if (closedCount >= maxClosed) {
+      if (issue?.id) droppedClosedIssueIds.add(issue.id);
+      continue;
+    }
+    closedCount += 1;
+    kept.push(slimIssueForCache(issue));
+  }
+  return { issues: kept, droppedClosedIssueIds, keptActiveIssueIds };
+}
+
+/**
+ * True when a terminal task still anchors a card outside the Closed column:
+ * an open / in-progress / review bead or a standalone (bead-less) `failed` task,
+ * which normalizeQueue renders in Needs Action.
+ */
+function isTerminalTaskKeptActive(task, keptActiveIssueIds) {
+  if (task?.bead_id && keptActiveIssueIds.has(task.bead_id)) return true;
+  // No bead means normalizeQueue has to report it from the task itself; only
+  // `done` / `cancelled` are Closed, so a standalone `failed` is Needs Action.
+  return !task?.bead_id && task?.status === "failed";
+}
+
+function slimTasksForCache(tasks, { droppedClosedIssueIds = new Set(), keptActiveIssueIds = new Set() } = {}, maxClosed) {
+  if (!Array.isArray(tasks)) return tasks;
+  if (maxClosed === null) return tasks.map(slimTaskForCache);
+  const limit = Math.max(maxClosed, 0);
+  const keptAsIs = new Set();
+  // Terminal tasks that actually belong to the Closed column; only these are
+  // subject to the maxClosed budget.
+  const closedTerminal = [];
+  for (const task of tasks) {
+    // A terminal task whose closed bead is no longer in the cached issue list has
+    // no anchor left; normalizeQueue would report it as a stale Needs Action card.
+    if (isTerminalTask(task) && task?.bead_id && droppedClosedIssueIds.has(task.bead_id)) continue;
+    if (!isTerminalTask(task) || isTerminalTaskKeptActive(task, keptActiveIssueIds)) {
+      keptAsIs.add(task);
+      continue;
+    }
+    closedTerminal.push(task);
+  }
+  // Keep the newest closed-column tasks (the snapshot lists them oldest first).
+  const keptClosedTerminal = new Set(
+    limit === 0 ? [] : closedTerminal.length > limit ? closedTerminal.slice(-limit) : closedTerminal,
+  );
+  const out = [];
+  for (const task of tasks) {
+    if (!keptAsIs.has(task) && !keptClosedTerminal.has(task)) continue;
+    out.push(slimTaskForCache(task));
+  }
+  return out;
+}
+
+/**
+ * Builds the localStorage-sized version of a snapshot.
+ *
+ * Issue trimming always runs; when `maxClosed` is set the closed issues beyond the
+ * budget, their terminal tasks and the oldest standalone terminal tasks are dropped
+ * so the cached board keeps the same active columns as the live snapshot.
+ */
+export function slimSnapshotForCache(snapshot, { maxEvents = null, maxClosed = null } = {}) {
   if (!snapshot || typeof snapshot !== "object") return null;
   const out = { ...snapshot };
   if (Array.isArray(snapshot.events) && maxEvents !== null && snapshot.events.length > maxEvents) {
     out.events = snapshot.events.slice(-maxEvents);
   }
+  let droppedClosedIssueIds = new Set();
+  let keptActiveIssueIds = new Set();
   if (snapshot.bd && typeof snapshot.bd === "object") {
     const bd = { ...snapshot.bd };
     if (Array.isArray(snapshot.bd.issues)) {
-      let closedCount = 0;
-      const issues = [];
-      for (const issue of snapshot.bd.issues) {
-        if (maxClosed !== null && issue?.status === "closed") {
-          if (closedCount >= maxClosed) continue;
-          closedCount += 1;
-        }
-        issues.push(slimIssueForCache(issue));
-      }
-      bd.issues = issues;
+      const slimmed = slimIssuesForCache(snapshot.bd.issues, maxClosed);
+      bd.issues = slimmed.issues;
+      droppedClosedIssueIds = slimmed.droppedClosedIssueIds;
+      keptActiveIssueIds = slimmed.keptActiveIssueIds;
     }
     out.bd = bd;
+  }
+  if (Array.isArray(snapshot.tasks)) {
+    out.tasks = slimTasksForCache(
+      snapshot.tasks,
+      { droppedClosedIssueIds, keptActiveIssueIds },
+      maxClosed,
+    );
   }
   return out;
 }
@@ -217,18 +364,40 @@ function isValidCachedSnapshot(snapshot) {
   );
 }
 
-export function loadCachedSnapshot(ctx) {
+function removeCachedSnapshotByKey(key) {
+  if (!key) return;
+  try {
+    localStorage.removeItem(`${SNAPSHOT_CACHE_PREFIX}${key}`);
+  } catch {
+    // Ignore storage failures during headless check or restricted contexts.
+  }
+  try {
+    const rawIdx = safeStorageGet(SNAPSHOT_CACHE_INDEX_KEY, []);
+    const index = Array.isArray(rawIdx) ? rawIdx.filter((k) => typeof k === "string" && k !== key) : [];
+    safeStorageSet(SNAPSHOT_CACHE_INDEX_KEY, index);
+  } catch {
+    // Ignore storage failures during headless check or restricted contexts.
+  }
+}
+
+export function loadCachedSnapshot(ctx, { maxAgeMs = MAX_CACHED_SNAPSHOT_AGE_MS, now = Date.now() } = {}) {
   const key = repoIdentityKey(ctx);
   if (!key) return null;
   const entry = safeStorageGet(`${SNAPSHOT_CACHE_PREFIX}${key}`, null);
   if (!entry || typeof entry !== "object") return null;
+  const cachedAt = entry.cachedAt;
+  const hasValidCachedAt =
+    typeof cachedAt === "number" && Number.isFinite(cachedAt) && cachedAt > 0;
+  const stale = !hasValidCachedAt || (maxAgeMs > 0 && now - cachedAt > maxAgeMs);
+  if (stale) {
+    // Drop expired / legacy entries instead of leaving them frozen in storage.
+    removeCachedSnapshotByKey(key);
+    return null;
+  }
   // Support both wrapped { v, cachedAt, snapshot } and legacy direct snapshot shapes.
   const snapshot = entry.snapshot && typeof entry.snapshot === "object" ? entry.snapshot : entry;
   if (!isValidCachedSnapshot(snapshot)) return null;
-  return {
-    snapshot,
-    cachedAt: typeof entry.cachedAt === "number" ? entry.cachedAt : 0,
-  };
+  return { snapshot, cachedAt };
 }
 
 export function saveCachedSnapshot(ctx, snapshot) {
@@ -239,25 +408,32 @@ export function saveCachedSnapshot(ctx, snapshot) {
     const closedCount = Array.isArray(issues)
       ? issues.reduce((count, issue) => count + (issue?.status === "closed" ? 1 : 0), 0)
       : 0;
-    const shouldSlim = Array.isArray(issues) && (issues.length > 120 || closedCount > 20);
+    const tasks = snapshot?.tasks;
+    const shouldSlim =
+      (Array.isArray(issues) && (issues.length > 120 || closedCount > 20)) ||
+      (Array.isArray(tasks) && tasks.length > 30);
     const cachedAt = Date.now();
+    const slimOpts = { maxEvents: MAX_CACHED_EVENTS, maxClosed: MAX_CACHED_TERMINAL_TASKS };
     let payload = {
       v: 1,
       cachedAt,
-      snapshot: shouldSlim
-        ? slimSnapshotForCache(snapshot, { maxEvents: 30, maxClosed: 20 })
-        : slimSnapshotForCache(snapshot),
+      snapshot: shouldSlim ? slimSnapshotForCache(snapshot, slimOpts) : slimSnapshotForCache(snapshot),
     };
     let serialized = JSON.stringify(payload);
     if (serialized.length > MAX_CACHED_SNAPSHOT_CHARS) {
-      if (shouldSlim) return;
+      if (shouldSlim) {
+        // Even the slimmed payload does not fit: never leave a stale entry behind.
+        removeCachedSnapshotByKey(key);
+        return;
+      }
       payload = {
         v: 1,
         cachedAt,
-        snapshot: slimSnapshotForCache(snapshot, { maxEvents: 30, maxClosed: 20 }),
+        snapshot: slimSnapshotForCache(snapshot, slimOpts),
       };
       serialized = JSON.stringify(payload);
       if (serialized.length > MAX_CACHED_SNAPSHOT_CHARS) {
+        removeCachedSnapshotByKey(key);
         return;
       }
     }
@@ -298,6 +474,9 @@ export function saveCachedSnapshot(ctx, snapshot) {
           // Keep evicting.
         }
       }
+      // Give up on caching this snapshot, but clear any older value for this key so
+      // the panel does not keep rendering a frozen board from a previous session.
+      removeCachedSnapshotByKey(key);
       return;
     }
     safeStorageSet(SNAPSHOT_CACHE_INDEX_KEY, index);
@@ -658,7 +837,7 @@ export async function detectCurrentWorkspaceProject({ focusedInfo = focused(), s
   return null;
 }
 
-async function pathExists(p) {
+export async function pathExists(p) {
   try {
     return await fs.exists(p);
   } catch {
@@ -670,8 +849,10 @@ async function probeBeadsDirArtifacts(beadsDir) {
   if (!beadsDir) return false;
   const clean = String(beadsDir).replace(/\/+$/, "");
   if (!clean) return false;
-  const checks = await Promise.all(BEADS_ARTIFACTS.map((name) => pathExists(`${clean}/${name}`)));
-  return checks.some(Boolean);
+  for (const name of BEADS_ARTIFACTS) {
+    if (await pathExists(`${clean}/${name}`)) return true;
+  }
+  return false;
 }
 
 async function probeBeadsArtifacts(dir) {
@@ -1179,6 +1360,7 @@ function detectSnapshotFlags(stdout, stderr) {
     supportsBrief: /(?:^|[\s\[,|])--?brief(?:[\s\]=,|]|$)/m.test(text),
     supportsIncludeEphemeral: /(?:^|[\s\[,|])--?include-ephemeral(?:[\s\]=,|]|$)/m.test(text),
     supportsAllClosed: /(?:^|[\s\[,|])--?all-closed(?:[\s\]=,|]|$)/m.test(text),
+    supportsTerminalTasksLimit: /(?:^|[\s\[,|])--?terminal-tasks-limit(?:[\s\]=,|]|$)/m.test(text),
   };
 }
 
@@ -1417,6 +1599,15 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   } else if (Number.isInteger(closedLimit) && closedLimit > 0) {
     args.push("--closed-limit", String(closedLimit));
   }
+  const terminalTasksLimit = opts.terminalTasksLimit;
+  if (
+    closedLimit !== "all" &&
+    resolved?.supportsTerminalTasksLimit &&
+    Number.isInteger(terminalTasksLimit) &&
+    terminalTasksLimit > 0
+  ) {
+    args.push("--terminal-tasks-limit", String(terminalTasksLimit));
+  }
 
   let res;
   try {
@@ -1433,13 +1624,18 @@ export async function fetchSnapshot(ctx, runner, opts = {}) {
   if (res.code !== 0) {
     const errText = (res.stderr || res.stdout || `snapshot exited ${res.code}`).trim();
     const flagRejected =
-      (resolved?.supportsCompact || resolved?.supportsBrief || resolved?.supportsIncludeEphemeral || resolved?.supportsAllClosed) &&
+      (resolved?.supportsCompact ||
+        resolved?.supportsBrief ||
+        resolved?.supportsIncludeEphemeral ||
+        resolved?.supportsAllClosed ||
+        resolved?.supportsTerminalTasksLimit) &&
       /flag provided but not defined/i.test(errText);
     if (flagRejected) {
       if (resolved?.supportsCompact) resolved.supportsCompact = false;
       if (resolved?.supportsBrief) resolved.supportsBrief = false;
       if (resolved?.supportsIncludeEphemeral) resolved.supportsIncludeEphemeral = false;
       if (resolved?.supportsAllClosed) resolved.supportsAllClosed = false;
+      if (resolved?.supportsTerminalTasksLimit) resolved.supportsTerminalTasksLimit = false;
     }
     if (!opts._retried && (isCommandNotFoundFailure(res) || flagRejected)) {
       invalidateBinaryCache(ctx);
@@ -1632,6 +1828,15 @@ function buildHerdrLookup(agents = [], terminals = [], spaces = [], panes = []) 
     const address = pane?.terminal || pane?.address || pane?.hc_address;
     if (address) addAddressIndex(paneByAddr, address, pane, pane.machine);
   }
+  const tabById = new Map();
+  for (const space of spaces || []) {
+    const tabs = Array.isArray(space?.tabs) ? space.tabs : space?.tab ? [space.tab] : [];
+    for (const rawTab of tabs) {
+      const tab = rawTab && typeof rawTab === "object" ? rawTab : { id: rawTab };
+      const key = String(tab.id ?? tab.tab ?? "");
+      if (key && !tabById.has(key)) tabById.set(key, { space, tab });
+    }
+  }
   return {
     findAgent(hcAddress, envObj) {
       for (const candidate of normalizeAddress(hcAddress, envObj)) {
@@ -1652,7 +1857,8 @@ function buildHerdrLookup(agents = [], terminals = [], spaces = [], panes = []) 
       return null;
     },
     findSpaceTab(tabId) {
-      return spaceTabInfo(spaces, tabId);
+      if (tabId === undefined || tabId === null) return null;
+      return tabById.get(String(tabId)) || null;
     },
   };
 }
@@ -1740,7 +1946,91 @@ export function resolveDispatchModel({ steps = [], currentStep = null, task = nu
   return { provider: "", model: "", label: "" };
 }
 
-function normalizeSteps(rawSteps, envObj, lookup) {
+function pickCurrentStep(steps) {
+  if (!steps.length) return null;
+  return (
+    steps.find((s) => s.status === "waiting_approval" || s.status === "needs_human") ||
+    steps.find((s) => s.status === "running") ||
+    steps.find((s) => s.status === "failed") ||
+    steps.find((s) => s.status === "pending") ||
+    steps[steps.length - 1]
+  );
+}
+
+function pickBestTaskForBead(tasks, metaTaskId) {
+  if (!tasks || !tasks.length) return null;
+  if (metaTaskId) {
+    const matched = tasks.find((t) => String(t.id) === metaTaskId);
+    if (matched) return matched;
+  }
+  const active = tasks.find((t) => t.status === "active");
+  if (active) return active;
+  return [...tasks].sort((a, b) => {
+    const ta = Date.parse(a.updated_at || a.created_at || "") || 0;
+    const tb = Date.parse(b.updated_at || b.created_at || "") || 0;
+    return tb - ta;
+  })[0];
+}
+
+function normalizeClosedCounts(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { omittedTotal: 0, omittedNonEphemeral: 0, truncated: false };
+  }
+  const omittedTotal = Math.max(0, Number(raw.omitted_total ?? raw.omittedTotal ?? 0) || 0);
+  const omittedNonEphemeral = Math.max(
+    0,
+    Number(raw.omitted_non_ephemeral ?? raw.omittedNonEphemeral ?? 0) || 0,
+  );
+  const truncated = Boolean(raw.truncated || omittedTotal > 0);
+  return { omittedTotal, omittedNonEphemeral, truncated };
+}
+
+function computeStatsSinglePass(items, closedCounts = null) {
+  const all = { total: 0, open: 0, closed: 0 };
+  const nonEphemeral = { total: 0, open: 0, closed: 0 };
+  const nonDeferred = { total: 0, open: 0, closed: 0 };
+  const nonEphemeralNonDeferred = { total: 0, open: 0, closed: 0 };
+  for (const item of items || []) {
+    const closed = isClosedQueueItem(item);
+    const eph = Boolean(item?.ephemeral);
+    const def = isDeferredItem(item);
+    all.total += 1;
+    if (closed) all.closed += 1;
+    else all.open += 1;
+    if (!eph) {
+      nonEphemeral.total += 1;
+      if (closed) nonEphemeral.closed += 1;
+      else nonEphemeral.open += 1;
+    }
+    if (!def) {
+      nonDeferred.total += 1;
+      if (closed) nonDeferred.closed += 1;
+      else nonDeferred.open += 1;
+    }
+    if (!eph && !def) {
+      nonEphemeralNonDeferred.total += 1;
+      if (closed) nonEphemeralNonDeferred.closed += 1;
+      else nonEphemeralNonDeferred.open += 1;
+    }
+  }
+  const omittedTotal = Math.max(0, Number(closedCounts?.omittedTotal || 0) || 0);
+  const omittedNonEph = Math.max(0, Number(closedCounts?.omittedNonEphemeral || 0) || 0);
+  if (omittedTotal > 0) {
+    all.closed += omittedTotal;
+    all.total += omittedTotal;
+    nonDeferred.closed += omittedTotal;
+    nonDeferred.total += omittedTotal;
+  }
+  if (omittedNonEph > 0) {
+    nonEphemeral.closed += omittedNonEph;
+    nonEphemeral.total += omittedNonEph;
+    nonEphemeralNonDeferred.closed += omittedNonEph;
+    nonEphemeralNonDeferred.total += omittedNonEph;
+  }
+  return { all, nonEphemeral, nonDeferred, nonEphemeralNonDeferred };
+}
+
+function normalizeStepsStatic(rawSteps) {
   const steps = Array.isArray(rawSteps) ? rawSteps : [];
   return steps.map((s) => {
     const attempt = s.current_attempt || s.attempt || null;
@@ -1750,9 +2040,6 @@ function normalizeSteps(rawSteps, envObj, lookup) {
       (isTerminalAddress(attemptAddress) ? String(attemptAddress).trim() : null) ||
       (isTerminalAddress(threadAddress) ? String(threadAddress).trim() : null) ||
       null;
-    const liveAgent = hcAddress ? lookup.findAgent(hcAddress, envObj) : null;
-    const liveTerminal = hcAddress ? lookup.findTerminal(hcAddress, envObj) : null;
-    const livePane = hcAddress ? lookup.findPane(hcAddress, envObj) : null;
     return {
       stepId: s.step_id || s.id || "",
       ordinal: s.ordinal ?? 0,
@@ -1787,41 +2074,127 @@ function normalizeSteps(rawSteps, envObj, lookup) {
           }
         : null,
       hcAddress,
-      liveAgent,
-      liveTerminal,
-      livePane,
-      agentStatus: resolveLiveStatus(liveAgent, liveTerminal),
+      liveAgent: null,
+      liveTerminal: null,
+      livePane: null,
+      agentStatus: null,
     };
   });
 }
 
-function pickCurrentStep(steps) {
-  if (!steps.length) return null;
-  return (
-    steps.find((s) => s.status === "waiting_approval" || s.status === "needs_human") ||
-    steps.find((s) => s.status === "running") ||
-    steps.find((s) => s.status === "failed") ||
-    steps.find((s) => s.status === "pending") ||
-    steps[steps.length - 1]
-  );
+function staticSessionInfo(hcAddress, envObj) {
+  if (!hcAddress) return null;
+  return {
+    terminal: hcAddress,
+    spaceId: null,
+    spaceName: null,
+    tabId: null,
+    tabName: null,
+    paneId: null,
+    hasAgent: false,
+    hasPane: false,
+    isLive: false,
+    machine: envObj?.machine || null,
+    envSpace: envObj?.space || null,
+  };
 }
 
-function pickBestTaskForBead(tasks, metaTaskId) {
-  if (!tasks || !tasks.length) return null;
-  if (metaTaskId) {
-    const matched = tasks.find((t) => String(t.id) === metaTaskId);
-    if (matched) return matched;
+function buildStaticLiveSig(item) {
+  const stepSig = (item.steps || [])
+    .map((s) => `${s.stepId}:${s.agentStatus || ""}:::`)
+    .join(";");
+  const si = item.sessionInfo;
+  return `${item.hcAddress || ""}|${item.agentStatus || ""}|${si?.spaceId || ""}|${si?.tabId || ""}|${si?.paneId || ""}|0|0|0|${stepSig}`;
+}
+
+function computeLiveItemOverlay(baseItem, envObj, lookup) {
+  const rawSteps = Array.isArray(baseItem.steps) ? baseItem.steps : [];
+  let steps = rawSteps;
+  let anyStepLive = false;
+  for (let i = 0; i < rawSteps.length; i += 1) {
+    const s = rawSteps[i];
+    if (!s.hcAddress) continue;
+    const liveAgent = lookup.findAgent(s.hcAddress, envObj);
+    const liveTerminal = lookup.findTerminal(s.hcAddress, envObj);
+    const livePane = lookup.findPane(s.hcAddress, envObj);
+    const agentStatus = resolveLiveStatus(liveAgent, liveTerminal);
+    if (liveAgent || liveTerminal || livePane || agentStatus) {
+      if (steps === rawSteps) steps = rawSteps.slice();
+      steps[i] = { ...s, liveAgent, liveTerminal, livePane, agentStatus };
+      anyStepLive = true;
+    }
   }
-  const active = tasks.find((t) => t.status === "active");
-  if (active) return active;
-  return [...tasks].sort((a, b) => {
-    const ta = Date.parse(a.updated_at || a.created_at || "") || 0;
-    const tb = Date.parse(b.updated_at || b.created_at || "") || 0;
-    return tb - ta;
-  })[0];
+  const currentStep = pickCurrentStep(steps);
+  const liveStep = anyStepLive
+    ? steps.find((step) => step.liveAgent || step.liveTerminal || step.livePane) || null
+    : null;
+  let sessionStep = liveStep || currentStep;
+  if (!sessionStep) {
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (steps[i].hcAddress) {
+        sessionStep = steps[i];
+        break;
+      }
+    }
+  }
+  const hcAddress = sessionStep?.hcAddress || baseItem._fallbackHcAddress || baseItem.hcAddress || null;
+  const liveAgent =
+    sessionStep?.liveAgent || (hcAddress ? lookup.findAgent(hcAddress, envObj) : null);
+  const liveTerminal =
+    sessionStep?.liveTerminal || (hcAddress ? lookup.findTerminal(hcAddress, envObj) : null);
+  const livePane =
+    sessionStep?.livePane || (hcAddress ? lookup.findPane(hcAddress, envObj) : null);
+  const canonicalAddress =
+    liveAgent?.address || liveTerminal?.address || livePane?.terminal || hcAddress || null;
+  const tabRef = liveAgent?.tab || livePane?.tab;
+  const tabInfo = tabRef !== undefined && tabRef !== null ? lookup.findSpaceTab(tabRef) : null;
+  const sessionInfo = canonicalAddress
+    ? {
+        terminal: canonicalAddress,
+        spaceId: liveAgent?.space || tabInfo?.space?.id || null,
+        spaceName: tabInfo?.space?.name || tabInfo?.space?.label || null,
+        tabId: liveAgent?.tab || livePane?.tab || tabInfo?.tab?.id || null,
+        tabName: tabInfo?.tab?.name || tabInfo?.tab?.title || tabInfo?.tab?.label || null,
+        paneId: livePane?.pane || livePane?.id || null,
+        hasAgent: Boolean(liveAgent),
+        hasPane: Boolean(livePane || liveAgent?.pane),
+        isLive: Boolean(liveAgent || liveTerminal || livePane),
+        machine: envObj?.machine ?? baseItem.machine ?? null,
+        envSpace: envObj?.space ?? baseItem.sessionInfo?.envSpace ?? null,
+      }
+    : null;
+  const agentStatus =
+    sessionStep?.agentStatus || resolveLiveStatus(liveAgent, liveTerminal);
+
+  const stepSig = steps
+    .map(
+      (s) =>
+        `${s.stepId}:${s.agentStatus || ""}:${s.liveAgent?.address || ""}:${s.liveTerminal?.status || ""}:${s.livePane?.pane || s.livePane?.id || ""}`,
+    )
+    .join(";");
+  const sig = `${canonicalAddress || ""}|${agentStatus || ""}|${sessionInfo?.spaceId || ""}|${sessionInfo?.tabId || ""}|${sessionInfo?.paneId || ""}|${sessionInfo?.hasAgent ? 1 : 0}|${sessionInfo?.hasPane ? 1 : 0}|${sessionInfo?.isLive ? 1 : 0}|${stepSig}`;
+
+  return {
+    sig,
+    steps,
+    currentStep,
+    waitingStep:
+      steps.find((s) => s.status === "waiting_approval") ||
+      steps.find((s) => s.status === "needs_human") ||
+      steps.find((s) => s.status === "failed") ||
+      null,
+    hcAddress: canonicalAddress,
+    sessionInfo,
+    liveAgent,
+    liveTerminal,
+    agentStatus,
+  };
 }
 
-export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces = [], panes = [] } = {}) {
+export function normalizeSnapshotBase(snapshot) {
+  if (snapshot && typeof snapshot === "object" && SNAPSHOT_BASE_CACHE.has(snapshot)) {
+    return SNAPSHOT_BASE_CACHE.get(snapshot);
+  }
   const snap = snapshot || {};
   const cfg = snap.config || {};
   const defaultEnv = cfg.default_env || "local";
@@ -1861,7 +2234,6 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
   for (const f of formulas) {
     if (f?.name) formulasByName.set(f.name, f);
   }
-  const lookup = buildHerdrLookup(agents, terminals, spaces, panes);
 
   const rawTasks = Array.isArray(snap.tasks) ? snap.tasks : [];
   const tasksById = new Map();
@@ -1925,6 +2297,9 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
 
   const items = [];
   const itemsById = new Map();
+  const itemEnvObjs = [];
+  const itemStaticSigs = [];
+  const liveCandidateIndices = [];
 
   function buildItem({ issue = null, task = null }) {
     const beadId = issue ? issue.id : task?.bead_id || null;
@@ -1984,7 +2359,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       issue?.metadata?.["roscaelifer.project"] ||
       null;
 
-    const steps = normalizeSteps(task?.steps, envObj, lookup);
+    const steps = normalizeStepsStatic(task?.steps);
     const currentStep = pickCurrentStep(steps);
     const sidecars = taskId ? sidecarsByTaskPrefix.get(taskId) || [] : [];
     const pendingSidecarCount = sidecars.filter((s) => s.pending_cleanup).length;
@@ -1997,47 +2372,28 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     );
     const pendingCleanup = pendingCleanupCount > 0;
 
-    const liveStep = steps.find((step) => step.liveAgent || step.liveTerminal || step.livePane) || null;
-    const sessionStep = liveStep || currentStep || [...steps].reverse().find((step) => step.hcAddress) || null;
+    let lastStepWithAddress = null;
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (steps[i].hcAddress) {
+        lastStepWithAddress = steps[i];
+        break;
+      }
+    }
+    const sessionStep = currentStep || lastStepWithAddress || null;
     let hcAddress = sessionStep?.hcAddress || null;
+    let fallbackHcAddress = null;
     if (!hcAddress && taskPendingCleanups.length > 0) {
       const candidate = taskPendingCleanups[0].hc_address || taskPendingCleanups[0].pane_id || null;
-      hcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
+      fallbackHcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
+      hcAddress = fallbackHcAddress;
     }
     if (!hcAddress && sidecars.length > 0) {
       const candidate = sidecars[0].pane_id || null;
-      hcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
+      fallbackHcAddress = isTerminalAddress(candidate) ? String(candidate).trim() : null;
+      hcAddress = fallbackHcAddress;
     }
 
-    const liveAgent =
-      sessionStep?.liveAgent ||
-      (hcAddress ? lookup.findAgent(hcAddress, envObj) : null);
-    const liveTerminal =
-      sessionStep?.liveTerminal ||
-      (hcAddress ? lookup.findTerminal(hcAddress, envObj) : null);
-    const livePane =
-      sessionStep?.livePane ||
-      (hcAddress ? lookup.findPane(hcAddress, envObj) : null);
-    const canonicalAddress = liveAgent?.address || liveTerminal?.address || livePane?.terminal || hcAddress || null;
-    const tabInfo = lookup.findSpaceTab(liveAgent?.tab || livePane?.tab);
-    const sessionInfo = canonicalAddress
-      ? {
-          terminal: canonicalAddress,
-          spaceId: liveAgent?.space || tabInfo?.space?.id || null,
-          spaceName: tabInfo?.space?.name || tabInfo?.space?.label || null,
-          tabId: liveAgent?.tab || livePane?.tab || tabInfo?.tab?.id || null,
-          tabName: tabInfo?.tab?.name || tabInfo?.tab?.title || tabInfo?.tab?.label || null,
-          paneId: livePane?.pane || livePane?.id || null,
-          hasAgent: Boolean(liveAgent),
-          hasPane: Boolean(livePane || liveAgent?.pane),
-          isLive: Boolean(liveAgent || liveTerminal || livePane),
-          machine: envObj?.machine || null,
-          envSpace: envObj?.space || null,
-        }
-      : null;
-    const agentStatus =
-      sessionStep?.agentStatus || resolveLiveStatus(liveAgent, liveTerminal);
-
+    const sessionInfo = staticSessionInfo(hcAddress, envObj);
     const attempt = currentStep?.currentAttempt || null;
     const stepSummary =
       steps
@@ -2075,7 +2431,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
             return target ? target.status !== "closed" : true;
           });
     const beadColumn =
-      !beadId
+      !issue
         ? null
         : bdStatus === "closed"
           ? "closed"
@@ -2152,7 +2508,6 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       formulasByName,
     });
 
-    // Also pick up live blocked agent status as informational badge (stays in running unless step paused).
     const item = {
       id,
       beadId,
@@ -2190,14 +2545,14 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       steps,
       currentStep,
       waitingStep: waitingApprovalStep || needsHumanStep || failedStep || null,
-      hcAddress: canonicalAddress,
+      hcAddress,
       sessionInfo,
       worktree,
       branch,
       link,
-      liveAgent,
-      liveTerminal,
-      agentStatus,
+      liveAgent: null,
+      liveTerminal: null,
+      agentStatus: null,
       pendingCleanup,
       pendingCleanupCount,
       pendingCleanups: taskPendingCleanups,
@@ -2215,6 +2570,7 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       issue,
       task,
     };
+    if (fallbackHcAddress) item._fallbackHcAddress = fallbackHcAddress;
     item._searchText = [
       item.id,
       item.beadId,
@@ -2238,8 +2594,20 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
-    return item;
+    return { item, envObj };
   }
+
+  const pushBuilt = ({ item, envObj }) => {
+    const idx = items.length;
+    items.push(item);
+    itemsById.set(item.id, item);
+    itemEnvObjs.push(envObj);
+    const sig = buildStaticLiveSig(item);
+    itemStaticSigs.push(sig);
+    if (item.hcAddress || item.steps.some((s) => Boolean(s.hcAddress))) {
+      liveCandidateIndices.push(idx);
+    }
+  };
 
   const seenWorkBeadIds = new Set();
   for (const issue of workIssues) {
@@ -2247,59 +2615,44 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     const metaTaskId = stripTaskMetaPrefix(issue?.metadata?.["roscaelifer.task"]);
     const matchingTasks = tasksByBead.get(issue.id) || [];
     const task = pickBestTaskForBead(matchingTasks, metaTaskId);
-    const item = buildItem({ issue, task });
-    items.push(item);
-    itemsById.set(item.id, item);
+    pushBuilt(buildItem({ issue, task }));
   }
 
   for (const [beadIdKey, matchingTasks] of tasksByBead.entries()) {
     if (seenWorkBeadIds.has(beadIdKey)) continue;
     const task = pickBestTaskForBead(matchingTasks, null);
     if (!task) continue;
-    const item = buildItem({ issue: null, task });
-    items.push(item);
-    itemsById.set(item.id, item);
+    pushBuilt(buildItem({ issue: null, task }));
   }
 
   for (const task of standaloneTasks) {
-    const item = buildItem({ issue: null, task });
-    items.push(item);
-    itemsById.set(item.id, item);
+    pushBuilt(buildItem({ issue: null, task }));
   }
 
-  // Sort items deterministically: higher priority (P0=0) first, ready/opted-in next, then newest/id.
-  const sortItems = (list) =>
-    [...list].sort((a, b) => {
-      const pa = a.priority ?? 99;
-      const pb = b.priority ?? 99;
-      if (pa !== pb) return pa - pb;
-      if (a.isOptedIn !== b.isOptedIn) return a.isOptedIn ? -1 : 1;
-      if (a.isReady !== b.isReady) return a.isReady ? -1 : 1;
-      const ar = a.agentStatus ? AGENT_RANK[a.agentStatus] ?? 0 : 0;
-      const br = b.agentStatus ? AGENT_RANK[b.agentStatus] ?? 0 : 0;
-      if (ar !== br) return br - ar;
-      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    });
-
   const columns = {
-    ready: sortItems(items.filter((i) => i.column === "ready")),
-    queue: sortItems(items.filter((i) => i.column === "queue")),
-    running: sortItems(items.filter((i) => i.column === "running")),
-    action: sortItems(items.filter((i) => i.column === "action")),
-    review: sortItems(items.filter((i) => i.column === "review")),
-    closed: sortItems(items.filter((i) => i.column === "closed")),
+    ready: [],
+    queue: [],
+    running: [],
+    action: [],
+    review: [],
+    closed: [],
   };
-  const beadItems = items.filter((item) => Boolean(item.beadId));
   const beadColumns = {
-    backlog: sortItems(beadItems.filter((item) => item.beadColumn === "backlog")),
-    ready: sortItems(beadItems.filter((item) => item.beadColumn === "ready")),
-    in_progress: sortItems(beadItems.filter((item) => item.beadColumn === "in_progress")),
-    blocked: sortItems(beadItems.filter((item) => item.beadColumn === "blocked")),
-    closed: sortItems(beadItems.filter((item) => item.beadColumn === "closed")),
+    backlog: [],
+    ready: [],
+    in_progress: [],
+    blocked: [],
+    closed: [],
   };
+  for (const item of items) {
+    if (columns[item.column]) columns[item.column].push(item);
+    if (item.beadId && item.beadColumn && beadColumns[item.beadColumn]) {
+      beadColumns[item.beadColumn].push(item);
+    }
+  }
+  for (const key of Object.keys(columns)) columns[key].sort(compareQueueItems);
+  for (const key of Object.keys(beadColumns)) beadColumns[key].sort(compareQueueItems);
 
-  // Build epic summaries (plus expose epics in itemsById for dependency lookup if referenced).
-  // Index each item under matching epic IDs once, instead of scanning all items for every epic.
   const epicIdSet = new Set(epicsRaw.map((epic) => epic.id));
   const childrenByEpic = new Map();
   for (const item of items) {
@@ -2332,14 +2685,13 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
       description: epic.description || "",
       acceptanceCriteria: epic.acceptance_criteria || "",
       labels: epic.labels || [],
-      children: sortItems(children),
+      children: [...children].sort(compareQueueItems),
       counts,
       progress,
       issue: epic,
     };
   });
 
-  // Also include epics in itemsById so deps graph lookups never miss an epic reference.
   for (const e of epics) {
     if (!itemsById.has(e.id)) {
       itemsById.set(e.id, {
@@ -2360,7 +2712,10 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     }
   }
 
-  return {
+  const closedCounts = normalizeClosedCounts(snap.closed_counts);
+  const staticStats = computeStatsSinglePass(items, closedCounts);
+
+  const base = {
     items,
     itemsById,
     columns,
@@ -2379,9 +2734,144 @@ export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces =
     runner: snap.runner || { lock_path: "", lock_held: false, active: false },
     paths: snap.paths || {},
     generatedAt: snap.generated_at || null,
-    spacesCount: (spaces || []).length,
-    panesCount: (panes || []).length,
+    closedCounts,
+    staticStats,
+    _itemEnvObjs: itemEnvObjs,
+    _itemStaticSigs: itemStaticSigs,
+    _liveCandidateIndices: liveCandidateIndices,
   };
+  if (snapshot && typeof snapshot === "object") {
+    SNAPSHOT_BASE_CACHE.set(snapshot, base);
+  }
+  return base;
+}
+
+function applyLiveProjection(base, herdrLive = {}, sharedLookup = null, prevProjected = null) {
+  const spacesCount = Array.isArray(herdrLive?.spaces) ? herdrLive.spaces.length : 0;
+  const panesCount = Array.isArray(herdrLive?.panes) ? herdrLive.panes.length : 0;
+  const canReusePrev = Boolean(prevProjected && prevProjected._base === base);
+  const candidateIndices = base._liveCandidateIndices || [];
+
+  if (candidateIndices.length === 0) {
+    if (canReusePrev) return prevProjected;
+    return {
+      ...base,
+      spacesCount,
+      panesCount,
+      _base: base,
+    };
+  }
+
+  const lookup =
+    sharedLookup ||
+    buildHerdrLookup(herdrLive?.agents, herdrLive?.terminals, herdrLive?.spaces, herdrLive?.panes);
+  const changed = [];
+  for (let c = 0; c < candidateIndices.length; c += 1) {
+    const idx = candidateIndices[c];
+    const baseItem = base.items[idx];
+    const envObj = base._itemEnvObjs[idx] || null;
+    const prevItem = canReusePrev ? prevProjected.items[idx] : baseItem;
+    const prevSig = prevItem?._liveSig ?? base._itemStaticSigs[idx];
+    const overlay = computeLiveItemOverlay(baseItem, envObj, lookup);
+    if (overlay.sig !== prevSig) {
+      changed.push([
+        idx,
+        {
+          ...baseItem,
+          steps: overlay.steps,
+          currentStep: overlay.currentStep,
+          waitingStep: overlay.waitingStep,
+          hcAddress: overlay.hcAddress,
+          sessionInfo: overlay.sessionInfo,
+          liveAgent: overlay.liveAgent,
+          liveTerminal: overlay.liveTerminal,
+          agentStatus: overlay.agentStatus,
+          _liveSig: overlay.sig,
+        },
+      ]);
+    }
+  }
+
+  if (changed.length === 0) {
+    if (canReusePrev) return prevProjected;
+    return {
+      ...base,
+      spacesCount,
+      panesCount,
+      _base: base,
+    };
+  }
+
+  const src = canReusePrev ? prevProjected : base;
+  const nextItems = src.items.slice();
+  const nextItemsById = new Map(src.itemsById);
+  const changedById = new Map();
+  const touchedCols = new Set();
+  const touchedBeadCols = new Set();
+  for (let i = 0; i < changed.length; i += 1) {
+    const [idx, nextItem] = changed[i];
+    nextItems[idx] = nextItem;
+    nextItemsById.set(nextItem.id, nextItem);
+    changedById.set(nextItem.id, nextItem);
+    if (nextItem.column) touchedCols.add(nextItem.column);
+    if (nextItem.beadId && nextItem.beadColumn) touchedBeadCols.add(nextItem.beadColumn);
+  }
+
+  const nextColumns = { ...src.columns };
+  for (const colKey of touchedCols) {
+    const arr = (src.columns[colKey] || []).map((it) => changedById.get(it.id) || it);
+    arr.sort(compareQueueItems);
+    nextColumns[colKey] = arr;
+  }
+  const nextBeadColumns = { ...src.beadColumns };
+  for (const bColKey of touchedBeadCols) {
+    const arr = (src.beadColumns[bColKey] || []).map((it) => changedById.get(it.id) || it);
+    arr.sort(compareQueueItems);
+    nextBeadColumns[bColKey] = arr;
+  }
+
+  let nextEpics = src.epics;
+  if (Array.isArray(src.epics) && src.epics.length > 0) {
+    for (let i = 0; i < src.epics.length; i += 1) {
+      const ep = src.epics[i];
+      if (!Array.isArray(ep.children) || ep.children.length === 0) continue;
+      let hit = false;
+      for (let j = 0; j < ep.children.length; j += 1) {
+        if (changedById.has(ep.children[j].id)) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        if (nextEpics === src.epics) nextEpics = src.epics.slice();
+        const nextChildren = ep.children.map((ch) => changedById.get(ch.id) || ch);
+        nextChildren.sort(compareQueueItems);
+        nextEpics[i] = { ...ep, children: nextChildren };
+      }
+    }
+  }
+
+  return {
+    ...base,
+    items: nextItems,
+    itemsById: nextItemsById,
+    columns: nextColumns,
+    beadColumns: nextBeadColumns,
+    epics: nextEpics,
+    spacesCount,
+    panesCount,
+    _base: base,
+  };
+}
+
+export function projectLiveQueue(base, herdrLive = {}, prevProjected = null) {
+  if (!base) return null;
+  return applyLiveProjection(base, herdrLive, null, prevProjected);
+}
+
+export function normalizeQueue(snapshot, { agents = [], terminals = [], spaces = [], panes = [] } = {}) {
+  const base = normalizeSnapshotBase(snapshot);
+  return applyLiveProjection(base, { agents, terminals, spaces, panes }, null, null);
 }
 
 function compareQueueItems(a, b) {
@@ -2410,7 +2900,7 @@ function eventSortMs(ev) {
  * Unwraps a Promise.allSettled-style entry or a plain project result. A plain
  * result carries either a normalized `queue`, a raw `snapshot`, or an error.
  */
-function normalizeProjectResult(entry, index, herdrLive) {
+function normalizeProjectResultBase(entry, index) {
   const raw = entry && typeof entry === "object" ? entry : {};
   let source = raw;
   let error = raw.error ?? null;
@@ -2427,7 +2917,7 @@ function normalizeProjectResult(entry, index, herdrLive) {
   let queue = source.queue && typeof source.queue === "object" ? source.queue : null;
   if (!queue && source.snapshot && typeof source.snapshot === "object") {
     try {
-      queue = normalizeQueue(source.snapshot, herdrLive || {});
+      queue = normalizeSnapshotBase(source.snapshot);
     } catch (err) {
       queue = null;
       if (!error) error = err?.message || String(err);
@@ -2471,28 +2961,25 @@ export function isClosedQueueItem(item) {
   return !item.column && (item.bdStatus === "closed" || item.status === "closed");
 }
 
-export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
+export function buildMultiProjectBase(projectResults) {
   const results = (Array.isArray(projectResults) ? projectResults : []).map((entry, index) =>
-    normalizeProjectResult(entry, index, herdrLive),
+    normalizeProjectResultBase(entry, index),
   );
+
+  let omittedTotalSum = 0;
+  let omittedNonEphSum = 0;
+  let anyTruncated = false;
 
   const projects = results.map((result) => {
     const projectItems = Array.isArray(result.queue?.items) ? result.queue.items : [];
-    const countItems = (items) => {
-      const closed = items.reduce(
-        (sum, item) => sum + (isClosedQueueItem(item) ? 1 : 0),
-        0,
-      );
-      return {
-        total: items.length,
-        open: items.length - closed,
-        closed,
-      };
-    };
-    const allStats = countItems(projectItems);
-    const nonEphemeralStats = countItems(projectItems.filter((item) => !item?.ephemeral));
-    const nonDeferredStats = countItems(projectItems.filter((item) => !isDeferredItem(item)));
-    const nonEphemeralNonDeferredStats = countItems(projectItems.filter((item) => !item?.ephemeral && !isDeferredItem(item)));
+    const closedCounts = normalizeClosedCounts(result.queue?.closedCounts);
+    omittedTotalSum += closedCounts.omittedTotal;
+    omittedNonEphSum += closedCounts.omittedNonEphemeral;
+    if (closedCounts.truncated) anyTruncated = true;
+
+    const stats =
+      result.queue?.staticStats || computeStatsSinglePass(projectItems, closedCounts);
+    const { all, nonEphemeral, nonDeferred, nonEphemeralNonDeferred } = stats;
     return {
       id: result.projectId,
       name: result.projectName,
@@ -2504,19 +2991,20 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
       envs: Array.isArray(result.envs) ? result.envs : [],
       formulas: Array.isArray(result.formulas) ? result.formulas : [],
       error: result.error,
+      closedCounts,
       // Keep the original fields as the all-items view used by older callers.
-      itemCount: allStats.total,
-      openItemCount: allStats.open,
-      closedItemCount: allStats.closed,
-      nonEphemeralItemCount: nonEphemeralStats.total,
-      nonEphemeralOpenItemCount: nonEphemeralStats.open,
-      nonEphemeralClosedItemCount: nonEphemeralStats.closed,
-      nonDeferredStats,
-      nonEphemeralNonDeferredStats,
+      itemCount: all.total,
+      openItemCount: all.open,
+      closedItemCount: all.closed,
+      nonEphemeralItemCount: nonEphemeral.total,
+      nonEphemeralOpenItemCount: nonEphemeral.open,
+      nonEphemeralClosedItemCount: nonEphemeral.closed,
+      nonDeferredStats: nonDeferred,
+      nonEphemeralNonDeferredStats: nonEphemeralNonDeferred,
     };
   });
 
-  const items = [];
+  const itemsWithEnv = [];
   const itemsByRaw = new Map();
   const epics = [];
 
@@ -2529,16 +3017,25 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
       projectColor: result.color,
       projectCtx: result.projectCtx || null,
     };
+    const projectNameLower = String(result.projectName || "").toLowerCase();
+    const queueItems = queue.items || [];
+    const queueEnvObjs = queue._itemEnvObjs || queue._base?._itemEnvObjs || null;
+    const queueStaticSigs = queue._itemStaticSigs || queue._base?._itemStaticSigs || null;
     const byRaw = new Map();
-    for (const item of queue.items || []) {
+    for (let i = 0; i < queueItems.length; i += 1) {
+      const item = queueItems[i];
       const rawId = item.id;
       const uid = `${result.projectId}::${rawId}`;
       const merged = { ...item, ...base, id: uid, uid, rawId };
-      merged._searchText = [item._searchText, result.projectName]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      items.push(merged);
+      if (item._searchText && projectNameLower) {
+        merged._searchText = `${item._searchText} ${projectNameLower}`;
+      } else {
+        merged._searchText = (item._searchText || projectNameLower || "").toLowerCase();
+      }
+      const envObj = queueEnvObjs ? queueEnvObjs[i] || null : null;
+      const staticSig =
+        queueStaticSigs && queueStaticSigs[i] ? queueStaticSigs[i] : buildStaticLiveSig(merged);
+      itemsWithEnv.push({ item: merged, envObj, staticSig });
       byRaw.set(rawId, merged);
       itemsByRaw.set(uid, merged);
     }
@@ -2577,20 +3074,40 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
     }
   }
 
-  const sorted = [...items].sort(compareQueueItems);
-  const columnKeys = ["ready", "queue", "running", "action", "review", "closed"];
-  const columns = {};
-  for (const key of columnKeys) {
-    columns[key] = sorted.filter((item) => item.column === key);
-  }
-  const beadItems = sorted.filter((item) => Boolean(item.beadId));
-  const beadColumns = {
-    backlog: beadItems.filter((item) => item.beadColumn === "backlog"),
-    ready: beadItems.filter((item) => item.beadColumn === "ready"),
-    in_progress: beadItems.filter((item) => item.beadColumn === "in_progress"),
-    blocked: beadItems.filter((item) => item.beadColumn === "blocked"),
-    closed: beadItems.filter((item) => item.beadColumn === "closed"),
+  itemsWithEnv.sort((a, b) => compareQueueItems(a.item, b.item));
+  const sorted = new Array(itemsWithEnv.length);
+  const itemEnvObjs = new Array(itemsWithEnv.length);
+  const itemStaticSigs = new Array(itemsWithEnv.length);
+  const liveCandidateIndices = [];
+  const columns = {
+    ready: [],
+    queue: [],
+    running: [],
+    action: [],
+    review: [],
+    closed: [],
   };
+  const beadColumns = {
+    backlog: [],
+    ready: [],
+    in_progress: [],
+    blocked: [],
+    closed: [],
+  };
+  for (let i = 0; i < itemsWithEnv.length; i += 1) {
+    const entry = itemsWithEnv[i];
+    const item = entry.item;
+    sorted[i] = item;
+    itemEnvObjs[i] = entry.envObj;
+    itemStaticSigs[i] = entry.staticSig;
+    if (item.hcAddress || (Array.isArray(item.steps) && item.steps.some((s) => Boolean(s.hcAddress)))) {
+      liveCandidateIndices.push(i);
+    }
+    if (columns[item.column]) columns[item.column].push(item);
+    if (item.beadId && item.beadColumn && beadColumns[item.beadColumn]) {
+      beadColumns[item.beadColumn].push(item);
+    }
+  }
 
   // Environments merge by name; capacity is summed across projects and the
   // per-project split stays available for tooltips.
@@ -2718,12 +3235,28 @@ export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
     paths: {},
     generatedAt,
     projects,
+    closedCounts: {
+      omittedTotal: omittedTotalSum,
+      omittedNonEphemeral: omittedNonEphSum,
+      truncated: anyTruncated,
+    },
     panelMode: results.length > 1 ? PANEL_MODE_MULTI : PANEL_MODE_SINGLE,
     error:
       errors.length > 0 && results.every((result) => !result.queue) ? errors.join(" | ") : null,
-    spacesCount: Array.isArray(herdrLive?.spaces) ? herdrLive.spaces.length : 0,
-    panesCount: Array.isArray(herdrLive?.panes) ? herdrLive.panes.length : 0,
+    _itemEnvObjs: itemEnvObjs,
+    _itemStaticSigs: itemStaticSigs,
+    _liveCandidateIndices: liveCandidateIndices,
   };
+}
+
+export function projectMultiProjectLive(multiBase, herdrLive = {}, prevQueue = null) {
+  if (!multiBase) return null;
+  return applyLiveProjection(multiBase, herdrLive, null, prevQueue);
+}
+
+export function mergeNormalizedQueues(projectResults, herdrLive = {}) {
+  const base = buildMultiProjectBase(projectResults);
+  return projectMultiProjectLive(base, herdrLive, null);
 }
 
 function firstRunner(result) {

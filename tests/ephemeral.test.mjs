@@ -179,10 +179,14 @@ test("normalizeQueue classifies orphan terminal bead tasks as ephemeral closed i
   assert.equal(done.column, "closed");
   assert.equal(done.actionReason, null);
   assert.equal(done.ephemeral, true);
-  // Orphan task for a bead nobody can see: terminal either way, so Closed.
+  assert.equal(done.beadColumn, null);
+  // Orphan task for a bead nobody can see: terminal either way, so Closed,
+  // and must never leak into the Beads board Ready column.
   assert.equal(cancelled.column, "closed");
   assert.equal(cancelled.actionReason, null);
   assert.equal(cancelled.ephemeral, true);
+  assert.equal(cancelled.beadColumn, null);
+  assert.equal(queue.beadColumns.ready.length, 0);
 });
 
 test("normalizeQueue sends a beadless cancelled wip task to Closed and keeps cleanup actionable", () => {
@@ -400,4 +404,51 @@ test("fetchSnapshot defaults closedLimit to all and passes --include-ephemeral o
     "--closed-limit",
     "50000",
   ]);
+});
+
+test("fetchSnapshot passes --closed-limit and --terminal-tasks-limit when supported and falls back when rejected", async () => {
+  const calls = [];
+  const ctx = {
+    repo: "/repos/demo",
+    db: "/repos/demo/.roscaelifer/roscaelifer.db",
+    bdDir: "/repos/demo/.beads",
+    bin: "/usr/local/bin/roscaelifer",
+  };
+  const runner = {
+    bin: "/usr/local/bin/roscaelifer",
+    supportsCompact: true,
+    supportsBrief: true,
+    supportsIncludeEphemeral: true,
+    supportsAllClosed: true,
+    supportsTerminalTasksLimit: true,
+  };
+  const legacyRunner = {
+    ...runner,
+    supportsTerminalTasksLimit: false,
+  };
+
+  await withHerdrMock(
+    {
+      exec(cmd, args) {
+        calls.push({ cmd, args });
+        if (args.includes("--terminal-tasks-limit") && calls.length === 2) {
+          return { code: 2, stdout: "", stderr: "flag provided but not defined: -terminal-tasks-limit" };
+        }
+        return { code: 0, stdout: JSON.stringify({ tasks: [], config: {}, bd: { available: true, issues: [], ready_ids: [] } }), stderr: "" };
+      },
+    },
+    async () => {
+      await store.fetchSnapshot(ctx, runner, { bd: true, closedLimit: 80, terminalTasksLimit: 80 });
+      await store.fetchSnapshot(ctx, { ...runner }, { bd: true, closedLimit: 80, terminalTasksLimit: 80 });
+      await store.fetchSnapshot(ctx, legacyRunner, { bd: true, closedLimit: 80, terminalTasksLimit: 80 });
+    },
+  );
+
+  assert.equal(calls[0].args.includes("--all-closed"), false);
+  assert.deepEqual(calls[0].args.slice(calls[0].args.indexOf("--closed-limit"), calls[0].args.indexOf("--closed-limit") + 2), ["--closed-limit", "80"]);
+  assert.deepEqual(calls[0].args.slice(calls[0].args.indexOf("--terminal-tasks-limit"), calls[0].args.indexOf("--terminal-tasks-limit") + 2), ["--terminal-tasks-limit", "80"]);
+  // Second call failed with flag error -> retried without --terminal-tasks-limit
+  assert.equal(calls[2].args.includes("--terminal-tasks-limit"), false);
+  // Third call with legacyRunner did not pass --terminal-tasks-limit
+  assert.equal(calls[3].args.includes("--terminal-tasks-limit"), false);
 });

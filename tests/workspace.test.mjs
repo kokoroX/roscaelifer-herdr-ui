@@ -1243,3 +1243,100 @@ test("formatRunningLimitMeta summarizes concurrency limits for the Running colum
     null,
   );
 });
+
+test("mergeNormalizedQueues folds closed_counts into project stats and preserves references on unrelated live changes", () => {
+  const snapA = {
+    schema_version: 1,
+    config: { default_env: "local", envs: [{ name: "local", kind: "local" }], formulas: [] },
+    tasks: [
+      {
+        id: "t-run",
+        title: "Running task",
+        formula_name: "solo",
+        status: "active",
+        bead_id: "a-1",
+        steps: [
+          {
+            step_id: "do",
+            kind: "work",
+            status: "running",
+            current_attempt: { n: 1, status: "running", thread_id: "herdr:local:term-1", hc_address: "term-1" },
+          },
+        ],
+      },
+    ],
+    bd: {
+      available: true,
+      ready_ids: [],
+      issues: [
+        { id: "a-1", title: "Open task", status: "in_progress", priority: 1, issue_type: "task" },
+        { id: "a-2", title: "Closed task", status: "closed", priority: 2, issue_type: "task" },
+      ],
+    },
+    closed_counts: { omitted_total: 100, omitted_non_ephemeral: 70, truncated: true },
+  };
+  const snapB = {
+    schema_version: 1,
+    config: { default_env: "local", envs: [{ name: "local", kind: "local" }], formulas: [] },
+    tasks: [],
+    bd: { available: true, ready_ids: ["b-1"], issues: [{ id: "b-1", title: "Ready B", status: "open", priority: 2, issue_type: "task" }] },
+    closed_counts: { omitted_total: 10, omitted_non_ephemeral: 10, truncated: true },
+  };
+
+  const base = store.buildMultiProjectBase([
+    { projectId: "alpha", projectName: "Alpha", snapshot: snapA },
+    { projectId: "beta", projectName: "Beta", snapshot: snapB },
+  ]);
+
+  const alpha = base.projects.find((p) => p.id === "alpha");
+  assert.equal(alpha.openItemCount, 1);
+  assert.equal(alpha.closedItemCount, 101);
+  assert.equal(alpha.itemCount, 102);
+  assert.equal(alpha.nonEphemeralClosedItemCount, 71);
+  assert.equal(alpha.nonEphemeralItemCount, 72);
+  assert.equal(alpha.nonDeferredStats.closed, 101);
+  assert.equal(alpha.nonEphemeralNonDeferredStats.closed, 71);
+  assert.deepEqual(base.closedCounts, { omittedTotal: 110, omittedNonEphemeral: 80, truncated: true });
+
+  const q1 = store.projectMultiProjectLive(base, {
+    agents: [{ address: "term-1", status: "working" }],
+    terminals: [{ address: "term-1", state: "live", status: "working" }],
+    spaces: [],
+    panes: [],
+  });
+  assert.equal(q1.itemsById.get("alpha::a-1").agentStatus, "working");
+
+  // Unrelated terminal changes should return the exact same queue reference.
+  const q2 = store.projectMultiProjectLive(
+    base,
+    {
+      agents: [{ address: "term-1", status: "working" }, { address: "unrelated-9", status: "idle" }],
+      terminals: [{ address: "term-1", state: "live", status: "working" }, { address: "unrelated-9", state: "live", status: "idle" }],
+      spaces: [],
+      panes: [],
+    },
+    q1,
+  );
+  assert.equal(q2, q1);
+
+  // Active item status change updates running column without touching closed column reference.
+  const q3 = store.projectMultiProjectLive(
+    base,
+    {
+      agents: [{ address: "term-1", status: "blocked" }],
+      terminals: [{ address: "term-1", state: "live", status: "blocked" }],
+      spaces: [],
+      panes: [],
+    },
+    q2,
+  );
+  assert.notEqual(q3, q2);
+  assert.equal(q3.itemsById.get("alpha::a-1").agentStatus, "blocked");
+  assert.equal(q3.columns.closed, q2.columns.closed);
+  assert.equal(q3.columns.ready, q2.columns.ready);
+
+  const board = new boardMod.BoardController({}, { mode: "roscaelifer" });
+  assert.deepEqual(board.closedHeaderSummary(q3, { projectFilter: "all", showEphemeral: true }), { omitted: 110, truncated: true });
+  assert.deepEqual(board.closedHeaderSummary(q3, { projectFilter: "alpha", showEphemeral: false }), { omitted: 70, truncated: true });
+  assert.deepEqual(board.closedHeaderSummary(q3, { projectFilter: "beta", showEphemeral: true }), { omitted: 10, truncated: true });
+});

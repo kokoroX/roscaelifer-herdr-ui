@@ -489,6 +489,14 @@ export class BoardController {
       cx.notify();
     });
     this._lastVisible = [];
+    this._hiddenDeferredCache = {
+      queue: null,
+      mode: "",
+      projectFilter: "all",
+      envFilter: "all",
+      showEphemeral: true,
+      count: 0,
+    };
     this._filterCache = {
       queue: null,
       envFilter: null,
@@ -1091,10 +1099,40 @@ export class BoardController {
   renderFilterBar(queue, t, { showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats } = {}) {
     this.syncEnvFilter(queue);
     const types = this.syncTypeFilter(queue, projectFilter);
-    const hiddenDeferred = showDeferred ? 0 : (queue?.items || []).filter((item) =>
-      isDeferredItem(item) && (this.mode !== "beads" || item.beadId) &&
-      (projectFilter === "all" || !item.projectId || item.projectId === projectFilter) &&
-      (this.envFilter === "all" || item.env === this.envFilter) && (showEphemeral || !item.ephemeral)).length;
+    let hiddenDeferred = 0;
+    if (!showDeferred) {
+      const hdc = this._hiddenDeferredCache;
+      if (
+        hdc &&
+        hdc.queue === queue &&
+        hdc.mode === this.mode &&
+        hdc.projectFilter === projectFilter &&
+        hdc.envFilter === this.envFilter &&
+        hdc.showEphemeral === showEphemeral
+      ) {
+        hiddenDeferred = hdc.count;
+      } else {
+        for (const item of queue?.items || []) {
+          if (
+            isDeferredItem(item) &&
+            (this.mode !== "beads" || item.beadId) &&
+            (projectFilter === "all" || !item.projectId || item.projectId === projectFilter) &&
+            (this.envFilter === "all" || item.env === this.envFilter) &&
+            (showEphemeral || !item.ephemeral)
+          ) {
+            hiddenDeferred += 1;
+          }
+        }
+        this._hiddenDeferredCache = {
+          queue,
+          mode: this.mode,
+          projectFilter,
+          envFilter: this.envFilter,
+          showEphemeral,
+          count: hiddenDeferred,
+        };
+      }
+    }
     const envs = queue?.envs || [];
     const multiProject = Array.isArray(projects) && projects.length > 1;
 
@@ -1457,7 +1495,27 @@ export class BoardController {
     return this.mode === "beads" ? BEADS_COLUMNS.filter((col) => showDeferred || col.key !== "backlog") : ROSCAELIFER_COLUMNS;
   }
 
-  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats }, cx) {
+  closedHeaderSummary(queue, { projectFilter = "all", showEphemeral = true } = {}) {
+    let omitted = 0;
+    let truncated = false;
+    const projects = Array.isArray(queue?.projects) ? queue.projects : null;
+    if (projects && projects.length > 0) {
+      for (const p of projects) {
+        if (projectFilter !== "all" && p.id !== projectFilter) continue;
+        const cc = p.closedCounts;
+        if (!cc) continue;
+        if (cc.truncated) truncated = true;
+        omitted += showEphemeral ? Number(cc.omittedTotal || 0) : Number(cc.omittedNonEphemeral || 0);
+      }
+    } else if (queue?.closedCounts) {
+      const cc = queue.closedCounts;
+      truncated = Boolean(cc.truncated);
+      omitted = showEphemeral ? Number(cc.omittedTotal || 0) : Number(cc.omittedNonEphemeral || 0);
+    }
+    return { omitted, truncated: truncated || omitted > 0 };
+  }
+
+  render({ queue, selectedId, onSelectItem, actions, onOpenDialog, showEphemeral = true, onToggleShowEphemeral, showDeferred = true, onToggleShowDeferred, projects = [], projectFilter = "all", onSelectProjectFilter, countClosedStats = true, onToggleCountClosedStats, loadAllClosed = false, onToggleLoadAllClosed = null }, cx) {
     void cx;
     const t = theme();
     const { columns: cols, visibleAll, itemsByKeyByCol } = this.getFilteredColumns(queue, {
@@ -1466,6 +1524,7 @@ export class BoardController {
       projectFilter,
     });
     const boardColumns = this.getBoardColumns(showDeferred);
+    const closedMeta = this.closedHeaderSummary(queue, { projectFilter, showEphemeral });
 
     const colViews = boardColumns.map((col) => {
       const listItems = cols[col.key] || [];
@@ -1478,6 +1537,14 @@ export class BoardController {
               projectFilter,
             })
           : null;
+      const isClosedCol = col.key === "closed";
+      const hasOmittedClosed = isClosedCol && (closedMeta.omitted > 0 || closedMeta.truncated);
+      const closedCountText =
+        hasOmittedClosed && closedMeta.omitted > 0
+          ? `${listItems.length} / ${listItems.length + closedMeta.omitted}`
+          : hasOmittedClosed
+            ? `${listItems.length}+`
+            : String(listItems.length);
 
       return v_flex()
         .id(`col-${this.mode}-${col.key}`)
@@ -1526,6 +1593,26 @@ export class BoardController {
                       .child(runningLimit.text),
                   ),
                 )
+                .when(hasOmittedClosed && typeof onToggleLoadAllClosed === "function", (el) =>
+                  el.child(
+                    miniBtn(`col-load-all-closed-${this.mode}`, "Load all", {
+                      bg: t.raised,
+                      fg: t.accent,
+                      border: t.border,
+                      onClick: (_e, clickCx) => onToggleLoadAllClosed(true, clickCx),
+                    }),
+                  ),
+                )
+                .when(isClosedCol && loadAllClosed && typeof onToggleLoadAllClosed === "function", (el) =>
+                  el.child(
+                    miniBtn(`col-recent-closed-${this.mode}`, "Recent", {
+                      bg: t.raised,
+                      fg: t.muted,
+                      border: t.border,
+                      onClick: (_e, clickCx) => onToggleLoadAllClosed(false, clickCx),
+                    }),
+                  ),
+                )
                 .child(
                   div()
                     .px(6)
@@ -1534,7 +1621,10 @@ export class BoardController {
                     .bg(t.raised)
                     .text_size(11)
                     .text_color(t.muted)
-                    .child(String(listItems.length)),
+                    .when(hasOmittedClosed, (el) =>
+                      el.tooltip("Showing recent closed items. Click Load all to view full history."),
+                    )
+                    .child(closedCountText),
                 ),
             ),
         )
